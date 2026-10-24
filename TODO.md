@@ -10,13 +10,14 @@
 - 宿主输入法：text-input-v3 → `WaydroidHostIme`。
 - 剪贴板：ext-data-control，主机复制经输入法推送进 Android；主机侧 Python 剪贴板服务已删除。
 - 文件共享：主机 `~/Downloads` 挂在 Android `Download/Host`（`waydroid.cfg` 的 `shared_folders` 可改），主机侧改动自动进媒体库。
+- 声音：经主机 PulseAudio 输出；网页音频等 AAudio 流也有声（不声明 MMAP），媒体音量默认最大，由主机控制音量。
 - Widevine：L3（`dumpsys android.hardware.drm.IDrmFactory/widevine`：`default_security_level: L3`，`hdcp_level_max: Unprotected`），无法提升。
 - root：KernelSU LKM，本地签名管理器 32708。
 - ABI：`x86_64, arm64-v8a, x86`，ARM 翻译用 ATV 自带的 `libndk_translation`，没有 `armeabi-v7a`。
 
 ## 发版
 
-1. **发版流程**：完整编 vendorimage → 删掉 `/var/lib/waydroid/overlay/vendor` 里调试用的文件（`lib64/hw/hwcomposer.waydroid.so`、`app/WaydroidHostIme`、`overlay/WaydroidFrameworkOverlay.apk`）→ 压缩分块、打 native bundle → 放进 `aur/waydroid-a17-nvidia-bin/`（文件名与 `source` 一致，makepkg 不再下载）改 `_tag`/`pkgver`、`updpkgsums`、`makepkg -fC`、`sudo pacman -U` → `sudo waydroid-nvidia-setup`（门禁）→ 回归（卡片、桌面窗口、输入法、剪贴板、文件共享、KernelSU）→ 打 tag、上传 Release → 删掉本地放的文件后 `makepkg -fC` 再验一遍下载 → `.SRCINFO`、推 AUR。
+1. **发版流程**：完整编 vendorimage → 删掉 `/var/lib/waydroid/overlay/vendor` 里调试用的所有文件（`sudo find /var/lib/waydroid/overlay/vendor -type f` 列出）→ 压缩分块、打 native bundle → 放进 `aur/waydroid-a17-nvidia-bin/`（文件名与 `source` 一致，makepkg 不再下载）改 `_tag`/`pkgver`、`updpkgsums`、`makepkg -fC`、`sudo pacman -U` → `sudo waydroid-nvidia-setup`（门禁）→ 回归（卡片、桌面窗口、输入法、剪贴板、文件共享、KernelSU）→ 打 tag、上传 Release → 删掉本地放的文件后 `makepkg -fC` 再验一遍下载 → `.SRCINFO`、推 AUR。
 2. **AUR**：`waydroid-a17-nvidia-bin`（`aur/` 目录）。每次发版后改 `_tag`/`pkgver`，`updpkgsums`，`makepkg --printsrcinfo > .SRCINFO`，推到 `ssh://aur@aur.archlinux.org/waydroid-a17-nvidia-bin.git`。native bundle 作为 Release 资产 `waydroid-a17-nvidia-native-x86_64.tar.zst` 一起上传。
 
 ## 功能

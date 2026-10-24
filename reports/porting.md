@@ -93,6 +93,14 @@
 
 已实测：双拼输入中文上屏、数字选词、退格、切回英文、Ctrl+A/C，候选框随光标移动；桌面窗口内同样正常；开机后自动启用并连上 hwcomposer；dmesg 无 Xid。预编辑是否内嵌在输入框里由宿主输入法决定，本机 fcitx5 配置 `PreeditEnabledByDefault=False`，预编辑显示在候选框里，宿主原生应用（KWrite）也是如此。
 
+## 声音
+
+ATV 的音频 HAL 是 AOSP 默认 AIDL HAL 加一套 PulseAudio 输出（`hardware/interfaces/audio/aidl/default/pulse`），经挂进容器的主机 socket `/run/xdg/pulse/native` 出声。两处问题（`device/waydroid/waydroid` `049cbe5`）：
+- `primary_audio_policy_configuration.xml` 声明了 `mmap_no_irq_out`/`mmap_no_irq_in`，HAL 却把 MMAP 流交给 Cuttlefish 的 `StreamOutMmapStub`，声音被丢弃。Chrome 的网页音频走 AAudio，会选中 MMAP，于是网页游戏没声。去掉这两个口后 AAudio 退回普通路径（日志 `got Legacy`），经 AudioFlinger 到 `StreamPulse`。真 MMAP 在这里省不下多少延迟：主机侧 PulseAudio/PipeWire 的缓冲两条路都要过。
+- system 镜像设了 `ro.config.media_vol_default=16`，超过 15 档被 AudioService 丢弃，退回 1/3（5 档，约 −32 dB），声音几乎听不见。vendor 属性改为 15（vendor 的 `ro.` 属性覆盖 system），主机没有 Android 音量键，音量交给主机。
+
+实测：Chrome 里的 WebGL 网页游戏有声；删掉已保存的音量后重启，扬声器媒体音量默认 15/15。
+
 ## 文件共享
 
 主机 `~/Downloads` 出现在 Android 的 `Download/Host`，由主机侧 Waydroid 的 `waydroid/0004-host-shared-folders.patch` 实现（`waydroid.cfg` 的 `shared_folders` 每行一个 `主机目录:存储路径`）。
