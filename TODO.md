@@ -26,7 +26,7 @@
 
 ## 不做
 
-- **整版跟进 waydroid-nvidia**：本仓库是分叉（自编双队列 NVK、主机侧补丁、自编 vendor），不随上游 rc 版本 rebase。上游有用的修复读懂后移植过来；NVIDIA 驱动升级后门禁不过时先看上游怎么修的。待移植候选（rc11，`7670f54` 及之前）：Codec2 视频中途换分辨率不再断播、VP9 segmentation 与 NVIDIA 一致、NVK 遇到 2D 图像的 3D 视图不再中止进程。ATV 出新 system 镜像时单独评估。
+- **整版跟进 waydroid-nvidia**：本仓库是分叉（自编双队列 NVK、主机侧补丁、自编 vendor），不随上游 rc 版本 rebase。上游有用的修复读懂后移植过来；NVIDIA 驱动升级后门禁不过时先看上游怎么修的。待移植候选（rc11，`7670f54` 及之前）：Codec2 视频中途换分辨率不再断播、VP9 segmentation 与 NVIDIA 一致。NVK 遇到 2D 图像的 3D 视图不再中止进程（上游 `3152d37`）已移入本地源码，未编译，下次重编 native 生效。ATV 出新 system 镜像时单独评估。
 
 - **32 位 ARM（`armeabi-v7a`）**：现在的应用基本都有 arm64 版本（Play 早已要求 64 位，新手机也已不支持 32 位应用）。ATV A17 镜像只带 arm64 翻译；ATV 的 `vendor_google_proprietary_ndk_translation-prebuilt` 在 `16arm_16arm64` 分支上有 32 位库，但那是 Android 16 的。
 - **桌面窗口和卡片同时开**：两者共用一块 Android 屏幕，只能二选一。卡片加主机菜单里的 Android 应用启动项已经覆盖日常用法；只有用桌面小部件、或个别应用当卡片用有问题时才需要桌面窗口，临时切过去即可。
