@@ -23,7 +23,7 @@
 ## 功能
 
 1. **重负载实测**：3DMark Wild Life Extreme（Vulkan，4K）12287–13096 分、约 74 FPS，无 Xid，连续多遍稳定（需下面的 NVK 修复）。Basemark GPU（Vulkan 1.0、4K、Medium、离屏、Z Prepass 关）：宿主官方驱动 35657（BC7），Waydroid 29369（ETC2），约 82%。还没测真实 3D 游戏。
-2. **Vulkan 1.0 应用创建窗口即崩**：A17 loader 的 R8G8B8 swapchain 检查直接调用 1.1 的 `GetPhysicalDeviceImageFormatProperties2` 原始指针，1.0 实例为空。gralloc 不再声称 BGR888 可作 GPU 渲染目标（`patches/external_minigbm/0009`），loader 就不进这个分支；已经 overlay 验证（原版 loader 下 Basemark Vulkan 跑完），下次发版打进 vendor。loader 本身的修复准备提交 LineageOS Gerrit 和 Google Issue Tracker。
+2. **Vulkan 1.0 应用创建窗口即崩**：A17 loader 的 R8G8B8 swapchain 检查直接调用 1.1 的 `GetPhysicalDeviceImageFormatProperties2` 原始指针，1.0 实例为空。gralloc 不再声称 BGR888 可作 GPU 渲染目标（`patches/external_minigbm/0009`），loader 就不进这个分支；已经 overlay 验证（原版 loader 下 Basemark Vulkan 跑完），下次发版打进 vendor。loader 本身的修复已提交 LineageOS Gerrit（[509993](https://review.lineageos.org/c/LineageOS/android_frameworks_native/+/509993)），还要报 Google Issue Tracker。
 
 ## 不做
 
