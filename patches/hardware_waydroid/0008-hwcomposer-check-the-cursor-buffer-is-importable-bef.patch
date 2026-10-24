@@ -1,7 +1,7 @@
 From 07d8ed843cf02786a3bb6ddaea7b8c2e6e96c9cd Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia-prolapse <build@local>
 Date: Mon, 12 Oct 2026 00:58:18 +0300
-Subject: [PATCH 08/25] hwcomposer: check the cursor buffer is importable
+Subject: [PATCH 08/26] hwcomposer: check the cursor buffer is importable
  before attaching it
 MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8

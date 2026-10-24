@@ -1,7 +1,7 @@
 From 9048b6a02e2cec4f5a52681b0ab2ea2f0b69227d Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia-prolapse <build@local>
 Date: Mon, 12 Oct 2026 00:51:46 +0300
-Subject: [PATCH 02/25] hwcomposer: lock display->formats/modifiers across
+Subject: [PATCH 02/26] hwcomposer: lock display->formats/modifiers across
  threads
 MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8

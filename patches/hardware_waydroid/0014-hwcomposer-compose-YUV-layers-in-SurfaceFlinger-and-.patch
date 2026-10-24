@@ -1,7 +1,7 @@
 From 1456a0659b2ccda7f9ddd82a27bf333f8b665a01 Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia-prolapse <build@local>
 Date: Wed, 14 Oct 2026 23:35:40 +0300
-Subject: [PATCH 14/25] hwcomposer: compose YUV layers in SurfaceFlinger and
+Subject: [PATCH 14/26] hwcomposer: compose YUV layers in SurfaceFlinger and
  pass every dma-buf plane
 MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8

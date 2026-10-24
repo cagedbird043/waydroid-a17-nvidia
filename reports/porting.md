@@ -4,7 +4,7 @@
 
 | 项目 | 状态 | 证据 |
 |---|---|---|
-| 系统镜像 | WayDroid-ATV LineageOS 24.0（Android 17，SDK 37）GAPPS 版 `20261017`（md5 `17ea7ba1…`），原样未改；此前的 VANILLA 版保留为 `/etc/waydroid-extra/images/system.img.vanilla` | `ro.build.version.release=17`，GMS/GSF/Play 商店已安装 |
+| 系统镜像 | WayDroid-ATV LineageOS 24.0（Android 17，SDK 37）GAPPS 版 `20261017`（md5 `17ea7ba1…`），原样未改 | `ro.build.version.release=17`，GMS/GSF/Play 商店已安装 |
 | vendor 镜像 | 自编 `lineage_nvidia_waydroid_x86_64-cp2a-userdebug`，`ro.vendor.nvidia_prolapse.version=v0.2.0-rc10-a17-multiqueue` | `src/out/target/product/waydroid_nvidia_x86_64/vendor.img` |
 | native bundle | rc10 Rust RM/HAL/nvrm 原样，NVK 重编为双图形队列（`nvidia/build/native-multiqueue`，BUILD-RECORD sha256 `684a32a5…`） | `reports/nvk-multiqueue.md` |
 | 发布门禁 | PASS：22 个用例 + media，内核模块 615.78.08 | `logs/nvidia-setup-6.log` |
@@ -21,7 +21,7 @@
 
 | 仓库 | 分支 | 内容 |
 |---|---|---|
-| `src/hardware/waydroid` | `nvidia-a17` | hwcomposer 移植 18 个提交和 `%llx` 格式修正（`hwcomposer.md`）；`c7c062f` show-full-ui 静止画面不出窗口；`ef2e651` A17 图层按任务事件映射到任务；`5db77ae` 多窗口 freeform 卡片模式；`6e906c5` 多窗口下的 Android 桌面窗口；`9edad77` 宿主输入法直通（`hostime/`、`hwcomposer/ime-bridge.*`）；`f622087` 剪贴板改用 ext-data-control |
+| `src/hardware/waydroid` | `nvidia-a17` | hwcomposer 移植 18 个提交和 `%llx` 格式修正（`hwcomposer.md`）；`c7c062f` show-full-ui 静止画面不出窗口；`ef2e651` A17 图层按任务事件映射到任务；`5db77ae` 多窗口 freeform 卡片模式；`6e906c5` 多窗口下的 Android 桌面窗口；`9edad77` 宿主输入法直通（`hostime/`、`hwcomposer/ime-bridge.*`）；`f622087` 剪贴板改用 ext-data-control；`4ffc464` 其他包的 activity（设置搜索、分享、权限页）进入任务时图层归到焦点任务，修复卡片整窗透明 |
 | `src/external/minigbm` | `nvidia-a17` | gbm_mesa 移植 7 个提交；`cros_gralloc_handle.usage` 恢复为 `int32_t`（`minigbm.md`） |
 | `src/hardware/interfaces` | `nvidia-a17` | composer 2.1/2.4 重连修正（`composer-hal.md`） |
 | `src/external/wayland-protocols` | `nvidia-a17` | 协议版本提升到 1.49；`06ffc32` 加入 ext-data-control-v1 |
@@ -56,7 +56,7 @@
 - 管理器：`ksu/out/KernelSU_v3.3.1-28-gb42ad459_32708-local.apk`，keystore 在 `ksu/keystore/`（权限 600，密码在同目录 README）。构建说明见 `ksu-manager-build.md`。
 - 开机加载：`/etc/systemd/system/kernelsu-load.service`（源文件 `host/kernelsu-load.service`），在 `waydroid-container` 之前运行 `load-kernelsu`，模块已加载时跳过。容器启动时 init 自动执行 `ksud post-fs-data` / `services` / `boot-completed`。
 
-换 GAPPS system 后 data 清空重来（旧 data 在 `~/.local/share/waydroid/data.vanilla-20261024-163851`）。清空 data 会丢掉 `/data/adb/ksud` 和管理器：把备份里的 `adb/ksud` 拷回 `data/adb/ksud`（root:root 755），在容器里运行 `/data/adb/ksud install`，再装 `ksu/out/` 里的本地管理器，重启会话即可。`persist.waydroid.multi_windows` 也存在 data 里，需要重新 `waydroid prop set`。
+清空 data 会丢掉 `/data/adb/ksud` 和管理器：从管理器 APK 取出 `lib/x86_64/libksud.so` 装为 `data/adb/ksud`（root:root 755），在容器里运行 `/data/adb/ksud install`，再装 `ksu/out/` 里的本地管理器，重启会话即可（命令见 `kernelsu/README.md`）。`persist.waydroid.multi_windows` 也存在 data 里，需要重新 `waydroid prop set`。
 
 ## 多窗口
 

@@ -1,7 +1,7 @@
 From 46893597e49bba560097343602ed6551b7a5dd4b Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia-prolapse <build@local>
 Date: Wed, 14 Oct 2026 16:33:08 +0300
-Subject: [PATCH 13/25] hwcomposer: present the client target to a compositor
+Subject: [PATCH 13/26] hwcomposer: present the client target to a compositor
  on another GPU through a system-memory LINEAR copy
 MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8

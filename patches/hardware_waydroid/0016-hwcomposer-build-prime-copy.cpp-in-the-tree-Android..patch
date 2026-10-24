@@ -1,7 +1,7 @@
 From 56e379e1b6019cc2864d59ce10ea898c2775622b Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia project <ci@waydroid-nvidia>
 Date: Fri, 16 Oct 2026 19:59:25 +0300
-Subject: [PATCH 16/25] hwcomposer: build prime-copy.cpp in the tree
+Subject: [PATCH 16/26] hwcomposer: build prime-copy.cpp in the tree
  (Android.bp)
 
 prime-copy.cpp (cross-GPU present, the patch before the last) loads libvulkan

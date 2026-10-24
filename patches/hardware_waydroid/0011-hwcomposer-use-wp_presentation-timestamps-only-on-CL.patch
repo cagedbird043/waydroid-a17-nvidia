@@ -1,7 +1,7 @@
 From a8f2d0346bc382c2a25bac4ae5b377ab3730c268 Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia-prolapse <build@local>
 Date: Mon, 12 Oct 2026 01:00:55 +0300
-Subject: [PATCH 11/25] hwcomposer: use wp_presentation timestamps only on
+Subject: [PATCH 11/26] hwcomposer: use wp_presentation timestamps only on
  CLOCK_MONOTONIC
 MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8

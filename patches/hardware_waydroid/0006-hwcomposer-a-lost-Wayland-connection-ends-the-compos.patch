@@ -1,7 +1,7 @@
 From 9f937573df62e62f32a0e6345e33430e821d5f5a Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia-prolapse <build@local>
 Date: Mon, 12 Oct 2026 00:57:16 +0300
-Subject: [PATCH 06/25] hwcomposer: a lost Wayland connection ends the composer
+Subject: [PATCH 06/26] hwcomposer: a lost Wayland connection ends the composer
  with a named cause
 MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8

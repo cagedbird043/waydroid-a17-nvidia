@@ -1,7 +1,7 @@
 From ed6a38f92d6b47f5acd8972f9f5fcfade35cf2f1 Mon Sep 17 00:00:00 2001
 From: build <build@local>
 Date: Fri, 16 Oct 2026 19:54:48 +0300
-Subject: [PATCH 01/25] 0001-baseline-wip-nvidia-fixes
+Subject: [PATCH 01/26] 0001-baseline-wip-nvidia-fixes
 MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8
 Content-Transfer-Encoding: 8bit

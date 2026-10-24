@@ -14,7 +14,7 @@
 
 ## 发版
 
-1. **Release 的 vendor 镜像落后于源码**：剪贴板改动（`f622087`）和新版 `WaydroidHostIme` 只在作者本机的 overlay 里。下次发版：完整编 vendorimage → 跑门禁和回归 → 删掉 overlay 里的 `hwcomposer.waydroid.so`、`WaydroidHostIme.apk`、`waydroid-hostime-enable`、`waydroid-hostime.rc` → 上传新 Release。
+1. **发版流程**：完整编 vendorimage → 删掉 `/var/lib/waydroid/overlay/vendor` 里调试用的文件 → `scripts/reinstall-vendor.sh`（含门禁）→ 回归（卡片、桌面窗口、输入法、剪贴板、KernelSU）→ 分块上传 Release。
 2. **AUR**：暂缓。计划拆成 `waydroid-a17-nvidia`（打过补丁的 Waydroid 主机部分，`conflicts=(waydroid)`）和 `waydroid-a17-nvidia-vendor-bin`（从 Release 下载 vendor 镜像）；KernelSU 不进 AUR（签名因人而异）。先看 waydroid-nvidia 的 `ci-aur` 分支，避免重复。
 
 ## 功能
@@ -33,7 +33,6 @@
 3. **重新打开的卡片位置由 KWin 决定**：Wayland 客户端不能指定位置。可试：KWin 窗口规则按 app_id（`waydroid.<包名>`）记住位置，或 KWin 脚本。
 4. **内嵌预编辑不显示**：fcitx5 用 Ctrl+Alt+P 打开内嵌预编辑后，Android 输入框里仍看不到预编辑，原因未查。（默认 `PreeditEnabledByDefault=False` 时预编辑显示在候选框里，与宿主应用一致。）
 5. **输入法桥未测场景**：密码框（content purpose 已传给宿主）、多行文本里的 Enter、`delete_surrounding_text`（fcitx5 部分联想功能会用）。
-6. **卡片偶尔整窗透明**：一次重启会话后 `waydroid app launch` 打开的浏览器卡片，KDE 窗口在、hwcomposer 显示 `window shown=1`、图层正常，但窗口里什么都不画；调整尺寸不恢复，force-stop 后重开正常。只出现一次，未复现。
 
 ## 维护备忘
 
