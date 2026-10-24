@@ -4,7 +4,7 @@
 
 | 项目 | 状态 | 证据 |
 |---|---|---|
-| 系统镜像 | WayDroid-ATV LineageOS 24.0（Android 17，SDK 37）原版 | `ro.build.version.release=17` |
+| 系统镜像 | WayDroid-ATV LineageOS 24.0（Android 17，SDK 37）GAPPS 版 `20261017`（md5 `17ea7ba1…`），原样未改；此前的 VANILLA 版保留为 `/etc/waydroid-extra/images/system.img.vanilla` | `ro.build.version.release=17`，GMS/GSF/Play 商店已安装 |
 | vendor 镜像 | 自编 `lineage_nvidia_waydroid_x86_64-cp2a-userdebug`，`ro.vendor.nvidia_prolapse.version=v0.2.0-rc10-a17-multiqueue` | `src/out/target/product/waydroid_nvidia_x86_64/vendor.img` |
 | native bundle | rc10 Rust RM/HAL/nvrm 原样，NVK 重编为双图形队列（`nvidia/build/native-multiqueue`，BUILD-RECORD sha256 `684a32a5…`） | `reports/nvk-multiqueue.md` |
 | 发布门禁 | PASS：22 个用例 + media，内核模块 615.78.08 | `logs/nvidia-setup-6.log` |
@@ -56,6 +56,8 @@
 - 管理器：`ksu/out/KernelSU_v3.3.1-28-gb42ad459_32708-local.apk`，keystore 在 `ksu/keystore/`（权限 600，密码在同目录 README）。构建说明见 `ksu-manager-build.md`。
 - 开机加载：`/etc/systemd/system/kernelsu-load.service`（源文件 `host/kernelsu-load.service`），在 `waydroid-container` 之前运行 `load-kernelsu`，模块已加载时跳过。容器启动时 init 自动执行 `ksud post-fs-data` / `services` / `boot-completed`。
 
+换 GAPPS system 后 data 清空重来（旧 data 在 `~/.local/share/waydroid/data.vanilla-20261024-163851`）。清空 data 会丢掉 `/data/adb/ksud` 和管理器：把备份里的 `adb/ksud` 拷回 `data/adb/ksud`（root:root 755），在容器里运行 `/data/adb/ksud install`，再装 `ksu/out/` 里的本地管理器，重启会话即可。`persist.waydroid.multi_windows` 也存在 data 里，需要重新 `waydroid prop set`。
+
 ## 多窗口
 
 开启：`waydroid prop set persist.waydroid.multi_windows true`，重启会话后用 `waydroid app launch <包名>` 打开应用，每个应用一个 KDE 窗口。
@@ -77,6 +79,10 @@
 - 开机时 vendor init（`/vendor/etc/init/waydroid-hostime.rc`）以 shell 身份运行 `/vendor/bin/waydroid-hostime-enable`，启用并设为默认输入法；用户若已经选了原生键盘以外的输入法则不改默认。用 shell 是因为 A17 的 `cmd input_method ime` 只接受 shell/root，`cmd settings put` 在 system uid 下会触发框架 NPE。
 
 已实测：双拼输入中文上屏、数字选词、退格、切回英文、Ctrl+A/C，候选框随光标移动；桌面窗口内同样正常；开机后自动启用并连上 hwcomposer；dmesg 无 Xid。预编辑是否内嵌在输入框里由宿主输入法决定，本机 fcitx5 配置 `PreeditEnabledByDefault=False`，预编辑显示在候选框里，宿主原生应用（KWrite）也是如此。
+
+## GApps
+
+system 用 ATV 的 GAPPS 版，vendor 不变。设备指纹为 Pixel Tablet（`google/tangorpro/tangorpro:17/CP2A.260705.006`）。Play 商店需要把 GSF ID（`/data/data/com.google.android.gms/databases/gservices.db` 中 `main` 表的 `android_id`）登记到 https://www.google.com/android/uncertified 。换镜像后已验证：ANGLE/NVK 渲染、HostIme 自动启用、KernelSU 开机流程、桌面窗口、dmesg 无 Xid。Waydroid 过不了 Play Integrity 的设备完整性校验，强制该校验的应用（银行等）不可用。
 
 ## 性能：skiavk 与 skiagl
 
