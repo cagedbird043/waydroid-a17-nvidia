@@ -20,7 +20,7 @@
 ## 功能
 
 1. **文件共享**：把主机 `~/Downloads` 等目录挂进 Android 存储。
-2. **32 位 ARM**：补齐 `armeabi-v7a`。先确认 ATV 镜像是否带 32 位翻译库（`/system/lib/libndk_translation.so` 和 arm linker）。
+2. **32 位 ARM**：ATV A17 镜像只带 arm64 翻译（`/system/lib64/libndk_translation.so`、`/system/bin/arm64`），没有任何 32 位 ARM 库，`ro.product.cpu.abilist32` 只有 `x86`。ATV 的 `vendor_google_proprietary_ndk_translation-prebuilt` 有 `16arm_16arm64` 分支带 32 位，但那是 Android 16 的库（`ro.berberis.version=16.0.0`），要放进 system 镜像，能否在 A17 上跑未验证。
 3. **重负载实测**：glmark2 太轻；换真实 3D 游戏或 GFXBench，看性能和稳定性，同时盯 Xid。
 4. **界面微调**：隐藏状态栏、smartdock 之类，用 KernelSU 模块或 `waydroid prop`，不改镜像。
 5. **Widevine**：vendor 带 `drm-service.widevine`，级别未实测，推测 L3（Netflix 之类只有标清），无法提升。
@@ -30,9 +30,8 @@
 
 1. **缩放时内容滞后**：拖动 KDE 窗口边框时窗口先变，Android 要等 `cmd` 调整任务尺寸、应用重新排版后才跟上。可试：拖动期间先按比例缩放旧画面占位，或合并多次 resize。
 2. **卡片共用一块 Android 屏幕**：显示尺寸 = 宿主 + 200 headroom，窗口多时可能互相遮挡点击区域；卡片和桌面窗口只能二选一。根治需要每个窗口一个虚拟显示，改动大。
-3. **重新打开的卡片位置由 KWin 决定**：Wayland 客户端不能指定位置。可试：KWin 窗口规则按 app_id（`waydroid.<包名>`）记住位置，或 KWin 脚本。
-4. **内嵌预编辑不显示**：fcitx5 用 Ctrl+Alt+P 打开内嵌预编辑后，Android 输入框里仍看不到预编辑，原因未查。（默认 `PreeditEnabledByDefault=False` 时预编辑显示在候选框里，与宿主应用一致。）
-5. **输入法桥未测场景**：密码框（content purpose 已传给宿主）、多行文本里的 Enter、`delete_surrounding_text`（fcitx5 部分联想功能会用）。
+3. **卡片位置只在本次 KWin 会话内记住**：`host/kwin-waydroid-placement` 把关闭时的位置按 app_id 记在内存里，注销后清空。
+4. **内嵌预编辑不显示**：fcitx5 用 Ctrl+Alt+P 打开内嵌预编辑后，Android 和 KWrite 一样，拼音仍只在候选框里，问题在 fcitx5/KWin 一侧。
 
 ## 维护备忘
 

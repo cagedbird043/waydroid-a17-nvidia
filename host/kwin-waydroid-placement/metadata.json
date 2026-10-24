@@ -1,0 +1,12 @@
+{
+    "KPlugin": {
+        "Id": "waydroid-placement",
+        "Name": "Waydroid card placement",
+        "Description": "Reopens each Waydroid app card where it was last closed",
+        "License": "MIT",
+        "Version": "1"
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js",
+    "KPackageStructure": "KWin/Script"
+}

@@ -16,7 +16,7 @@ Waydroid 整合版：Android 17（LineageOS 24.0）+ NVIDIA 显卡硬件加速 +
 ## 功能
 
 - **NVIDIA 加速**：ANGLE → NVK（双图形队列）→ NVIDIA 内核驱动；HWUI 走 Vulkan（skiavk）；H.264/HEVC/VP9/AV1 由 NVDEC 硬解。
-- **多窗口**：`waydroid prop set persist.waydroid.multi_windows true` 后，每个 Android 应用一个 KDE 窗口（freeform 卡片），标题栏、拖动、缩放、关闭都由 KWin 处理；`waydroid show-full-ui` 打开带 KDE 边框的 Android 桌面窗口，关掉后应用回到各自窗口。
+- **多窗口**：`waydroid prop set persist.waydroid.multi_windows true` 后，每个 Android 应用一个 KDE 窗口（freeform 卡片），标题栏、拖动、缩放、关闭都由 KWin 处理；`waydroid show-full-ui` 打开带 KDE 边框的 Android 桌面窗口，关掉后应用回到各自窗口。可选的 KWin 脚本 `host/kwin-waydroid-placement` 让重开的卡片回到上次关闭的位置：`kpackagetool6 --type KWin/Script --install host/kwin-waydroid-placement && kwriteconfig6 --file kwinrc --group Plugins --key waydroid-placementEnabled true && qdbus6 org.kde.KWin /KWin reconfigure`。
 - **宿主输入法**：fcitx5、ibus 等经 Wayland `text-input-v3` 直接在 Android 里输入，候选框跟随光标。Android 侧是预装在 vendor 的输入法 `WaydroidHostIme`，开机自动启用。
 - **剪贴板**：经 `ext-data-control` 与主机双向同步，不依赖窗口焦点；不再需要主机侧 Python 剪贴板服务。
 - **GApps**：直接用 ATV 的 GAPPS system 镜像，vendor 不变。
@@ -53,7 +53,7 @@ sha256sum -c vendor.img.zst.sha256   # 校验分块、压缩包和解压后的�
 
 | 仓库 | 上游 | 分支 | 基线 | 补丁数 |
 |---|---|---|---|---|
-| `hardware/waydroid` | https://github.com/WayDroid-ATV/android_hardware_waydroid | lineage-23.0 (ATV manifest) | `3af187c1de51` | 25 |
+| `hardware/waydroid` | https://github.com/WayDroid-ATV/android_hardware_waydroid | lineage-23.0 (ATV manifest) | `3af187c1de51` | 28 |
 | `external/minigbm` | https://github.com/WayDroid-ATV/android_external_minigbm | lineage-24.0 | `5f5797cacd14` | 8 |
 | `hardware/interfaces` | https://github.com/WayDroid-ATV/android_hardware_interfaces | lineage-24.0 | `1b0bcde9a85b` | 1 |
 | `external/wayland-protocols` | https://android.googlesource.com/platform/external/wayland-protocols | AOSP | `2dabfe6879b2` | 3 |
@@ -69,7 +69,7 @@ sha256sum -c vendor.img.zst.sha256   # 校验分块、压缩包和解压后的�
 | `nvidia-product/` | `vendor/nvidia-prolapse` product 层（来自 waydroid-nvidia v0.2.0-rc10，已适配 A17） |
 | `container/` | 编译容器 |
 | `scripts/` | 同步、打补丁、编译、重装 vendor、跑分（按作者本机目录布局写的） |
-| `host/` | 宿主机开机加载 KernelSU 的 systemd 服务 |
+| `host/` | 宿主机开机加载 KernelSU 的 systemd 服务；记住卡片位置的 KWin 脚本 |
 | `kernelsu/` | KernelSU 步骤、kernelsu-dkms PKGBUILD、管理器编译与签名脚本 |
 | `reports/` | 移植、对比、性能报告 |
 

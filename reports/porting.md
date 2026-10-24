@@ -21,7 +21,7 @@
 
 | 仓库 | 分支 | 内容 |
 |---|---|---|
-| `src/hardware/waydroid` | `nvidia-a17` | hwcomposer 移植 18 个提交和 `%llx` 格式修正（`hwcomposer.md`）；`c7c062f` show-full-ui 静止画面不出窗口；`ef2e651` A17 图层按任务事件映射到任务；`5db77ae` 多窗口 freeform 卡片模式；`6e906c5` 多窗口下的 Android 桌面窗口；`9edad77` 宿主输入法直通（`hostime/`、`hwcomposer/ime-bridge.*`）；`f622087` 剪贴板改用 ext-data-control；`4ffc464` 其他包的 activity（设置搜索、分享、权限页）进入任务时图层归到焦点任务，修复卡片整窗透明 |
+| `src/hardware/waydroid` | `nvidia-a17` | hwcomposer 移植 18 个提交和 `%llx` 格式修正（`hwcomposer.md`）；`c7c062f` show-full-ui 静止画面不出窗口；`ef2e651` A17 图层按任务事件映射到任务；`5db77ae` 多窗口 freeform 卡片模式；`6e906c5` 多窗口下的 Android 桌面窗口；`9edad77` 宿主输入法直通（`hostime/`、`hwcomposer/ime-bridge.*`）；`f622087` 剪贴板改用 ext-data-control；`4ffc464` 其他包的 activity（设置搜索、分享、权限页）进入任务时图层归到焦点任务，修复卡片整窗透明；`7ceb257` 把光标前后文字发给宿主输入法（长按选重音字符等）；`742c344` desk ID 改读 WMShell 自己的记录，修复 SystemUI 反复崩溃 |
 | `src/external/minigbm` | `nvidia-a17` | gbm_mesa 移植 7 个提交；`cros_gralloc_handle.usage` 恢复为 `int32_t`（`minigbm.md`） |
 | `src/hardware/interfaces` | `nvidia-a17` | composer 2.1/2.4 重连修正（`composer-hal.md`） |
 | `src/external/wayland-protocols` | `nvidia-a17` | 协议版本提升到 1.49；`06ffc32` 加入 ext-data-control-v1 |

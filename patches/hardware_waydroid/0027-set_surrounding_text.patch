@@ -1,0 +1,339 @@
+From 7ceb25773c22305dd7336ef7f473209e2662b80e Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 24 Oct 2026 18:42:46 +0800
+Subject: [PATCH 27/28] =?utf-8?q?=E5=AE=BF=E4=B8=BB=E8=BE=93=E5=85=A5?=
+ =?utf-8?q?=E6=B3=95=EF=BC=9A=E6=8A=8A=E5=85=89=E6=A0=87=E5=89=8D=E5=90=8E?=
+ =?utf-8?q?=E7=9A=84=E6=96=87=E5=AD=97=EF=BC=88set=5Fsurrounding=5Ftext?=
+ =?utf-8?q?=EF=BC=89=E5=8F=91=E7=BB=99=E5=AE=BF=E4=B8=BB=E8=BE=93=E5=85=A5?=
+ =?utf-8?q?=E6=B3=95=EF=BC=8C=E9=95=BF=E6=8C=89=E9=80=89=E9=87=8D=E9=9F=B3?=
+ =?utf-8?q?=E5=AD=97=E7=AC=A6=E7=AD=89=E4=BE=9D=E8=B5=96=E5=AE=83=E7=9A=84?=
+ =?utf-8?q?=E5=8A=9F=E8=83=BD=E5=8F=AF=E7=94=A8=EF=BC=9B=E5=AF=86=E7=A0=81?=
+ =?utf-8?q?=E6=A1=86=E5=92=8C=E7=BB=84=E5=AD=97=E4=B8=AD=E4=B8=8D=E5=8F=91?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hostime/src/id/waydro/hostime/HostIme.java | 124 ++++++++++++++++++++-
+ hwcomposer/ime-bridge.cpp                  |  39 ++++++-
+ hwcomposer/ime-bridge.h                    |  12 ++
+ 3 files changed, 170 insertions(+), 5 deletions(-)
+
+diff --git a/hostime/src/id/waydro/hostime/HostIme.java b/hostime/src/id/waydro/hostime/HostIme.java
+index 553b31a..3088ac1 100644
+--- a/hostime/src/id/waydro/hostime/HostIme.java
++++ b/hostime/src/id/waydro/hostime/HostIme.java
+@@ -35,6 +35,7 @@ public class HostIme extends InputMethodService {
+ 
+     private static final int MSG_FOCUS = 1;
+     private static final int MSG_CURSOR = 2;
++    private static final int MSG_SURROUNDING = 3;
+     private static final int MSG_DONE = 10;
+     private static final int MSG_CLIP = 11;
+ 
+@@ -57,6 +58,13 @@ public class HostIme extends InputMethodService {
+     private static final int PURPOSE_DATE = 10;
+     private static final int PURPOSE_TIME = 11;
+     private static final int PURPOSE_DATETIME = 12;
++    private static final int CAUSE_INPUT_METHOD = 0;
++    private static final int CAUSE_OTHER = 1;
++    /* zwp_text_input_v3.set_surrounding_text takes less than 4000 bytes; at
++     * most 3 bytes per UTF-16 unit, so these always fit with no selection. */
++    private static final int SURROUNDING_BEFORE = 1000;
++    private static final int SURROUNDING_AFTER = 300;
++    private static final int SURROUNDING_MAX_BYTES = 3999;
+ 
+     private final Handler main = new Handler(Looper.getMainLooper());
+     private final Object lock = new Object();
+@@ -73,6 +81,13 @@ public class HostIme extends InputMethodService {
+     private final RectF lastCursor = new RectF();
+     private boolean haveCursor;
+     private boolean composing;
++    /* The surrounding text last sent; null when none was (no editor, a
++     * password, composing text in the editor). */
++    private byte[] lastSurrounding;
++    private int lastSurroundingCursor;
++    private int lastSurroundingAnchor;
++    /* apply() changed the editor: the next text change is the input method's. */
++    private boolean imeEdit;
+ 
+     @Override
+     public void onCreate() {
+@@ -104,6 +119,8 @@ public class HostIme extends InputMethodService {
+         super.onStartInput(info, restarting);
+         composing = false;
+         haveCursor = false;
++        lastSurrounding = null;
++        imeEdit = false;
+         int cls = info.inputType & InputType.TYPE_MASK_CLASS;
+         editorActive = cls != InputType.TYPE_NULL;
+         hint = 0;
+@@ -116,6 +133,15 @@ public class HostIme extends InputMethodService {
+             ic.requestCursorUpdates(InputConnection.CURSOR_UPDATE_IMMEDIATE
+                     | InputConnection.CURSOR_UPDATE_MONITOR);
+         }
++        sendSurrounding(-1);
++    }
++
++    @Override
++    public void onUpdateSelection(int oldSelStart, int oldSelEnd, int newSelStart,
++                                  int newSelEnd, int candidatesStart, int candidatesEnd) {
++        super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd,
++                candidatesStart, candidatesEnd);
++        sendSurrounding(candidatesStart);
+     }
+ 
+     @Override
+@@ -123,6 +149,7 @@ public class HostIme extends InputMethodService {
+         super.onFinishInput();
+         composing = false;
+         haveCursor = false;
++        lastSurrounding = null;
+         if (editorActive) {
+             editorActive = false;
+             sendFocus();
+@@ -219,6 +246,87 @@ public class HostIme extends InputMethodService {
+                 Math.round(lastCursor.right), Math.round(lastCursor.bottom)});
+     }
+ 
++    /* The text around the cursor, for the host input method's context and
++     * delete_surrounding_text. Not for a password, nor while the editor holds
++     * composing text (candidatesStart >= 0), which the protocol leaves out. */
++    private void sendSurrounding(int candidatesStart) {
++        if (!editorActive)
++            return;
++        final int cause = imeEdit ? CAUSE_INPUT_METHOD : CAUSE_OTHER;
++        imeEdit = false;
++        InputConnection ic = getCurrentInputConnection();
++        if ((hint & HINT_SENSITIVE_DATA) != 0 || composing || candidatesStart >= 0 || ic == null) {
++            if (lastSurrounding != null) {
++                lastSurrounding = null;
++                sendNoSurrounding();
++            }
++            return;
++        }
++        CharSequence before = ic.getTextBeforeCursor(SURROUNDING_BEFORE, 0);
++        CharSequence selected = ic.getSelectedText(0);
++        CharSequence after = ic.getTextAfterCursor(SURROUNDING_AFTER, 0);
++        if (before == null || after == null)
++            return;
++        byte[] b = trimStart(before.toString().getBytes(StandardCharsets.UTF_8));
++        byte[] s = selected == null ? new byte[0] : selected.toString().getBytes(StandardCharsets.UTF_8);
++        byte[] a = after.toString().getBytes(StandardCharsets.UTF_8);
++        if (b.length + s.length > SURROUNDING_MAX_BYTES)
++            s = new byte[0];  /* a huge selection: only the cursor end */
++        int room = SURROUNDING_MAX_BYTES - b.length - s.length;
++        if (a.length > room)
++            a = trimEnd(a, room);
++        byte[] text = new byte[b.length + s.length + a.length];
++        System.arraycopy(b, 0, text, 0, b.length);
++        System.arraycopy(s, 0, text, b.length, s.length);
++        System.arraycopy(a, 0, text, b.length + s.length, a.length);
++        int anchor = b.length;
++        int cursor = b.length + s.length;
++        if (lastSurrounding != null && java.util.Arrays.equals(text, lastSurrounding)
++                && cursor == lastSurroundingCursor && anchor == lastSurroundingAnchor)
++            return;
++        lastSurrounding = text;
++        lastSurroundingCursor = cursor;
++        lastSurroundingAnchor = anchor;
++        synchronized (lock) {
++            if (out == null)
++                return;
++            try {
++                ByteArrayOutputStream body = new ByteArrayOutputStream();
++                DataOutputStream d = new DataOutputStream(body);
++                d.writeInt(MSG_SURROUNDING);
++                d.writeInt(text.length);
++                d.write(text);
++                d.writeInt(cursor);
++                d.writeInt(anchor);
++                d.writeInt(cause);
++                writeFrame(body);
++            } catch (IOException e) {
++                Log.w(TAG, "send failed: " + e);
++                closeSocketLocked();
++            }
++        }
++    }
++
++    private void sendNoSurrounding() {
++        send(MSG_SURROUNDING, new int[] {-1});
++    }
++
++    /* Drops whole UTF-8 sequences from the front until it fits the budget. */
++    private static byte[] trimStart(byte[] t) {
++        int off = Math.max(0, t.length - SURROUNDING_MAX_BYTES);
++        while (off < t.length && (t[off] & 0xC0) == 0x80)
++            off++;
++        return off == 0 ? t : java.util.Arrays.copyOfRange(t, off, t.length);
++    }
++
++    /* The longest prefix of whole UTF-8 sequences within max bytes. */
++    private static byte[] trimEnd(byte[] t, int max) {
++        int end = Math.max(0, max);
++        while (end > 0 && end < t.length && (t[end] & 0xC0) == 0x80)
++            end--;
++        return java.util.Arrays.copyOf(t, end);
++    }
++
+     private void send(int type, int[] fields) {
+         synchronized (lock) {
+             if (out == null)
+@@ -229,10 +337,7 @@ public class HostIme extends InputMethodService {
+                 d.writeInt(type);
+                 for (int f : fields)
+                     d.writeInt(f);
+-                DataOutputStream o = new DataOutputStream(out);
+-                o.writeInt(body.size());
+-                body.writeTo(o);
+-                o.flush();
++                writeFrame(body);
+             } catch (IOException e) {
+                 Log.w(TAG, "send failed: " + e);
+                 closeSocketLocked();
+@@ -240,6 +345,14 @@ public class HostIme extends InputMethodService {
+         }
+     }
+ 
++    /* Called with lock held and out set. */
++    private void writeFrame(ByteArrayOutputStream body) throws IOException {
++        DataOutputStream o = new DataOutputStream(out);
++        o.writeInt(body.size());
++        body.writeTo(o);
++        o.flush();
++    }
++
+     private void closeSocket() {
+         synchronized (lock) {
+             closeSocketLocked();
+@@ -286,6 +399,8 @@ public class HostIme extends InputMethodService {
+                 sendFocus();
+                 if (haveCursor)
+                     sendCursor();
++                lastSurrounding = null;
++                sendSurrounding(-1);
+             });
+             try {
+                 while (true) {
+@@ -345,6 +460,7 @@ public class HostIme extends InputMethodService {
+         InputConnection ic = getCurrentInputConnection();
+         if (ic == null)
+             return;
++        imeEdit = true;
+         ic.beginBatchEdit();
+         if (before > 0 || after > 0) {
+             if (composing) {
+diff --git a/hwcomposer/ime-bridge.cpp b/hwcomposer/ime-bridge.cpp
+index 1a046c2..d82a870 100644
+--- a/hwcomposer/ime-bridge.cpp
++++ b/hwcomposer/ime-bridge.cpp
+@@ -51,6 +51,9 @@ constexpr char kImePackage[] = "id.waydro.hostime";
+ 
+ constexpr uint32_t kMsgFocus = 1;
+ constexpr uint32_t kMsgCursor = 2;
++constexpr uint32_t kMsgSurrounding = 3;
++/* zwp_text_input_v3.set_surrounding_text takes less than 4000 bytes. */
++constexpr size_t kMaxSurrounding = 3999;
+ constexpr uint32_t kMsgDone = 10;
+ constexpr uint32_t kMsgClip = 11;
+ /* The app takes messages up to this size; a bigger clipboard text stays on the
+@@ -252,7 +255,16 @@ void ime_bridge::update() {
+         zwp_text_input_v3_enable(text_input);
+         zwp_text_input_v3_set_content_type(text_input, content_hint, content_purpose);
+         enabled = true;
++        /* enable resets the text-input state: send it all again. */
+         cursor_sent = false;
++        surrounding_sent = false;
++        changed = true;
++    }
++    if (surrounding && !surrounding_sent) {
++        zwp_text_input_v3_set_surrounding_text(text_input, surrounding->text.c_str(),
++                                               surrounding->cursor, surrounding->anchor);
++        zwp_text_input_v3_set_text_change_cause(text_input, surrounding->cause);
++        surrounding_sent = true;
+         changed = true;
+     }
+     if (cursor && !cursor_sent) {
+@@ -298,6 +310,7 @@ void ime_bridge::drop_client() {
+     client_fd = -1;
+     editor_active = false;
+     cursor.reset();
++    surrounding.reset();
+     update();
+ }
+ 
+@@ -333,8 +346,10 @@ void ime_bridge::handle_message(uint32_t type, const uint8_t *data, size_t size)
+         }
+         content_hint = hint;
+         content_purpose = purpose;
+-        if (!editor_active)
++        if (!editor_active) {
+             cursor.reset();
++            surrounding.reset();
++        }
+         update();
+     } else if (type == kMsgCursor && size >= 16) {
+         const hwc_rect_t r = {(int32_t)get_u32(data), (int32_t)get_u32(data + 4),
+@@ -344,6 +359,28 @@ void ime_bridge::handle_message(uint32_t type, const uint8_t *data, size_t size)
+             cursor_sent = false;
+             update();
+         }
++    } else if (type == kMsgSurrounding && size >= 4) {
++        const uint32_t n = get_u32(data);
++        if (n == uint32_t(-1)) {
++            /* The editor gives no text (password, composing): none until it does. */
++            surrounding.reset();
++            return;
++        }
++        if (n > kMaxSurrounding || size < 4 + size_t(n) + 12)
++            return;
++        surrounding_text s;
++        s.text.assign(reinterpret_cast<const char *>(data + 4), n);
++        s.cursor = get_u32(data + 4 + n);
++        s.anchor = get_u32(data + 8 + n);
++        s.cause = get_u32(data + 12 + n);
++        if (s.cursor > n || s.anchor > n || s.text.find('\0') != std::string::npos)
++            return;
++        if (surrounding && surrounding->text == s.text && surrounding->cursor == s.cursor
++                && surrounding->anchor == s.anchor)
++            return;
++        surrounding = std::move(s);
++        surrounding_sent = false;
++        update();
+     }
+ }
+ 
+diff --git a/hwcomposer/ime-bridge.h b/hwcomposer/ime-bridge.h
+index 0c82f8c..e9b12fd 100644
+--- a/hwcomposer/ime-bridge.h
++++ b/hwcomposer/ime-bridge.h
+@@ -58,6 +58,10 @@ struct zwp_text_input_v3;
+  *   app -> composer
+  *     1 FOCUS   active, content hint, content purpose (zwp_text_input_v3 values)
+  *     2 CURSOR  left, top, right, bottom of the cursor, Android display pixels
++ *     3 SURROUNDING  text around the cursor (UTF-8, under 4000 bytes, no
++ *               composing text), cursor and anchor byte offsets into it, change
++ *               cause (zwp_text_input_v3 change_cause); the input method reads
++ *               it for context and deletes in it (delete_surrounding_text)
+  *   composer -> app
+  *     10 DONE   delete before, delete after (UTF-8 bytes), commit string,
+  *               preedit string, preedit cursor begin, end (bytes; -1 hidden)
+@@ -115,6 +119,14 @@ class ime_bridge {
+     uint32_t content_purpose = 0;
+     std::optional<hwc_rect_t> cursor;
+     bool cursor_sent = false;
++    struct surrounding_text {
++        std::string text;
++        uint32_t cursor;
++        uint32_t anchor;
++        uint32_t cause;
++    };
++    std::optional<surrounding_text> surrounding;
++    bool surrounding_sent = false;
+ 
+     /* Events since the last done. */
+     std::optional<std::string> pending_preedit;
+-- 
+2.56.0
+

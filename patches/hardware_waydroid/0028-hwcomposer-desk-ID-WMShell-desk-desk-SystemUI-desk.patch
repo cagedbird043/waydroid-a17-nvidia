@@ -1,0 +1,153 @@
+From 742c34419b728fe02d09ccc4a7786890dc52c255 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 24 Oct 2026 18:54:31 +0800
+Subject: [PATCH 28/28] =?utf-8?q?hwcomposer=EF=BC=9Adesk=20ID=20=E6=94=B9?=
+ =?utf-8?q?=E4=BB=8E=20WMShell=20=E8=87=AA=E5=B7=B1=E7=9A=84=E8=AE=B0?=
+ =?utf-8?q?=E5=BD=95=E8=AF=BB=E5=8F=96=EF=BC=8C=E9=87=8D=E5=BB=BA=20desk?=
+ =?utf-8?q?=20=E5=90=8E=E7=AD=89=E6=96=B0=20desk=20=E5=87=BA=E7=8E=B0?=
+ =?utf-8?q?=E5=86=8D=E7=A7=BB=E5=85=A5=E4=BB=BB=E5=8A=A1=EF=BC=8C=E4=BF=AE?=
+ =?utf-8?q?=E5=A4=8D=20SystemUI=20=E5=9B=A0=E6=89=BE=E4=B8=8D=E5=88=B0=20d?=
+ =?utf-8?q?esk=20=E5=8F=8D=E5=A4=8D=E5=B4=A9=E6=BA=83=E3=80=81=E5=8D=A1?=
+ =?utf-8?q?=E7=89=87=E4=B8=8D=E5=87=BA=E7=94=BB=E9=9D=A2?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hwcomposer/task-control.cpp | 82 +++++++++++++++++++++++++++++--------
+ hwcomposer/task-control.h   |  2 +-
+ 2 files changed, 66 insertions(+), 18 deletions(-)
+
+diff --git a/hwcomposer/task-control.cpp b/hwcomposer/task-control.cpp
+index 44920ba..3d22591 100644
+--- a/hwcomposer/task-control.cpp
++++ b/hwcomposer/task-control.cpp
+@@ -31,6 +31,7 @@
+ #include <unistd.h>
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <cstdlib>
+ #include <cerrno>
+ #include <chrono>
+@@ -203,21 +204,48 @@ static bool desktopmode(std::vector<std::string> args) {
+     return run_tool("dumpsys", std::move(args));
+ }
+ 
+-/* The id of WMShell's desk on the default display: the root task named
+- * "Desk" ("Task{... #6 name=Desk ..."). WMShell's own getActiveDeskId is not
++/* WMShell's desks on the default display, from its DesktopRepository dump
++ * ("Display #0:" / "activeDesk=<id|null>" / "Desk #<id>:"): moveTaskToDesk
++ * takes only a desk WMShell knows, and crashes SystemUI on any other. The
++ * "Desk" root tasks WM lists are no substitute: one being removed, or one a
++ * crashed SystemUI left behind, is still there. getActiveDeskId is not
+  * implemented on this platform. Worker thread only. */
+-int task_control::desk_id() {
++std::vector<int> task_control::desk_ids(int *active) {
++    std::vector<int> ids;
++    *active = -1;
+     std::string out;
+-    if (!run_tool("dumpsys", {"activity", "activities"}, &out))
+-        return -1;
+-    static const std::string kName = " name=Desk ";
+-    const size_t name = out.find(kName);
+-    if (name == std::string::npos)
+-        return -1;
+-    const size_t hash = out.rfind('#', name);
+-    if (hash == std::string::npos)
+-        return -1;
+-    return atoi(out.c_str() + hash + 1);
++    if (!run_tool("dumpsys", {"activity", "service", "SystemUIService", "WMShell"}, &out))
++        return ids;
++    bool in_display = false;
++    size_t pos = 0;
++    while (pos < out.size()) {
++        size_t end = out.find('\n', pos);
++        if (end == std::string::npos)
++            end = out.size();
++        std::string line = out.substr(pos, end - pos);
++        pos = end + 1;
++        const size_t first = line.find_first_not_of(' ');
++        if (first == std::string::npos)
++            continue;
++        line.erase(0, first);
++        if (line.rfind("Display #", 0) == 0) {
++            /* Only the repository's "Display #<id>:" lines end there. */
++            in_display = line == "Display #0:";
++            continue;
++        }
++        if (!in_display)
++            continue;
++        if (line.rfind("activeDesk=", 0) == 0) {
++            const char *v = line.c_str() + 11;
++            if (isdigit((unsigned char)*v))
++                *active = atoi(v);
++        } else if (line.rfind("Desk #", 0) == 0 && line.back() == ':') {
++            ids.push_back(atoi(line.c_str() + 6));
++        } else if (line.find('=') == std::string::npos && line != "desks:") {
++            in_display = false;  /* past the repository's display section */
++        }
++    }
++    return ids;
+ }
+ 
+ /* The desk Android restored at boot still holds the previous session's
+@@ -225,18 +253,38 @@ int task_control::desk_id() {
+  * nobody opened. Start the session from a fresh, empty desk instead.
+  * Worker thread only. */
+ int task_control::fresh_desk_id() {
++    int active;
++    std::vector<int> ids = desk_ids(&active);
+     if (!desks_reset) {
+         desks_reset = true;
+         ALOGI("WMShell: replacing the desks restored from the last session");
++        const std::vector<int> old = ids;
+         desktopmode({"removeAllDesks"});
+         desktopmode({"createDesk", "0"});
++        /* Both run on WMShell's executor: wait until the new desk is listed
++         * and the old ones are not. */
++        for (int i = 0; i < 20; i++) {
++            ids = desk_ids(&active);
++            const bool stale = std::any_of(ids.begin(), ids.end(), [&](int id) {
++                return std::find(old.begin(), old.end(), id) != old.end();
++            });
++            if (!ids.empty() && !stale)
++                break;
++            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++        }
+     }
+-    int desk = desk_id();
+-    if (desk < 0) {
++    if (ids.empty()) {
++        /* SystemUI restarted with no desk, or the one above is not there yet. */
+         desktopmode({"createDesk", "0"});
+-        desk = desk_id();
++        for (int i = 0; i < 20 && ids.empty(); i++) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++            ids = desk_ids(&active);
++        }
+     }
+-    return desk;
++    if (ids.empty())
++        return -1;
++    return active >= 0 && std::find(ids.begin(), ids.end(), active) != ids.end() ? active
++                                                                                 : ids.front();
+ }
+ 
+ void task_control::worker() {
+diff --git a/hwcomposer/task-control.h b/hwcomposer/task-control.h
+index 8178e86..7f7ce0d 100644
+--- a/hwcomposer/task-control.h
++++ b/hwcomposer/task-control.h
+@@ -78,7 +78,7 @@ class task_control {
+ 
+   private:
+     void worker();
+-    int desk_id();
++    std::vector<int> desk_ids(int *active);
+     int fresh_desk_id();
+ 
+     std::mutex mutex;
+-- 
+2.56.0
+

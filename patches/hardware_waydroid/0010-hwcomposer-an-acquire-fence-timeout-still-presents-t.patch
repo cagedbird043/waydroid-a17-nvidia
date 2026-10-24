@@ -1,7 +1,7 @@
 From 68e13a071cb356ca3213b0d143a81dd9f609c3f6 Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia-prolapse <build@local>
 Date: Mon, 12 Oct 2026 01:00:25 +0300
-Subject: [PATCH 10/26] hwcomposer: an acquire-fence timeout still presents the
+Subject: [PATCH 10/28] hwcomposer: an acquire-fence timeout still presents the
  layer completely
 MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8
