@@ -21,14 +21,14 @@
 
 | 仓库 | 分支 | 内容 |
 |---|---|---|
-| `src/hardware/waydroid` | `nvidia-a17` | hwcomposer 移植 18 个提交和 `%llx` 格式修正（`hwcomposer.md`）；`f676385` show-full-ui 静止画面不出窗口；`a122fa3` A17 图层按任务事件映射到任务；`04d1d60` 多窗口 freeform 卡片模式；`379ec63` 多窗口下的 Android 桌面窗口；`17c36f7` 宿主输入法直通（`hostime/`、`hwcomposer/ime-bridge.*`）；`2fba6a7` 剪贴板改用 ext-data-control |
+| `src/hardware/waydroid` | `nvidia-a17` | hwcomposer 移植 18 个提交和 `%llx` 格式修正（`hwcomposer.md`）；`c7c062f` show-full-ui 静止画面不出窗口；`ef2e651` A17 图层按任务事件映射到任务；`5db77ae` 多窗口 freeform 卡片模式；`6e906c5` 多窗口下的 Android 桌面窗口；`9edad77` 宿主输入法直通（`hostime/`、`hwcomposer/ime-bridge.*`）；`f622087` 剪贴板改用 ext-data-control |
 | `src/external/minigbm` | `nvidia-a17` | gbm_mesa 移植 7 个提交；`cros_gralloc_handle.usage` 恢复为 `int32_t`（`minigbm.md`） |
 | `src/hardware/interfaces` | `nvidia-a17` | composer 2.1/2.4 重连修正（`composer-hal.md`） |
-| `src/external/wayland-protocols` | `nvidia-a17` | 协议版本提升到 1.49；`8ee79fc` 加入 ext-data-control-v1 |
-| `src/device/waydroid/waydroid` | `local-build` | x86_64 不编 Mesa nouveau Vulkan；`5421c32` 预装 `WaydroidHostIme` |
-| `src/vendor/waydroid/init` | `nvidia-a17` | `597f6e5` 识别 nvidia-prolapse；`75b2978` 视频解码交给 NVDEC |
-| `nvidia/waydroid-nvidia` | `a17-local` | 门禁 EROFS/APEX/VNDK 支持、KernelSU seccomp 补丁、双队列 NVK（`eec39aa`）、本地安装器（`db78568`、`e63b1fb`）；安装器不重写已有目录、只在图标变化时刷新图标缓存（`26fdaa4`、`b1a3597`、`a30d79a`）；`58f8014` 去掉主机侧 Python 剪贴板服务 |
-| `nvidia/product` | （主分支） | `libhwminijail`；native bundle pin（`de9e574`） |
+| `src/external/wayland-protocols` | `nvidia-a17` | 协议版本提升到 1.49；`06ffc32` 加入 ext-data-control-v1 |
+| `src/device/waydroid/waydroid` | `local-build` | x86_64 不编 Mesa nouveau Vulkan；`edf992a` 预装 `WaydroidHostIme` |
+| `src/vendor/waydroid/init` | `nvidia-a17` | `c75eb53` 识别 nvidia-prolapse；`5a6d921` 视频解码交给 NVDEC |
+| `nvidia/waydroid-nvidia` | `a17-local` | 门禁 EROFS/APEX/VNDK 支持、KernelSU seccomp 补丁、双队列 NVK（`eec39aa`）、本地安装器（`db78568`、`fa99138`）；安装器不重写已有目录、只在图标变化时刷新图标缓存（`d5c3d83`、`0d45957`、`035d267`）；`1b5eaae` 去掉主机侧 Python 剪贴板服务 |
+| `nvidia/product` | （主分支） | `libhwminijail`；native bundle pin（`c5aaf35`） |
 | `ksu/KernelSU` | `local-manager` | 管理器源码（b42ad459），本地 keystore 签名 |
 
 `nvidia/work/` 中的独立克隆与 `hardware/waydroid`、`external/minigbm` 同步，`scripts/apply-nvidia.sh` 从这些克隆 cherry-pick；`vendor/waydroid/init` 的两个提交只在 `src/` 树里。

@@ -1,4 +1,4 @@
-From d1d1b18b58ab27e6176a91865be5e1b591890386 Mon Sep 17 00:00:00 2001
+From a7108c4d1b3b639a3636499602fea36d84a674b8 Mon Sep 17 00:00:00 2001
 From: nvidia-prolapse <nvidia-prolapse@localhost>
 Date: Fri, 16 Oct 2026 19:55:46 +0300
 Subject: [PATCH 3/8] gbm_mesa: FP16 and 1010102 render targets from the

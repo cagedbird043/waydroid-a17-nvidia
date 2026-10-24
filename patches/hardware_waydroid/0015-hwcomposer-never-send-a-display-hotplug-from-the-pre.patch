@@ -1,4 +1,4 @@
-From 3c9a7244ccab5e028490d68c548728276283323d Mon Sep 17 00:00:00 2001
+From fb74704ad74ec9f4edcab8ea66b83fde92a3f2b4 Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia-prolapse <build@local>
 Date: Fri, 16 Oct 2026 18:12:50 +0300
 Subject: [PATCH 15/25] hwcomposer: never send a display hotplug from the

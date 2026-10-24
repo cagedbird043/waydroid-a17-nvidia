@@ -1,4 +1,4 @@
-From 5adec743b3663b4e79af9fdef520293e478e3575 Mon Sep 17 00:00:00 2001
+From 0fb126dcb257b6c585e15eff1e7a642ccd77d04c Mon Sep 17 00:00:00 2001
 From: nvidia-prolapse <nvidia-prolapse@localhost>
 Date: Sun, 18 Oct 2026 01:20:49 +0300
 Subject: [PATCH 6/8] gbm_mesa: CPU-cached memory for buffers the CPU reads

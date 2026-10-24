@@ -1,4 +1,4 @@
-From 36807eb38db7d2ed929675481d07271b8334c8bc Mon Sep 17 00:00:00 2001
+From 394c156d5e147a7d9b6e1fa130b84ccf1e481b4f Mon Sep 17 00:00:00 2001
 From: nvidia-prolapse <nvidia-prolapse@localhost>
 Date: Fri, 16 Oct 2026 19:55:46 +0300
 Subject: [PATCH 4/8] gbm_mesa: P010 and a GPU-writable NV12/P010 layout for

@@ -1,4 +1,4 @@
-From cdd0db86a470b1911b5a136ce8c98210a425ed88 Mon Sep 17 00:00:00 2001
+From b2d0b7d09225a320fd2b840afe62a0346df6836b Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia-prolapse <build@local>
 Date: Mon, 12 Oct 2026 00:54:33 +0300
 Subject: [PATCH 04/25] hwcomposer: keep the wl_buffer cache across geometry

@@ -8,7 +8,7 @@
 - 没有 GApps 或 microG（ATV VANILLA 版 system 镜像）。
 - vendor 带 `android.hardware.drm-service.widevine` 和 clearkey；Widevine 级别未实测，推测为 L3。
 - `persist.waydroid.multi_windows=true`：每个应用一个 KDE 窗口（freeform 卡片），`show-full-ui` 打开带 KDE 边框的 Android 桌面窗口。
-- 宿主输入法直通已完成（`17c36f7`、`5421c32`）：fcitx5 经 text-input-v3 在 Android 里上屏，候选框跟随光标。
+- 宿主输入法直通已完成（`9edad77`、`edf992a`）：fcitx5 经 text-input-v3 在 Android 里上屏，候选框跟随光标。
 - root：KernelSU（本地签名的管理器 32708，`kernelsu-load.service` 开机加载），Termux 已授权。
 
 ## waydroid_script（casualsnek）各功能对照
@@ -25,8 +25,8 @@
 
 ## 与本环境直接相关的改进
 
-1. **多窗口模式**：已完成。`04d1d60` freeform 卡片模式，`379ec63` 带 KDE 边框的桌面窗口。
-2. **剪贴板与文件共享**：剪贴板已改用 ext-data-control（`2fba6a7`），主机复制经输入法推送进 Android，Python 服务已删除；文件共享（把 `~/Downloads` 等目录挂到安卓存储）未做。
+1. **多窗口模式**：已完成。`5db77ae` freeform 卡片模式，`6e906c5` 带 KDE 边框的桌面窗口。
+2. **剪贴板与文件共享**：剪贴板已改用 ext-data-control（`f622087`），主机复制经输入法推送进 Android，Python 服务已删除；文件共享（把 `~/Downloads` 等目录挂到安卓存储）未做。
 3. **32 位 ARM 支持**：在 ndk_translation 上补齐 `armeabi-v7a`。先确认 ATV 镜像是否带 32 位翻译库（`/system/lib/libndk_translation.so` 以及 arm 的 linker 等）。
 4. **重负载游戏和基准**：glmark2 负载太轻，换真实 3D 游戏或 GFXBench，看 4060 在这套栈上的实际性能和稳定性（同时盯 Xid）。
 5. **跟进上游**：ATV 出新 system 镜像、waydroid-nvidia 出 rc11 时，用现有脚本 rebase 后重编（`scripts/apply-nvidia.sh`、`scripts/build.sh`、`scripts/reinstall-vendor.sh`）。

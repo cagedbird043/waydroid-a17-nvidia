@@ -10,7 +10,7 @@
 | 项目 | 路径 / 身份 |
 |---|---|
 | 源码提交（`a17-local`，未推送） | `eec39aa`：为 Android 17 HWUI 暴露两条独立 NVK graphics 队列 |
-| product 提交 | `de9e574`：固定 Android 17 HWUI 双队列 NVK 原生包身份 |
+| product 提交 | `c5aaf35`：固定 Android 17 HWUI 双队列 NVK 原生包身份 |
 | 新完整 native bundle | `nvidia/build/native-multiqueue/`（含 payload、原 gates、新 BUILD-RECORD、SHA256SUMS.native） |
 | 新 bundle release | `v0.2.0-rc10-a17-multiqueue` |
 | BUILD-RECORD SHA256 | `684a32a51133fe326904a67bc2a905e95cce52c0da5949dbd5bbeff0992c3565` |

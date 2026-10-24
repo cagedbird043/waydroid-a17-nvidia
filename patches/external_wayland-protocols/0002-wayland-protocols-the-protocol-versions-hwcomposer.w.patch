@@ -1,4 +1,4 @@
-From e2428ad5d31853579e8f923140fefed970e5930a Mon Sep 17 00:00:00 2001
+From 0832d60fd5f609cc45425f59aa038d0dc180493a Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia project <ci@waydroid-nvidia>
 Date: Fri, 16 Oct 2026 19:59:08 +0300
 Subject: [PATCH 2/3] wayland-protocols: the protocol versions

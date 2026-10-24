@@ -1,4 +1,4 @@
-From cf22f85982419d111c2c3ea6739a284967584f8a Mon Sep 17 00:00:00 2001
+From baacdb411a43c0831d831cba9b98c287e55a9634 Mon Sep 17 00:00:00 2001
 From: nvidia-prolapse <nvidia-prolapse@localhost>
 Date: Fri, 16 Oct 2026 19:55:46 +0300
 Subject: [PATCH 1/8] gbm_mesa: CPU usage does not force LINEAR on GPU render

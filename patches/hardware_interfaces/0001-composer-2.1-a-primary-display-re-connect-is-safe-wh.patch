@@ -1,4 +1,4 @@
-From 83da1d6d2925b090a89471761bcddd47f8d10e25 Mon Sep 17 00:00:00 2001
+From c49fc0fef6e1931a4779bd3898a8ccc998df1891 Mon Sep 17 00:00:00 2001
 From: Shiro836 <17294277+Shiro836@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 21:36:27 +0300
 Subject: [PATCH] composer 2.1: a primary display re-connect is safe while

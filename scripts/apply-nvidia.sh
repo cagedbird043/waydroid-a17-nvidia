@@ -20,7 +20,7 @@ for entry in "${PORTS[@]}"; do
     fi
     git -C "$proj" fetch -q "$ROOT/nvidia/work/$clone" nvidia-a17
     git -C "$proj" checkout -q -b nvidia-a17
-    git -C "$proj" -c user.name=local -c user.email=local@localhost cherry-pick -x "$base"..FETCH_HEAD >/dev/null
+    git -C "$proj" cherry-pick -x "$base"..FETCH_HEAD >/dev/null
     echo "$path: $(git -C "$proj" rev-list --count "$base"..FETCH_HEAD) port commits on $(git -C "$proj" rev-parse --short HEAD~"$(git -C "$proj" rev-list --count "$base"..FETCH_HEAD)")"
 done
 "$ROOT/scripts/stage-product.sh"

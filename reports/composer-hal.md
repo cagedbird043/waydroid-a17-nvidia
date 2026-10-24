@@ -3,12 +3,12 @@
 ## 交付
 
 仅操作 `nvidia/work/` 下的独立克隆；未访问同步中的 `src/`，未推送。
-两个仓库均已设置本地身份 `local <local@localhost>`，分支均为 `nvidia-a17`，工作树干净。
+两个仓库的分支均为 `nvidia-a17`，工作树干净。
 
 |仓库|基线|移植提交|
 |---|---|---|
-|`nvidia/work/hardware_interfaces`|WayDroid-ATV/android_hardware_interfaces，lineage-24.0，`1b0bcde9a85bd3e6c5866ae83aaab9af9b5efd29`（depth 200）|`7cb84c3d160bada81ad5d5f30fa2d690b149d79c`|
-|`nvidia/work/wayland-protocols`|TUNA AOSP platform/external/wayland-protocols，android-17.0.0_r1，`2dabfe6879b25981e0340823eb1b6d037d21577f`（depth 1）|`5a5e59973b799d6e670d1e1c8d8c1c5b654003e3`|
+|`nvidia/work/hardware_interfaces`|WayDroid-ATV/android_hardware_interfaces，lineage-24.0，`1b0bcde9a85bd3e6c5866ae83aaab9af9b5efd29`（depth 200）|`7c6466bcb5ab93c039bd69db084e9c961610acc1`|
+|`nvidia/work/wayland-protocols`|TUNA AOSP platform/external/wayland-protocols，android-17.0.0_r1，`2dabfe6879b25981e0340823eb1b6d037d21577f`（depth 1）|`782480c88f3b8682cf88b63144f9b7220a963f06`|
 
 ## 逐补丁结果
 

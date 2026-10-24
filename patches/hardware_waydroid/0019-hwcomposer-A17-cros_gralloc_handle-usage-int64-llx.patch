@@ -1,5 +1,5 @@
-From bfe5acbeb0fae6ea6b0a4d5aaa53f618ee4ee5b8 Mon Sep 17 00:00:00 2001
-From: local <local@localhost>
+From b6df6eafff51611ee4482a77b16e5a5ee6b4d7aa Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
 Date: Sat, 24 Oct 2026 05:41:47 +0800
 Subject: [PATCH 19/25] =?utf-8?q?hwcomposer=EF=BC=9AA17=20=E7=9A=84=20cros?=
  =?utf-8?q?=5Fgralloc=5Fhandle=20usage=20=E4=B8=BA=20int64=EF=BC=8C?=
