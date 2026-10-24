@@ -9,6 +9,7 @@
 - 多窗口（`persist.waydroid.multi_windows=true`）：freeform 卡片 + 带 KDE 边框的桌面窗口。
 - 宿主输入法：text-input-v3 → `WaydroidHostIme`。
 - 剪贴板：ext-data-control，主机复制经输入法推送进 Android；主机侧 Python 剪贴板服务已删除。
+- 文件共享：主机 `~/Downloads` 挂在 Android `Download/Host`（`waydroid.cfg` 的 `shared_folders` 可改）。
 - root：KernelSU LKM，本地签名管理器 32708。
 - ABI：`x86_64, arm64-v8a, x86`，ARM 翻译用 ATV 自带的 `libndk_translation`，没有 `armeabi-v7a`。
 
@@ -19,12 +20,15 @@
 
 ## 功能
 
-1. **文件共享**：把主机 `~/Downloads` 等目录挂进 Android 存储。
-2. **32 位 ARM**：ATV A17 镜像只带 arm64 翻译（`/system/lib64/libndk_translation.so`、`/system/bin/arm64`），没有任何 32 位 ARM 库，`ro.product.cpu.abilist32` 只有 `x86`。ATV 的 `vendor_google_proprietary_ndk_translation-prebuilt` 有 `16arm_16arm64` 分支带 32 位，但那是 Android 16 的库（`ro.berberis.version=16.0.0`），要放进 system 镜像，能否在 A17 上跑未验证。
-3. **重负载实测**：glmark2 太轻；换真实 3D 游戏或 GFXBench，看性能和稳定性，同时盯 Xid。
-4. **界面微调**：隐藏状态栏、smartdock 之类，用 KernelSU 模块或 `waydroid prop`，不改镜像。
-5. **Widevine**：vendor 带 `drm-service.widevine`，级别未实测，推测 L3（Netflix 之类只有标清），无法提升。
-6. **跟进上游**：ATV 出新 system 镜像、waydroid-nvidia 出 rc11 时 rebase 重编（`scripts/apply-nvidia.sh`、`scripts/build.sh`、`scripts/reinstall-vendor.sh`）。
+1. **重负载实测**：glmark2 太轻；换真实 3D 游戏或 GFXBench，看性能和稳定性，同时盯 Xid。
+2. **界面微调**：隐藏状态栏、smartdock 之类，用 KernelSU 模块或 `waydroid prop`，不改镜像。
+3. **Widevine**：vendor 带 `drm-service.widevine`，级别未实测，推测 L3（Netflix 之类只有标清），无法提升。
+4. **跟进上游**：ATV 出新 system 镜像、waydroid-nvidia 出 rc11 时 rebase 重编（`scripts/apply-nvidia.sh`、`scripts/build.sh`、`scripts/reinstall-vendor.sh`）。
+5. **主机文件进图库**：主机放进共享目录的文件，文件管理器和系统文件选择器立即可见，但要等 MediaStore 扫描后图库才列出（`content call --uri content://media --method scan_volume --arg external_primary` 可手动触发）。
+
+## 不做
+
+- **32 位 ARM（`armeabi-v7a`）**：现在的应用基本都有 arm64 版本（Play 早已要求 64 位，新手机也已不支持 32 位应用）。ATV A17 镜像只带 arm64 翻译；ATV 的 `vendor_google_proprietary_ndk_translation-prebuilt` 在 `16arm_16arm64` 分支上有 32 位库，但那是 Android 16 的。
 
 ## 卡片模式与输入法的已知问题
 

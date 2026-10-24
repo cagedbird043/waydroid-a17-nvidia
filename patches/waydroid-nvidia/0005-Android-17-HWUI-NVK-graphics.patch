@@ -1,7 +1,7 @@
 From eec39aa15836f460bc4903dddb7e98da4c637fac Mon Sep 17 00:00:00 2001
 From: cagedbird043 <cagedbird043@gmail.com>
 Date: Sat, 24 Oct 2026 09:21:33 +0800
-Subject: [PATCH 05/10] =?utf-8?q?=E4=B8=BA=20Android=2017=20HWUI=20?=
+Subject: [PATCH 05/11] =?utf-8?q?=E4=B8=BA=20Android=2017=20HWUI=20?=
  =?utf-8?q?=E6=9A=B4=E9=9C=B2=E4=B8=A4=E6=9D=A1=E7=8B=AC=E7=AB=8B=20NVK=20?=
  =?utf-8?q?graphics=20=E9=98=9F=E5=88=97?=
 MIME-Version: 1.0
@@ -61,7 +61,7 @@ index 0000000..d8b1a1b
 --- /dev/null
 +++ b/nvidia-prolapse/driver-source/native/mesa/nvk-rm-graphics-multiqueue.patch
 @@ -0,0 +1,27 @@
-+From: cagedbird043 <cagedbird043@gmail.com>
++From: local <local@localhost>
 +Subject: [PATCH] nvk: expose two independent graphics queues on the RM transport
 +
 +Android HWUI uses separate RenderThread and GrallocUploadThread queues from

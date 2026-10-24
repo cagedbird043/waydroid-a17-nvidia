@@ -85,6 +85,16 @@
 
 已实测：双拼输入中文上屏、数字选词、退格、切回英文、Ctrl+A/C，候选框随光标移动；桌面窗口内同样正常；开机后自动启用并连上 hwcomposer；dmesg 无 Xid。预编辑是否内嵌在输入框里由宿主输入法决定，本机 fcitx5 配置 `PreeditEnabledByDefault=False`，预编辑显示在候选框里，宿主原生应用（KWrite）也是如此。
 
+## 文件共享
+
+主机 `~/Downloads` 出现在 Android 的 `Download/Host`，由主机侧 Waydroid 的 `waydroid/0004-host-shared-folders.patch` 实现（`waydroid.cfg` 的 `shared_folders` 每行一个 `主机目录:存储路径`）。
+- Android 的 `/data/media` 只由 MediaProvider（`/sdcard` 背后的 FUSE 进程，本机 uid 10120）读写，所以用 idmapped bind mount：主机用户的 uid/gid 映射为 MediaProvider 的 uid/gid，Android 侧建的文件落到主机上归当前用户。uid 从 `packages.list` 读，不写死。
+- vold 开机时把 `/data/media` 非递归地 bind 到 FUSE 下层路径 `/mnt/pass_through/0/emulated`，在那之前挂上的子挂载不会被带进去（Android 侧写入会落进挂载点底下的原目录）。所以 container manager 等容器 init 的挂载表里出现这个路径后再挂，靠挂载传播进入 Android；停容器时卸载。
+- 挂载点放在主机的 Waydroid data 目录下，该目录归普通用户所有，root 在其中建目录和挂载时一律按 fd 操作（`open_tree` + `move_mount`），不按路径。
+- 存储路径要放在标准目录下面：MediaProvider 只允许应用在接受该类型的顶层目录里建文件（`Download` 接受所有类型），顶层自建的 `Host` 目录里能建 txt 但建不了 png。
+
+实测：以 uid 2000 经 FUSE 在 `Download/Host` 建 png、txt、目录，读主机文件，主机上属主为 1000:1000；主机新建的文件 Android 立即可见；`waydroid session stop` 后挂载全部卸掉。主机放入的文件要等 MediaStore 扫描后图库才列出（`content call --uri content://media --method scan_volume --arg external_primary`）。
+
 ## GApps
 
 system 用 ATV 的 GAPPS 版，vendor 不变。设备指纹为 Pixel Tablet（`google/tangorpro/tangorpro:17/CP2A.260705.006`）。Play 商店需要把 GSF ID（`/data/data/com.google.android.gms/databases/gservices.db` 中 `main` 表的 `android_id`）登记到 https://www.google.com/android/uncertified 。换镜像后已验证：ANGLE/NVK 渲染、HostIme 自动启用、KernelSU 开机流程、桌面窗口、dmesg 无 Xid。Waydroid 过不了 Play Integrity 的设备完整性校验，强制该校验的应用（银行等）不可用。

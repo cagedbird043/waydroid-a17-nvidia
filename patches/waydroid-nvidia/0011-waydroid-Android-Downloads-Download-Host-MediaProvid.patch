@@ -1,0 +1,356 @@
+From 891b5b30d9c531a9926f7bd1e8734eef76e454ed Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 24 Oct 2026 19:17:50 +0800
+Subject: [PATCH 11/11] =?utf-8?q?waydroid=EF=BC=9A=E6=8A=8A=E4=B8=BB?=
+ =?utf-8?q?=E6=9C=BA=E6=96=87=E4=BB=B6=E5=A4=B9=E5=85=B1=E4=BA=AB=E8=BF=9B?=
+ =?utf-8?q?=20Android=20=E5=86=85=E9=83=A8=E5=AD=98=E5=82=A8=EF=BC=88?=
+ =?utf-8?q?=E9=BB=98=E8=AE=A4=20~/Downloads=20=E2=86=92=20Download/Host?=
+ =?utf-8?q?=EF=BC=8C=E6=8C=89=20MediaProvider=20=E7=9A=84=20uid=20?=
+ =?utf-8?q?=E5=81=9A=20idmapped=20=E6=8C=82=E8=BD=BD=EF=BC=8CAndroid=20?=
+ =?utf-8?q?=E5=90=AF=E5=8A=A8=E5=90=8E=E6=8C=82=E4=B8=8A=EF=BC=8C=E5=81=9C?=
+ =?utf-8?q?=E5=AE=B9=E5=99=A8=E6=97=B6=E5=8D=B8=E8=BD=BD=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ packaging/install.sh                    |   1 +
+ waydroid/0004-host-shared-folders.patch | 281 ++++++++++++++++++++++++
+ waydroid/README.md                      |  17 ++
+ 3 files changed, 299 insertions(+)
+ create mode 100644 waydroid/0004-host-shared-folders.patch
+
+diff --git a/packaging/install.sh b/packaging/install.sh
+index 3f4af14..81ae015 100755
+--- a/packaging/install.sh
++++ b/packaging/install.sh
+@@ -334,6 +334,7 @@ if [ -f "$SRC/waydroid/0002-seccomp-allow-kernelsu-supercall.patch" ]; then
+     patch -s -d "$WORK/waydroid" -p1 < "$SRC/waydroid/0002-seccomp-allow-kernelsu-supercall.patch"
+ fi
+ patch -s -d "$WORK/waydroid" -p1 < "$SRC/waydroid/0003-drop-python-clipboard-service.patch"
++patch -s -d "$WORK/waydroid" -p1 < "$SRC/waydroid/0004-host-shared-folders.patch"
+ cmp -s "$SRC/waydroid/nvidia_native.py" "$WORK/waydroid/tools/helpers/nvidia_native.py" || die "patched generator differs from the release's"
+ NFT=1; command -v nft >/dev/null 2>&1 || NFT=0
+ make -s -C "$WORK/waydroid" install DESTDIR="$ROOT" USE_NFTABLES=$NFT >/dev/null
+diff --git a/waydroid/0004-host-shared-folders.patch b/waydroid/0004-host-shared-folders.patch
+new file mode 100644
+index 0000000..2fe7966
+--- /dev/null
++++ b/waydroid/0004-host-shared-folders.patch
+@@ -0,0 +1,281 @@
++Share host folders into Android's internal storage.
++
++[waydroid] shared_folders in waydroid.cfg lists "host folder:storage path" pairs, one per
++line (default ~/Downloads:Download/Host, an empty value disables it). Once vold has bound
++/data/media to the FUSE lower path, the container manager bind-mounts each folder below the
++session's data directory with an id mapping between the session user and MediaProvider, and
++the mount reaches Android through propagation. Stopping the container unmounts them.
++
++diff --git a/tools/actions/container_manager.py b/tools/actions/container_manager.py
++--- a/tools/actions/container_manager.py
+++++ b/tools/actions/container_manager.py
++@@ -217,6 +217,11 @@
++ 
++     helpers.lxc.start(args)
++     services.hardware_manager.start(args)
+++    # Host folders in internal storage; a failure only costs the sharing
+++    try:
+++        helpers.shared_folders.start(args, session)
+++    except Exception as e:
+++        logging.warning("Shared folders not mounted: %s", e)
++ 
++     args.session = session
++ 
++@@ -233,6 +238,9 @@
++             helpers.lxc.stop(args)
++             while helpers.lxc.status(args) != "STOPPED":
++                 pass
+++        if "session" in args:
+++            with suppress(Exception):
+++                helpers.shared_folders.stop(args, args.session)
++ 
++         # Networking
++         command = [tools.config.tools_src +
++二进制文件 wd-a/tools/actions/__pycache__/container_manager.cpython-314.pyc 和 wd-b/tools/actions/__pycache__/container_manager.cpython-314.pyc 不同
++diff --git a/tools/helpers/__init__.py b/tools/helpers/__init__.py
++--- a/tools/helpers/__init__.py
+++++ b/tools/helpers/__init__.py
++@@ -13,3 +13,4 @@
++ import tools.helpers.protocol
++ import tools.helpers.version
++ import tools.helpers.logging
+++import tools.helpers.shared_folders
++二进制文件 wd-a/tools/helpers/__pycache__/shared_folders.cpython-314.pyc 和 wd-b/tools/helpers/__pycache__/shared_folders.cpython-314.pyc 不同
++diff --git a/tools/helpers/shared_folders.py b/tools/helpers/shared_folders.py
++--- /dev/null
+++++ b/tools/helpers/shared_folders.py
++@@ -0,0 +1,234 @@
+++# Copyright 2026 cagedbird043
+++# SPDX-License-Identifier: GPL-3.0-or-later
+++"""Host folders shared into Android's internal storage.
+++
+++[waydroid] shared_folders in waydroid.cfg holds one "host folder:storage path" pair per line;
+++the storage path is relative to internal storage (/sdcard) and a leading ~ in the host folder
+++is the session user's home. Without the key ~/Downloads appears as Download/Host; an empty
+++value shares nothing. MediaProvider lets apps create a file only below the standard top-level
+++folders that take its type (Download takes all), so storage paths belong below one of them.
+++
+++Only MediaProvider (the FUSE daemon behind /sdcard) touches the lower filesystem /data/media,
+++under its own uid and gid. Each folder is therefore bind-mounted with an id mapping: the session
+++user's files show up as MediaProvider's, and what MediaProvider creates is stored as the session
+++user's. The mounts sit below the session's data directory, which LXC rbinds to /data. vold binds
+++/data/media non-recursively to the FUSE lower path at boot, so the folders are mounted after that
+++bind exists and reach it through mount propagation.
+++"""
+++import ctypes
+++import logging
+++import os
+++import stat
+++import subprocess
+++import threading
+++import tools.config
+++import tools.helpers.mount
+++
+++DEFAULT = "~/Downloads:Download/Host"
+++MEDIA_PROVIDERS = ("com.android.providers.media.module", "com.google.android.providers.media.module")
+++MEDIA_RW_GID = 1023
+++# root-only spot where mount(8) applies the id mapping before the mount moves to its target
+++STAGING = "/run/waydroid-shared-folder"
+++# vold's bind of /data/media that MediaProvider serves /sdcard from
+++FUSE_LOWER = "/mnt/pass_through/0/emulated"
+++BOOT_TIMEOUT = 300
+++_stop = threading.Event()
+++
+++_libc = ctypes.CDLL(None, use_errno=True)
+++SYS_OPEN_TREE, SYS_MOVE_MOUNT = 428, 429      # same number on every architecture
+++OPEN_TREE_CLONE = 0x1
+++MOVE_MOUNT_F_EMPTY_PATH, MOVE_MOUNT_T_EMPTY_PATH = 0x4, 0x40
+++
+++
+++def _check(ret):
+++    if ret < 0:
+++        err = ctypes.get_errno()
+++        raise OSError(err, os.strerror(err))
+++    return ret
+++
+++
+++def _move_to(path, dst_fd):
+++    """Attach a copy of the mount at path onto the folder dst_fd refers to."""
+++    tree = _check(_libc.syscall(SYS_OPEN_TREE, -100, path.encode(), OPEN_TREE_CLONE | os.O_CLOEXEC))
+++    try:
+++        _check(_libc.syscall(SYS_MOVE_MOUNT, tree, b"", dst_fd, b"",
+++                             MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH))
+++    finally:
+++        os.close(tree)
+++
+++
+++def _pairs(args, session):
+++    raw = tools.config.load(args)["waydroid"].get("shared_folders", DEFAULT)
+++    for line in raw.splitlines():
+++        line = line.strip()
+++        if not line:
+++            continue
+++        host, sep, guest = line.rpartition(":")
+++        parts = [p for p in guest.split("/") if p]
+++        if not sep or not host or not parts or any(p in (".", "..") for p in parts):
+++            logging.warning("shared_folders: ignoring \"{}\" (expected host folder:storage path)".format(line))
+++            continue
+++        if host == "~" or host.startswith("~/"):
+++            host = session["host_user"] + host[1:]
+++        yield host, parts
+++
+++
+++def _media_provider_uid(data_fd):
+++    try:
+++        fd = os.open("system/packages.list", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=data_fd)
+++    except OSError:
+++        return None
+++    with os.fdopen(fd) as f:
+++        for line in f:
+++            words = line.split()
+++            if len(words) >= 2 and words[0] in MEDIA_PROVIDERS:
+++                return int(words[1])
+++    return None
+++
+++
+++def _open_dir(name, dir_fd):
+++    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+++
+++
+++def _storage_dir(parent_fd, parts, uid):
+++    """Open parent/parts, creating missing folders the way Android's own look (uid:media_rw 2770)."""
+++    fd = os.dup(parent_fd)
+++    try:
+++        for name in parts:
+++            try:
+++                os.mkdir(name, 0o700, dir_fd=fd)
+++                created = True
+++            except FileExistsError:
+++                created = False
+++            child = _open_dir(name, fd)
+++            os.close(fd)
+++            fd = child
+++            if created:
+++                os.fchown(fd, uid, MEDIA_RW_GID)
+++                os.fchmod(fd, 0o2770)
+++        return fd
+++    except BaseException:
+++        os.close(fd)
+++        raise
+++
+++
+++def umount_all(args, session):
+++    media = os.path.join(os.path.realpath(session["waydroid_data"]), "media") + "/"
+++    for mountpoint in tools.helpers.mount.umount_all_list(media):
+++        if mountpoint.startswith(media):
+++            subprocess.run(["umount", "-l", mountpoint], check=False)
+++
+++
+++def start(args, session):
+++    """Drop mounts a crashed session left behind; share the folders once Android has booted."""
+++    umount_all(args, session)
+++    _stop.clear()
+++    threading.Thread(target=_wait_and_mount, args=(args, session), daemon=True).start()
+++
+++
+++def stop(args, session):
+++    _stop.set()
+++    umount_all(args, session)
+++
+++
+++def _fuse_lower_ready():
+++    r = subprocess.run(["lxc-info", "-P", tools.config.defaults["lxc"], "-n", "waydroid", "-pH"],
+++                       capture_output=True, text=True)
+++    pid = r.stdout.strip()
+++    if r.returncode or not pid.isdigit():
+++        return False
+++    try:
+++        with open("/proc/{}/mountinfo".format(pid)) as f:
+++            return any(line.split()[4] == FUSE_LOWER for line in f)
+++    except OSError:
+++        return False
+++
+++
+++def _wait_and_mount(args, session):
+++    for _ in range(BOOT_TIMEOUT):
+++        if _stop.wait(1):
+++            return
+++        if _fuse_lower_ready():
+++            break
+++    else:
+++        logging.warning("shared_folders: {} did not appear, nothing shared".format(FUSE_LOWER))
+++        return
+++    try:
+++        mount_all(args, session)
+++    except Exception as e:
+++        logging.warning("shared_folders: %s", e)
+++
+++
+++def mount_all(args, session):
+++    pairs = list(_pairs(args, session))
+++    if not pairs:
+++        return
+++    user, group = int(session["user_id"]), int(session["group_id"])
+++    data = os.path.realpath(session["waydroid_data"])
+++    data_fd = os.open(data, os.O_RDONLY | os.O_DIRECTORY)
+++    try:
+++        if os.fstat(data_fd).st_uid != user:
+++            logging.warning("shared_folders: {} is not owned by the session user, nothing shared".format(data))
+++            return
+++        try:
+++            storage_fd = _open_dir("media", data_fd)
+++            try:
+++                child = _open_dir("0", storage_fd)
+++            finally:
+++                os.close(storage_fd)
+++            storage_fd = child
+++        except OSError:
+++            logging.info("shared_folders: internal storage does not exist yet, shared from the next start on")
+++            return
+++        try:
+++            uid = _media_provider_uid(data_fd)
+++            if uid is None:
+++                logging.warning("shared_folders: MediaProvider is not in packages.list, nothing shared")
+++                return
+++            idmap = "X-mount.idmap=u:{0}:{2}:1 g:{1}:{2}:1".format(user, group, uid)
+++            for host, parts in pairs:
+++                _mount_one(host, parts, storage_fd, user, uid, idmap)
+++        finally:
+++            os.close(storage_fd)
+++    finally:
+++        os.close(data_fd)
+++
+++
+++def _mount_one(host, parts, storage_fd, user, uid, idmap):
+++    try:
+++        src_fd = os.open(host, os.O_RDONLY | os.O_DIRECTORY)
+++    except OSError as e:
+++        logging.warning("shared_folders: cannot open {}: {}".format(host, e.strerror))
+++        return
+++    try:
+++        st = os.fstat(src_fd)
+++        if not stat.S_ISDIR(st.st_mode) or st.st_uid != user:
+++            logging.warning("shared_folders: {} is not a folder owned by the session user".format(host))
+++            return
+++        dst_fd = _storage_dir(storage_fd, parts, uid)
+++        try:
+++            os.makedirs(STAGING, mode=0o700, exist_ok=True)
+++            if tools.helpers.mount.ismount(STAGING):
+++                subprocess.run(["umount", "-l", STAGING], check=False)
+++            r = subprocess.run(["mount", "--bind", "-o", idmap, "/proc/self/fd/{}".format(src_fd), STAGING],
+++                               pass_fds=(src_fd,), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+++            if r.returncode:
+++                logging.warning("shared_folders: mounting {} failed: {}".format(host, r.stdout.strip()))
+++                return
+++            try:
+++                # mount(8) resolves paths itself: make sure it took the folder that was checked
+++                staged = os.stat(STAGING)
+++                if (staged.st_dev, staged.st_ino) != (st.st_dev, st.st_ino):
+++                    logging.warning("shared_folders: {} changed while being shared".format(host))
+++                    return
+++                # the target goes by file descriptor, so no symlink can redirect it
+++                _move_to(STAGING, dst_fd)
+++            finally:
+++                subprocess.run(["umount", "-l", STAGING], check=False)
+++            logging.info("shared_folders: {} -> /sdcard/{}".format(host, "/".join(parts)))
+++        finally:
+++            os.close(dst_fd)
+++    except OSError as e:
+++        logging.warning("shared_folders: cannot share {}: {}".format(host, e))
+++    finally:
+++        os.close(src_fd)
+diff --git a/waydroid/README.md b/waydroid/README.md
+index 6bb231d..2edffbf 100644
+--- a/waydroid/README.md
++++ b/waydroid/README.md
+@@ -4,6 +4,7 @@
+   Waydroid as `tools/helpers/nvidia_native.py`.
+ - `0001-lxc-nvidia-native-mounts.patch`: hooks it into Waydroid (`lxc.py`, `images.py`, `session_manager.py`).
+   Applies after `patches/waydroid/0001-nvidia-integration.patch` at Waydroid `a33a5c0`.
++- `0004-host-shared-folders.patch`: shares host folders into Android's internal storage (see below).
+ - `test_nvidia_native.py`: unit tests, no root. Run `dev/build-waydroid`, then
+   `python3 -m pytest -q waydroid/test_nvidia_native.py`.
+ 
+@@ -75,3 +76,19 @@ waydroid prop set persist.waydroid.nvidia_video_decode on    # NVDEC (default)
+ 
+ Use `waydroid prop set`, not `[properties]` (that entry is refused). Running apps pick up the change on their
+ next decoder; `logcat -s nvc2` shows the service's log.
++
++## Shared folders
++
++```ini
++[waydroid]
++shared_folders = ~/Downloads:Download/Host
++    ~/Pictures:Pictures/Host
++```
++
++One `host folder:storage path` pair per line; the storage path is relative to internal storage (`/sdcard`).
++Without the key `~/Downloads` appears as `Download/Host`; `shared_folders =` shares nothing. Android apps may
++create a file only below a standard top-level folder that takes its type (`Download` takes every type, `Pictures`
++and `DCIM` take images and videos), so put storage paths below one. The folders must belong to the session user.
++The container manager mounts them once Android has booted and unmounts them when the container stops; changes take
++effect at the next session start. Files Android creates belong to the session user on the host. Host files appear
++in file managers and the system file picker right away; galleries list them only after MediaStore scanned them.
+-- 
+2.56.0
+
