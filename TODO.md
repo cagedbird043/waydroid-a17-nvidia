@@ -22,11 +22,11 @@
 
 ## 功能
 
-1. **重负载实测**：glmark2 太轻；换真实 3D 游戏或 GFXBench，看性能和稳定性，同时盯 Xid。
+1. **重负载实测**：3DMark Wild Life Extreme（Vulkan，4K）12287–13096 分、约 74 FPS，无 Xid，连续多遍稳定（需下面的 NVK 修复）。还没测真实 3D 游戏。
 
 ## 不做
 
-- **整版跟进 waydroid-nvidia**：本仓库是分叉（自编双队列 NVK、主机侧补丁、自编 vendor），不随上游 rc 版本 rebase。上游有用的修复读懂后移植过来；NVIDIA 驱动升级后门禁不过时先看上游怎么修的。待移植候选（rc11，`7670f54` 及之前）：Codec2 视频中途换分辨率不再断播、VP9 segmentation 与 NVIDIA 一致。NVK 遇到 2D 图像的 3D 视图不再中止进程（上游 `3152d37`）已移入本地源码，未编译，下次重编 native 生效。ATV 出新 system 镜像时单独评估。
+- **整版跟进 waydroid-nvidia**：本仓库是分叉（自编双队列 NVK、主机侧补丁、自编 vendor），不随上游 rc 版本 rebase。上游有用的修复读懂后移植过来；NVIDIA 驱动升级后门禁不过时先看上游怎么修的。待移植候选（rc11，`7670f54` 及之前）：Codec2 视频中途换分辨率不再断播、VP9 segmentation 与 NVIDIA 一致。NVK 遇到 2D 图像的 3D 视图不再中止进程（上游 `3152d37`，本地 `7b39af9`）：已编译，本机经 vendor overlay 验证（3DMark Wild Life Extreme 同一进程第二次加载场景不再在 `nil_image_view_descriptor` abort），下次发版打进 native bundle。ATV 出新 system 镜像时单独评估。
 
 - **32 位 ARM（`armeabi-v7a`）**：现在的应用基本都有 arm64 版本（Play 早已要求 64 位，新手机也已不支持 32 位应用）。ATV A17 镜像只带 arm64 翻译；ATV 的 `vendor_google_proprietary_ndk_translation-prebuilt` 在 `16arm_16arm64` 分支上有 32 位库，但那是 Android 16 的。
 - **桌面窗口和卡片同时开**：两者共用一块 Android 屏幕，只能二选一。卡片加主机菜单里的 Android 应用启动项已经覆盖日常用法；只有用桌面小部件、或个别应用当卡片用有问题时才需要桌面窗口，临时切过去即可。
@@ -41,4 +41,5 @@
 - 本机的 Waydroid 由 pacman 包 `waydroid-a17-nvidia-bin` 管理；`scripts/reinstall-vendor.sh`（走 `install.sh`）会因文件归 pacman 所有而拒绝安装，重装走上面的 makepkg 流程。
 - 清空 Waydroid data 后要重新放 `/data/adb/ksud`、装管理器（`kernelsu/README.md` 第 5 步），并重新 `waydroid prop set persist.waydroid.multi_windows true`。
 - `nvidia/waydroid-nvidia` 中 `eec39aa` 及之前的提交不能重写：native bundle 的 BUILD-RECORD 记着从 `eec39aa` 编出，`install.sh --source` 要求本地源码是它的后代。
+- 只重编 NVK（几十秒，增量）：在 `nvidia/waydroid-nvidia` 下 `podman run --rm --userns=keep-id --network=none -v $PWD:/work -w /work -e HOME=/work/build/.buildenv-home -e CARGO_HOME=/work/build/.buildenv-home/cargo localhost/nvk-native-a17 python3 nvidia-prolapse/driver-source/native/mesa/build.py --target android --rust-profile release -j 14`（32 位用 `--target android32`）；产物 `build/nvk-{android,android32}/src/nouveau/vulkan/libvulkan_nouveau.so`，测试时装进 overlay 的 `vendor/lib64/`、`vendor/lib/`。
 - 调试：`setprop waydroid.dump_hal 1`（下一帧打印图层、任务、窗口）；`waydroid prop set persist.waydroid.clipboard_debug true` 后重启会话（logcat `hwcomposer` 的 `clipboard:` 行）。
