@@ -1,0 +1,41 @@
+From 445a159175245fedf9b00b1e78d2596e8a38535d Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 24 Oct 2026 23:06:28 +0800
+Subject: [PATCH] =?utf-8?q?gbm=5Fmesa=EF=BC=9ABGR888=20=E4=B8=8D=E5=86=8D?=
+ =?utf-8?q?=E5=A3=B0=E7=A7=B0=E5=8F=AF=E4=BD=9C=20GPU=20=E6=B8=B2=E6=9F=93?=
+ =?utf-8?q?=E7=9B=AE=E6=A0=87=EF=BC=88R8=20=E8=BD=BD=E4=BD=93=E6=97=A0?=
+ =?utf-8?q?=E6=B3=95=E6=B8=B2=E6=9F=93=EF=BC=9B=E5=90=A6=E5=88=99=20A17=20?=
+ =?utf-8?q?Vulkan=20loader=20=E8=BF=9B=E5=85=A5=20R8G8B8=20swapchain=20?=
+ =?utf-8?q?=E5=88=86=E6=94=AF=EF=BC=8CVulkan=201.0=20=E5=BA=94=E7=94=A8?=
+ =?utf-8?q?=E7=A9=BA=E6=8C=87=E9=92=88=E5=B4=A9=E6=BA=83=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ gbm_mesa_driver/gbm_mesa_internals.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/gbm_mesa_driver/gbm_mesa_internals.cpp b/gbm_mesa_driver/gbm_mesa_internals.cpp
+index 814e9a5..93b1e1a 100644
+--- a/gbm_mesa_driver/gbm_mesa_internals.cpp
++++ b/gbm_mesa_driver/gbm_mesa_internals.cpp
+@@ -377,6 +377,15 @@ int gbm_mesa_bo_create2(struct bo *bo, uint32_t width, uint32_t height, uint32_t
+ 	const bool sw_access = unmask64(&use_flags, BO_USE_SW_MASK);
+ 	const bool gpu_render = (use_flags & (BO_USE_RENDERING | BO_USE_FRONT_RENDERING)) != 0;
+ 
++	/* BGR888 lives in an R8 carrier, which the GPU cannot use as a colour target. Answering a
++	 * render probe with "supported" sends the A17 Vulkan loader into its R8G8B8 swapchain path
++	 * (vkGetPhysicalDeviceSurfaceFormatsKHR), which crashes Vulkan 1.0 instances. */
++	if (format == DRM_FORMAT_BGR888 && gpu_render) {
++		if (!test_only)
++			drv_loge("BGR888 cannot be a GPU render target");
++		return -EINVAL;
++	}
++
+ 	struct alloc_args alloc_args = {
+ 		.gbm = drv->gbm_dev,
+ 		.width = width,
+-- 
+2.56.0
+
