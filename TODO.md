@@ -16,8 +16,8 @@
 
 ## 发版
 
-1. **发版流程**：完整编 vendorimage → 删掉 `/var/lib/waydroid/overlay/vendor` 里调试用的文件（`lib64/hw/hwcomposer.waydroid.so`、`app/WaydroidHostIme`、`overlay/WaydroidFrameworkOverlay.apk`） → `scripts/reinstall-vendor.sh`（含门禁）→ 回归（卡片、桌面窗口、输入法、剪贴板、KernelSU）→ 分块上传 Release。
-2. **AUR**：暂缓。计划拆成 `waydroid-a17-nvidia`（打过补丁的 Waydroid 主机部分，`conflicts=(waydroid)`）和 `waydroid-a17-nvidia-vendor-bin`（从 Release 下载 vendor 镜像）；KernelSU 不进 AUR（签名因人而异）。先看 waydroid-nvidia 的 `ci-aur` 分支，避免重复。
+1. **发版流程**：完整编 vendorimage → 删掉 `/var/lib/waydroid/overlay/vendor` 里调试用的文件（`lib64/hw/hwcomposer.waydroid.so`、`app/WaydroidHostIme`、`overlay/WaydroidFrameworkOverlay.apk`）→ 压缩分块、打 native bundle → 放进 `aur/waydroid-a17-nvidia-bin/`（文件名与 `source` 一致，makepkg 不再下载）改 `_tag`/`pkgver`、`updpkgsums`、`makepkg -fC`、`sudo pacman -U` → `sudo waydroid-nvidia-setup`（门禁）→ 回归（卡片、桌面窗口、输入法、剪贴板、文件共享、KernelSU）→ 打 tag、上传 Release → 删掉本地放的文件后 `makepkg -fC` 再验一遍下载 → `.SRCINFO`、推 AUR。
+2. **AUR**：`waydroid-a17-nvidia-bin`（`aur/` 目录）。每次发版后改 `_tag`/`pkgver`，`updpkgsums`，`makepkg --printsrcinfo > .SRCINFO`，推到 `ssh://aur@aur.archlinux.org/waydroid-a17-nvidia-bin.git`。native bundle 作为 Release 资产 `waydroid-a17-nvidia-native-x86_64.tar.zst` 一起上传。
 
 ## 功能
 
@@ -36,7 +36,7 @@
 
 ## 维护备忘
 
-- 重装用 `scripts/reinstall-vendor.sh`，它会把 `debug.hwui.renderer` 写回 `skiavk`。
+- 本机的 Waydroid 由 pacman 包 `waydroid-a17-nvidia-bin` 管理；`scripts/reinstall-vendor.sh`（走 `install.sh`）会因文件归 pacman 所有而拒绝安装，重装走上面的 makepkg 流程。
 - 清空 Waydroid data 后要重新放 `/data/adb/ksud`、装管理器（`kernelsu/README.md` 第 5 步），并重新 `waydroid prop set persist.waydroid.multi_windows true`。
 - `nvidia/waydroid-nvidia` 中 `eec39aa` 及之前的提交不能重写：native bundle 的 BUILD-RECORD 记着从 `eec39aa` 编出，`install.sh --source` 要求本地源码是它的后代。
 - 调试：`setprop waydroid.dump_hal 1`（下一帧打印图层、任务、窗口）；`waydroid prop set persist.waydroid.clipboard_debug true` 后重启会话（logcat `hwcomposer` 的 `clipboard:` 行）。

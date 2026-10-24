@@ -25,9 +25,30 @@ Waydroid 整合版：Android 17（LineageOS 24.0）+ NVIDIA 显卡硬件加速 +
 
 已知问题和计划见 [`TODO.md`](TODO.md)，详细的移植记录、测试结果和性能数据见 [`reports/porting.md`](reports/porting.md)。
 
-## 使用预编译 vendor 镜像
+## 安装（Arch：AUR）
 
-Releases 里的 vendor 镜像分块上传：
+```bash
+yay -S waydroid-a17-nvidia-bin
+```
+
+包内含打过本仓库补丁的 Waydroid 主机部分、本仓库 Release 的 vendor 镜像和它配套的 native bundle、记住卡片位置的 KWin 脚本；不含 Android system 镜像和 KernelSU。装好后按提示：
+
+```bash
+sudo mkdir -p /etc/waydroid-extra/images
+# ATV 20261017 的 system 镜像（GAPPS 或 VANILLA）：https://github.com/WayDroid-ATV/waydroid-builds/releases/tag/20261017
+sudo bsdtar -xf lineage-24.0-20261017-GAPPS-waydroid_x86_64-system.zip -C /etc/waydroid-extra/images system.img
+sudo bsdtar -xf /usr/lib/waydroid-nvidia/vendor/waydroid-nvidia-vendor-x86_64-*.zip -C /etc/waydroid-extra/images vendor.img
+sudo waydroid init -f
+sudo waydroid-nvidia-setup        # 在本机 GPU 和内核模块上跑发布门禁，通过后装上 vendor 镜像
+waydroid prop set persist.waydroid.multi_windows true
+waydroid session start
+```
+
+需要 NVIDIA open 内核模块（作者用 615.78.08）和 binder（binderfs）。NVIDIA 驱动更新并重启后要再跑一次 `sudo waydroid-nvidia-setup`。KWin 脚本在「系统设置 → 窗口管理 → KWin 脚本」里启用「Waydroid card placement」。root 见 [`kernelsu/`](kernelsu/)。
+
+## 手动使用预编译 vendor 镜像
+
+其他发行版或不用 AUR 时，Releases 里的 vendor 镜像分块上传：
 
 ```bash
 cat vendor.img.zst.part* > vendor.img.zst && zstd -d vendor.img.zst
@@ -72,6 +93,7 @@ sha256sum -c vendor.img.zst.sha256   # 校验分块、压缩包和解压后的�
 | `container/` | 编译容器 |
 | `scripts/` | 同步、打补丁、编译、重装 vendor、跑分（按作者本机目录布局写的） |
 | `host/` | 宿主机开机加载 KernelSU 的 systemd 服务；记住卡片位置的 KWin 脚本 |
+| `aur/` | AUR 包 `waydroid-a17-nvidia-bin` 的 PKGBUILD |
 | `kernelsu/` | KernelSU 步骤、kernelsu-dkms PKGBUILD、管理器编译与签名脚本 |
 | `reports/` | 移植、对比、性能报告 |
 
