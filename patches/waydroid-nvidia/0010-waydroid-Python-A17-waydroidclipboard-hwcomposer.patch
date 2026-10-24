@@ -1,0 +1,190 @@
+From 58f8014db80cfe25d41025752219f5945a0942c4 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 17:24:34 +0800
+Subject: [PATCH 10/10] =?utf-8?q?waydroid=EF=BC=9A=E5=8E=BB=E6=8E=89?=
+ =?utf-8?q?=E4=B8=BB=E6=9C=BA=E4=BE=A7=20Python=20=E5=89=AA=E8=B4=B4?=
+ =?utf-8?q?=E6=9D=BF=E6=9C=8D=E5=8A=A1=EF=BC=88A17=20=E6=A1=86=E6=9E=B6?=
+ =?utf-8?q?=E4=B8=8D=E8=B0=83=E7=94=A8=20waydroidclipboard=EF=BC=8C?=
+ =?utf-8?q?=E5=89=AA=E8=B4=B4=E6=9D=BF=E7=94=B1=20hwcomposer=20=E8=B4=9F?=
+ =?utf-8?q?=E8=B4=A3=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ packaging/install.sh                          |   1 +
+ .../0003-drop-python-clipboard-service.patch  | 150 ++++++++++++++++++
+ 2 files changed, 151 insertions(+)
+ create mode 100644 waydroid/0003-drop-python-clipboard-service.patch
+
+diff --git a/packaging/install.sh b/packaging/install.sh
+index b1bd88b..3f4af14 100755
+--- a/packaging/install.sh
++++ b/packaging/install.sh
+@@ -333,6 +333,7 @@ patch -s -d "$WORK/waydroid" -p1 < "$SRC/waydroid/0001-lxc-nvidia-native-mounts.
+ if [ -f "$SRC/waydroid/0002-seccomp-allow-kernelsu-supercall.patch" ]; then
+     patch -s -d "$WORK/waydroid" -p1 < "$SRC/waydroid/0002-seccomp-allow-kernelsu-supercall.patch"
+ fi
++patch -s -d "$WORK/waydroid" -p1 < "$SRC/waydroid/0003-drop-python-clipboard-service.patch"
+ cmp -s "$SRC/waydroid/nvidia_native.py" "$WORK/waydroid/tools/helpers/nvidia_native.py" || die "patched generator differs from the release's"
+ NFT=1; command -v nft >/dev/null 2>&1 || NFT=0
+ make -s -C "$WORK/waydroid" install DESTDIR="$ROOT" USE_NFTABLES=$NFT >/dev/null
+diff --git a/waydroid/0003-drop-python-clipboard-service.patch b/waydroid/0003-drop-python-clipboard-service.patch
+new file mode 100644
+index 0000000..50cb781
+--- /dev/null
++++ b/waydroid/0003-drop-python-clipboard-service.patch
+@@ -0,0 +1,150 @@
++Drop the host clipboard service: the Android 17 framework never calls
++lineageos.waydroid.IClipboard; the clipboard is hwcomposer's IWaydroidClipboard,
++which reaches the host clipboard through ext-data-control.
++
++diff --git a/tools/actions/session_manager.py b/tools/actions/session_manager.py
++index 1b1a48f..3a00bc7 100644
++--- a/tools/actions/session_manager.py
+++++ b/tools/actions/session_manager.py
++@@ -124,13 +124,11 @@ def start(args, unlocked_cb=None, background=True):
++         sys.exit(0)
++ 
++     services.user_manager.start(args, session, unlocked_cb)
++-    services.clipboard_manager.start(args)
++     services.notification_manager.start(args, session)
++     service(args, mainloop)
++ 
++ def do_stop(args, looper):
++     services.user_manager.stop(args)
++-    services.clipboard_manager.stop(args)
++     services.notification_manager.stop(args)
++     looper.quit()
++ 
++diff --git a/tools/interfaces/IClipboard.py b/tools/interfaces/IClipboard.py
++deleted file mode 100644
++index c8538e7..0000000
++--- a/tools/interfaces/IClipboard.py
+++++ /dev/null
++@@ -1,56 +0,0 @@
++-import gbinder
++-import logging
++-from tools import helpers
++-from gi.repository import GLib
++-
++-
++-INTERFACE = "lineageos.waydroid.IClipboard"
++-SERVICE_NAME = "waydroidclipboard"
++-
++-TRANSACTION_sendClipboardData = 1
++-TRANSACTION_getClipboardData = 2
++-
++-def add_service(args, sendClipboardData, getClipboardData):
++-    helpers.drivers.loadBinderNodes(args)
++-    try:
++-        serviceManager = gbinder.ServiceManager("/dev/" + args.BINDER_DRIVER, args.SERVICE_MANAGER_PROTOCOL, args.BINDER_PROTOCOL)
++-    except TypeError:
++-        serviceManager = gbinder.ServiceManager("/dev/" + args.BINDER_DRIVER)
++-
++-    def response_handler(req, code, flags):
++-        logging.debug(
++-            "{}: Received transaction: {}".format(SERVICE_NAME, code))
++-        reader = req.init_reader()
++-        local_response = response.new_reply()
++-        if code == TRANSACTION_sendClipboardData:
++-            arg1 = reader.read_string16()
++-            sendClipboardData(arg1)
++-            local_response.append_int32(0)
++-        elif code == TRANSACTION_getClipboardData:
++-            ret = getClipboardData()
++-            local_response.append_int32(0)
++-            local_response.append_string16(ret)
++-        else:
++-            return local_response, -99999 # Some error unknown to binder to force a RemoteException
++-
++-        return local_response, 0
++-
++-    def binder_presence():
++-        if serviceManager.is_present():
++-            status = serviceManager.add_service_sync(SERVICE_NAME, response)
++-
++-            if status:
++-                logging.error("Failed to add service {}: {}".format(
++-                    SERVICE_NAME, status))
++-                args.clipboardLoop.quit()
++-
++-    response = serviceManager.new_local_object(INTERFACE, response_handler)
++-    args.clipboardLoop = GLib.MainLoop()
++-    binder_presence()
++-    status = serviceManager.add_presence_handler(binder_presence)
++-    if status:
++-        args.clipboardLoop.run()
++-        serviceManager.remove_handler(status)
++-        del serviceManager
++-    else:
++-        logging.error("Failed to add presence handler: {}".format(status))
++diff --git a/tools/services/__init__.py b/tools/services/__init__.py
++index 57d1032..337361e 100644
++--- a/tools/services/__init__.py
+++++ b/tools/services/__init__.py
++@@ -1,6 +1,5 @@
++ # Copyright 2021 Erfan Abdi
++ # SPDX-License-Identifier: GPL-3.0-or-later
++ from tools.services.user_manager import start, stop
++-from tools.services.clipboard_manager import start, stop
++ from tools.services.hardware_manager import start, stop
++ from tools.services.notification_manager import start, stop
++diff --git a/tools/services/clipboard_manager.py b/tools/services/clipboard_manager.py
++deleted file mode 100644
++index aedf76d..0000000
++--- a/tools/services/clipboard_manager.py
+++++ /dev/null
++@@ -1,49 +0,0 @@
++-# Copyright 2021 Erfan Abdi
++-# SPDX-License-Identifier: GPL-3.0-or-later
++-import logging
++-import threading
++-from tools.interfaces import IClipboard
++-
++-try:
++-    import pyclip
++-    canClip = True
++-except Exception as e:
++-    logging.debug(str(e))
++-    canClip = False
++-
++-stopping = False
++-
++-def start(args):
++-    def sendClipboardData(value):
++-        try:
++-            pyclip.copy(value)
++-        except Exception as e:
++-            logging.debug(str(e))
++-
++-    def getClipboardData():
++-        try:
++-            return pyclip.paste()
++-        except Exception as e:
++-            logging.debug(str(e))
++-        return ""
++-
++-    def service_thread():
++-        while not stopping:
++-            IClipboard.add_service(args, sendClipboardData, getClipboardData)
++-
++-    if canClip:
++-        global stopping
++-        stopping = False
++-        args.clipboard_manager = threading.Thread(target=service_thread)
++-        args.clipboard_manager.start()
++-    else:
++-        logging.debug("Skipping clipboard manager service because of missing pyclip package")
++-
++-def stop(args):
++-    global stopping
++-    stopping = True
++-    try:
++-        if args.clipboardLoop:
++-            args.clipboardLoop.quit()
++-    except AttributeError:
++-        logging.debug("Clipboard service is not even started")
+-- 
+2.56.0
+

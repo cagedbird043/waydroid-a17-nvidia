@@ -21,13 +21,13 @@
 
 | 仓库 | 分支 | 内容 |
 |---|---|---|
-| `src/hardware/waydroid` | `nvidia-a17` | hwcomposer 移植 18 个提交和 `%llx` 格式修正（`hwcomposer.md`）；`f676385` show-full-ui 静止画面不出窗口；`a122fa3` A17 图层按任务事件映射到任务；`04d1d60` 多窗口 freeform 卡片模式；`379ec63` 多窗口下的 Android 桌面窗口；`17c36f7` 宿主输入法直通（`hostime/`、`hwcomposer/ime-bridge.*`） |
+| `src/hardware/waydroid` | `nvidia-a17` | hwcomposer 移植 18 个提交和 `%llx` 格式修正（`hwcomposer.md`）；`f676385` show-full-ui 静止画面不出窗口；`a122fa3` A17 图层按任务事件映射到任务；`04d1d60` 多窗口 freeform 卡片模式；`379ec63` 多窗口下的 Android 桌面窗口；`17c36f7` 宿主输入法直通（`hostime/`、`hwcomposer/ime-bridge.*`）；`2fba6a7` 剪贴板改用 ext-data-control |
 | `src/external/minigbm` | `nvidia-a17` | gbm_mesa 移植 7 个提交；`cros_gralloc_handle.usage` 恢复为 `int32_t`（`minigbm.md`） |
 | `src/hardware/interfaces` | `nvidia-a17` | composer 2.1/2.4 重连修正（`composer-hal.md`） |
-| `src/external/wayland-protocols` | `nvidia-a17` | 协议版本提升到 1.49 |
+| `src/external/wayland-protocols` | `nvidia-a17` | 协议版本提升到 1.49；`8ee79fc` 加入 ext-data-control-v1 |
 | `src/device/waydroid/waydroid` | `local-build` | x86_64 不编 Mesa nouveau Vulkan；`5421c32` 预装 `WaydroidHostIme` |
 | `src/vendor/waydroid/init` | `nvidia-a17` | `597f6e5` 识别 nvidia-prolapse；`75b2978` 视频解码交给 NVDEC |
-| `nvidia/waydroid-nvidia` | `a17-local` | 门禁 EROFS/APEX/VNDK 支持、KernelSU seccomp 补丁、双队列 NVK（`eec39aa`）、本地安装器（`db78568`、`e63b1fb`）；安装器不重写已有目录、只在图标变化时刷新图标缓存（`26fdaa4`、`b1a3597`、`a30d79a`） |
+| `nvidia/waydroid-nvidia` | `a17-local` | 门禁 EROFS/APEX/VNDK 支持、KernelSU seccomp 补丁、双队列 NVK（`eec39aa`）、本地安装器（`db78568`、`e63b1fb`）；安装器不重写已有目录、只在图标变化时刷新图标缓存（`26fdaa4`、`b1a3597`、`a30d79a`）；`58f8014` 去掉主机侧 Python 剪贴板服务 |
 | `nvidia/product` | （主分支） | `libhwminijail`；native bundle pin（`de9e574`） |
 | `ksu/KernelSU` | `local-manager` | 管理器源码（b42ad459），本地 keystore 签名 |
 
@@ -66,7 +66,12 @@
 
 已在桌面上实测（build-22）：计算器和时钟并排，两个窗口交替点击都落在正确位置；键盘输入；拖动标题栏移动；KDE 缩放后应用按新尺寸重排；长按出现的复制/粘贴浮动工具栏正常显示，且不会让窗口跳位；剪贴板双向互通（Android 复制 → `wl-paste`，`wl-copy` → Android 粘贴）；点关闭按钮后窗口和 Android 任务一起移除；dmesg 无 Xid。
 
-剪贴板服务由主机上的 waydroid 用 `/usr/bin/python3` 加载 `python-pyclip`；PATH 里若有 linuxbrew 等其他 python3，命令行测试时要用 `/usr/bin/python3`。
+剪贴板由 hwcomposer 负责（Android 的 `ClipboardService` 只调用 HIDL `IWaydroidClipboard`，从不调用主机侧 Python 的 `waydroidclipboard`，该服务已删除，见 `waydroid/0003-drop-python-clipboard-service.patch`）。hwcomposer 在控制连接上绑定 `ext_data_control_manager_v1`（剪贴板管理器用的协议）：
+- 主机每次复制都会通知 hwcomposer，不需要 Waydroid 窗口有焦点；hwcomposer 在独立线程读出文本，经 `@waydroid-hostime` 发给 `WaydroidHostIme`，由它 `setPrimaryClip`。必须走这一步：只把文本留给 `ClipboardService` 被动拉取时，框架不发剪贴板变化通知，WebView（浏览器等）会一直粘贴旧内容。
+- Android 复制时 hwcomposer 直接设置主机剪贴板，不需要 input serial，切走焦点后仍在；Android 回传的正是主机文本时不回写，主机保留原有选区。
+- 混成器没有 ext-data-control 时退回 `wl_data_device`（跟随键盘焦点）。
+
+实测（KWin，卡片模式的设置搜索框和浏览器 WebView 输入框、桌面窗口）：主机复制 → 切到 Android 粘贴 → 追加字符 → 全选复制 → 切回主机 `wl-paste`，设置 5/5、WebView 5/5、桌面窗口 3/3（中文、emoji、多行）全部一致；dmesg 无 Xid。调试：`waydroid prop set persist.waydroid.clipboard_debug true` 后重启会话，logcat `hwcomposer` 中 `clipboard:` 行。
 
 ## 宿主输入法
 

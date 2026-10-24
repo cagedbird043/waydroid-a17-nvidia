@@ -26,7 +26,7 @@
 ## 与本环境直接相关的改进
 
 1. **多窗口模式**：已完成。`04d1d60` freeform 卡片模式，`379ec63` 带 KDE 边框的桌面窗口。
-2. **剪贴板与文件共享**：剪贴板双向互通已实测可用；文件共享（把 `~/Downloads` 等目录挂到安卓存储）未做。
+2. **剪贴板与文件共享**：剪贴板已改用 ext-data-control（`2fba6a7`），主机复制经输入法推送进 Android，Python 服务已删除；文件共享（把 `~/Downloads` 等目录挂到安卓存储）未做。
 3. **32 位 ARM 支持**：在 ndk_translation 上补齐 `armeabi-v7a`。先确认 ATV 镜像是否带 32 位翻译库（`/system/lib/libndk_translation.so` 以及 arm 的 linker 等）。
 4. **重负载游戏和基准**：glmark2 负载太轻，换真实 3D 游戏或 GFXBench，看 4060 在这套栈上的实际性能和稳定性（同时盯 Xid）。
 5. **跟进上游**：ATV 出新 system 镜像、waydroid-nvidia 出 rc11 时，用现有脚本 rebase 后重编（`scripts/apply-nvidia.sh`、`scripts/build.sh`、`scripts/reinstall-vendor.sh`）。
@@ -38,8 +38,9 @@
 3. **恢复的卡片位置由 KWin 决定**：Wayland 客户端不能指定位置，重新打开的卡片不一定回到原处。可试：KWin 窗口规则按 app_id（`waydroid.<包名>`）记住位置，或写 KWin 脚本。
 4. **Android 输入框里的内嵌预编辑没验证**：本机 fcitx5 `PreeditEnabledByDefault=False`，预编辑显示在候选框里（与 KWrite 一致）；用 Ctrl+Alt+P 打开内嵌预编辑后 Android 输入框仍未显示，原因未查。
 5. **输入法桥未覆盖的场景**：密码框（content purpose 已传给宿主）、多行文本里的 Enter、`delete_surrounding_text`（fcitx5 的部分联想功能会用）均未实测。
+6. **卡片偶尔整窗透明**：一次重启会话后 `waydroid app launch` 打开的浏览器卡片，KDE 窗口在、hwcomposer 显示 `window shown=1`、图层正常，但窗口里什么都不画；调整窗口尺寸也不恢复，force-stop 后重开正常。只出现一次，未复现，原因未查。
 
-GApps：已决定换 ATV 的 GAPPS 版 system 镜像（`lineage-24.0-20261017-GAPPS`），vendor 不变，data 清空重来。
+GApps：已换 ATV 的 GAPPS 版 system 镜像，Play 商店已认证。
 
 ## 操作注意
 

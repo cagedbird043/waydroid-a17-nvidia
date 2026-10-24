@@ -1,0 +1,696 @@
+From 2fba6a782739173333cc29e08cff8f10ebb6523e Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 17:24:34 +0800
+Subject: [PATCH 25/25] =?utf-8?q?hwcomposer=EF=BC=9A=E5=89=AA=E8=B4=B4?=
+ =?utf-8?q?=E6=9D=BF=E6=94=B9=E7=94=A8=20ext-data-control=EF=BC=8C?=
+ =?utf-8?q?=E4=B8=BB=E6=9C=BA=E5=A4=8D=E5=88=B6=E7=BB=8F=E8=BE=93=E5=85=A5?=
+ =?utf-8?q?=E6=B3=95=E6=8E=A8=E9=80=81=E8=BF=9B=20Android?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+- 控制连接绑定 ext_data_control_manager_v1：主机每次复制都会收到，设置主机剪贴板不再需要键盘焦点和 input serial；混成器不支持时退回 wl_data_device。
+- 读写主机剪贴板放到独立线程，不再阻塞 Wayland 事件循环；按代号丢弃过期的读取。
+- 读到新的主机文本后经 @waydroid-hostime 发给 WaydroidHostIme（新消息 CLIP），由它 setPrimaryClip，框架因此通知应用（WebView 只在收到通知时刷新粘贴缓存）。
+- Android 回传的正是主机文本时不再回写主机，保留主机原有的选区与类型。
+---
+ hostime/src/id/waydro/hostime/HostIme.java |  25 +-
+ hwcomposer/WaydroidClipboard.cpp           | 355 ++++++++++++++++-----
+ hwcomposer/ime-bridge.cpp                  |  17 +
+ hwcomposer/ime-bridge.h                    |   8 +
+ hwcomposer/wayland-hwc.cpp                 |  13 +
+ hwcomposer/wayland-hwc.h                   |  18 ++
+ 6 files changed, 358 insertions(+), 78 deletions(-)
+
+diff --git a/hostime/src/id/waydro/hostime/HostIme.java b/hostime/src/id/waydro/hostime/HostIme.java
+index 7b24d93..553b31a 100644
+--- a/hostime/src/id/waydro/hostime/HostIme.java
++++ b/hostime/src/id/waydro/hostime/HostIme.java
+@@ -1,5 +1,7 @@
+ package id.waydro.hostime;
+ 
++import android.content.ClipData;
++import android.content.ClipboardManager;
+ import android.graphics.Matrix;
+ import android.graphics.RectF;
+ import android.inputmethodservice.InputMethodService;
+@@ -34,6 +36,7 @@ public class HostIme extends InputMethodService {
+     private static final int MSG_FOCUS = 1;
+     private static final int MSG_CURSOR = 2;
+     private static final int MSG_DONE = 10;
++    private static final int MSG_CLIP = 11;
+ 
+     /* zwp_text_input_v3 content hints and purposes. */
+     private static final int HINT_COMPLETION = 0x1;
+@@ -287,12 +290,19 @@ public class HostIme extends InputMethodService {
+             try {
+                 while (true) {
+                     int len = in.readInt();
+-                    if (len < 4 || len > 64 * 1024)
++                    if (len < 4 || len > 16 * 1024 * 1024)
+                         throw new IOException("bad message length " + len);
+                     byte[] buf = new byte[len];
+                     in.readFully(buf);
+                     DataInputStream m = new DataInputStream(new java.io.ByteArrayInputStream(buf));
+-                    if (m.readInt() != MSG_DONE)
++                    int type = m.readInt();
++                    if (type == MSG_CLIP) {
++                        final String text = readString(m);
++                        if (text != null)
++                            main.post(() -> setClip(text));
++                        continue;
++                    }
++                    if (type != MSG_DONE)
+                         continue;
+                     final int before = m.readInt();
+                     final int after = m.readInt();
+@@ -309,6 +319,17 @@ public class HostIme extends InputMethodService {
+         }
+     }
+ 
++    /* The host copied text: make it Android's primary clip through the
++     * framework, which notifies apps (the composer drops the echo it gets
++     * back, so the host keeps its own selection). Always set, never compare
++     * first: reading the clip makes ClipboardService adopt the host text
++     * silently, and the notification is the point. */
++    private void setClip(String text) {
++        ClipboardManager cm = getSystemService(ClipboardManager.class);
++        if (cm != null)
++            cm.setPrimaryClip(ClipData.newPlainText("host clipboard", text));
++    }
++
+     private static String readString(DataInputStream m) throws IOException {
+         int n = m.readInt();
+         if (n < 0)
+diff --git a/hwcomposer/WaydroidClipboard.cpp b/hwcomposer/WaydroidClipboard.cpp
+index 39cd803..79e35c9 100644
+--- a/hwcomposer/WaydroidClipboard.cpp
++++ b/hwcomposer/WaydroidClipboard.cpp
+@@ -16,17 +16,33 @@
+ 
+ /* Thank you @emersion:
+  * https://emersion.fr/blog/2020/wayland-clipboard-drag-and-drop/
+- */
++ *
++ * Two ways to the host clipboard. ext-data-control (the clipboard managers'
++ * protocol) on the control connection is used whenever the compositor offers
++ * it: it reports every selection change and takes a new selection without
++ * keyboard focus or an input serial. Without it the clipboard rides on
++ * wl_data_device of whichever connection has keyboard focus, which only sees
++ * the selection on focus enter and needs a recent serial to set it.
++ *
++ * Transfers never block the Wayland event thread: the host selection is read
++ * and our text is written on short-lived threads. */
+ 
+ #include "WaydroidClipboard.h"
+ 
++#include <fcntl.h>
+ #include <log/log.h>
+ #include <unistd.h>
+ #include <algorithm>
++#include <cerrno>
++#include <cstring>
++#include <mutex>
++#include <thread>
+ #include <vector>
+ 
+ #include <wayland-client.h>
+ 
++#include "ext-data-control-v1-client-protocol.h"
++
+ bool clipboard_debug_enabled() {
+     static const bool enabled =
+         property_get_bool("persist.waydroid.clipboard_debug", false);
+@@ -41,15 +57,220 @@ static const std::vector<std::string> MIME_TYPES = {
+     "STRING",
+ };
+ 
+-static void data_source_handle_send(void *data, struct wl_data_source *, const char *mime_type, int fd) {
+-    // An application wants to paste the clipboard contents
+-    const char *text = (const char *)data;
++static bool is_text_mime(const char *mime_type) {
++    return std::find(MIME_TYPES.begin(), MIME_TYPES.end(), mime_type) != MIME_TYPES.end();
++}
++
++/* The preferred text type among those offered; empty when there is none. */
++template <typename List>
++static std::string pick_text_mime(const List &offered) {
++    for (const auto &want : MIME_TYPES)
++        if (std::find(offered.begin(), offered.end(), want) != offered.end())
++            return want;
++    return "";
++}
++
++/* Hands our text to a host application that pastes it. */
++static void serve_text(const char *mime_type, int fd, std::string text) {
+     CLIPLOG("clipboard: host asked for our selection as %s", mime_type);
+-    if (std::find(MIME_TYPES.begin(), MIME_TYPES.end(), mime_type) != MIME_TYPES.end())
+-        write(fd, text, strlen((char *)text));
+-    else
++    if (!is_text_mime(mime_type)) {
+         ALOGE("Destination client requested unsupported MIME type: %s", mime_type);
+-    close(fd);
++        close(fd);
++        return;
++    }
++    std::thread([fd, text = std::move(text)] {
++        size_t off = 0;
++        while (off < text.size()) {
++            ssize_t n = write(fd, text.data() + off, text.size() - off);
++            if (n < 0 && errno == EINTR)
++                continue;
++            if (n <= 0)
++                break;
++            off += n;
++        }
++        close(fd);
++    }).detach();
++}
++
++/* Reads a host selection the compositor is about to send into fd. A read
++ * that ends after a newer selection arrived is dropped. */
++static void read_host_selection(struct display *display, int fd, const std::string &mime_type) {
++    uint64_t generation;
++    {
++        std::scoped_lock lock(display->clipboard_mutex);
++        generation = ++display->clipboard_generation;
++    }
++    std::thread([display, fd, generation, mime_type] {
++        std::string received;
++        char buf[4096];
++        while (true) {
++            ssize_t n = read(fd, buf, sizeof(buf));
++            if (n < 0 && errno == EINTR)
++                continue;
++            if (n <= 0)
++                break;
++            received.append(buf, n);
++        }
++        close(fd);
++
++        {
++            std::scoped_lock lock(display->clipboard_mutex);
++            if (generation != display->clipboard_generation) {
++                CLIPLOG("clipboard: dropping a stale read of %zu bytes", received.size());
++                return;
++            }
++            /* Nothing transferred means the source went away before writing;
++             * an empty host clipboard is not worth losing what we had. */
++            if (received.empty()) {
++                CLIPLOG("clipboard: host selection transferred 0 bytes as %s, keeping the "
++                        "previous %zu bytes", mime_type.c_str(), display->clipboard.size());
++                return;
++            }
++            /* Our own selection coming back, or a host copy of the same text. */
++            if (received == display->clipboard)
++                return;
++            display->clipboard = received;
++            CLIPLOG("clipboard: read %zu bytes of host selection as %s",
++                    display->clipboard.size(), mime_type.c_str());
++        }
++        /* Android only pulls the host text when an app reads the clipboard and
++         * then does not tell anyone it changed; pushing it in through the
++         * input method makes the framework notify apps. */
++        if (display->ime && display->ime->set_clip(received))
++            CLIPLOG("clipboard: pushed %zu bytes to Android", received.size());
++    }).detach();
++}
++
++/* A pipe for one transfer: returns the write end for the compositor and keeps
++ * the read end in *read_fd. */
++static int transfer_pipe(int *read_fd) {
++    int fds[2];
++    if (pipe2(fds, O_CLOEXEC) != 0) {
++        ALOGE("clipboard: pipe failed: %s", strerror(errno));
++        return -1;
++    }
++    *read_fd = fds[0];
++    return fds[1];
++}
++
++/* ---- ext-data-control ---- */
++
++struct control_offer {
++    std::vector<std::string> mime_types;
++};
++
++static void control_offer_handle_offer(void *data, struct ext_data_control_offer_v1 *,
++                                       const char *mime_type) {
++    static_cast<control_offer *>(data)->mime_types.push_back(mime_type);
++}
++
++static const struct ext_data_control_offer_v1_listener control_offer_listener = {
++    .offer = control_offer_handle_offer,
++};
++
++static void control_offer_destroy(struct ext_data_control_offer_v1 *offer) {
++    delete static_cast<control_offer *>(ext_data_control_offer_v1_get_user_data(offer));
++    ext_data_control_offer_v1_destroy(offer);
++}
++
++static void control_device_handle_data_offer(void *, struct ext_data_control_device_v1 *,
++                                             struct ext_data_control_offer_v1 *offer) {
++    ext_data_control_offer_v1_add_listener(offer, &control_offer_listener, new control_offer);
++}
++
++static void control_device_handle_selection(void *data, struct ext_data_control_device_v1 *,
++                                            struct ext_data_control_offer_v1 *offer) {
++    struct wl_conn *conn = static_cast<struct wl_conn *>(data);
++    if (!offer) {
++        CLIPLOG("clipboard: host selection cleared");
++        return;
++    }
++    const std::string mime_type =
++            pick_text_mime(static_cast<control_offer *>(ext_data_control_offer_v1_get_user_data(offer))
++                                   ->mime_types);
++    if (mime_type.empty()) {
++        CLIPLOG("clipboard: host selection has no text");
++        control_offer_destroy(offer);
++        return;
++    }
++    int read_fd;
++    int write_fd = transfer_pipe(&read_fd);
++    if (write_fd < 0) {
++        control_offer_destroy(offer);
++        return;
++    }
++    ext_data_control_offer_v1_receive(offer, mime_type.c_str(), write_fd);
++    close(write_fd);
++    control_offer_destroy(offer);
++    wl_display_flush(conn->display);
++    read_host_selection(conn->dpy, read_fd, mime_type);
++}
++
++static void control_device_handle_finished(void *data, struct ext_data_control_device_v1 *device) {
++    struct wl_conn *conn = static_cast<struct wl_conn *>(data);
++    ALOGW("clipboard: the compositor ended data control; following keyboard focus instead");
++    std::scoped_lock lock(conn->dpy->windowsMutex);
++    if (conn->data_control_device == device)
++        conn->data_control_device = nullptr;
++    ext_data_control_device_v1_destroy(device);
++}
++
++static void control_device_handle_primary_selection(void *, struct ext_data_control_device_v1 *,
++                                                    struct ext_data_control_offer_v1 *offer) {
++    if (offer)
++        control_offer_destroy(offer);
++}
++
++static const struct ext_data_control_device_v1_listener control_device_listener = {
++    .data_offer = control_device_handle_data_offer,
++    .selection = control_device_handle_selection,
++    .finished = control_device_handle_finished,
++    .primary_selection = control_device_handle_primary_selection,
++};
++
++static void control_source_handle_send(void *data, struct ext_data_control_source_v1 *,
++                                       const char *mime_type, int fd) {
++    serve_text(mime_type, fd, *static_cast<std::string *>(data));
++}
++
++static void control_source_handle_cancelled(void *data, struct ext_data_control_source_v1 *source) {
++    CLIPLOG("clipboard: our selection was replaced on the host");
++    delete static_cast<std::string *>(data);
++    ext_data_control_source_v1_destroy(source);
++}
++
++static const struct ext_data_control_source_v1_listener control_source_listener = {
++    .send = control_source_handle_send,
++    .cancelled = control_source_handle_cancelled,
++};
++
++void clipboard_attach(struct wl_conn *conn) {
++    std::scoped_lock lock(conn->dpy->windowsMutex);
++    if (!conn->is_ctl || conn->data_control_device)
++        return;
++    if (!conn->data_control_manager || !conn->seat) {
++        ALOGW("clipboard: the compositor has no ext_data_control_manager_v1; the clipboard "
++              "follows keyboard focus");
++        return;
++    }
++    conn->data_control_device =
++            ext_data_control_manager_v1_get_data_device(conn->data_control_manager, conn->seat);
++    ext_data_control_device_v1_add_listener(conn->data_control_device, &control_device_listener, conn);
++    wl_display_flush(conn->display);
++    ALOGI("clipboard: using ext-data-control");
++}
++
++void clipboard_detach(struct wl_conn *conn) {
++    std::scoped_lock lock(conn->dpy->windowsMutex);
++    if (conn->data_control_device)
++        ext_data_control_device_v1_destroy(conn->data_control_device);
++    conn->data_control_device = nullptr;
++}
++
++/* ---- wl_data_device, following keyboard focus ---- */
++
++static void data_source_handle_send(void *data, struct wl_data_source *, const char *mime_type, int fd) {
++    serve_text(mime_type, fd, *static_cast<std::string *>(data));
+ }
+ 
+ static void data_source_handle_cancelled(void *data, struct wl_data_source *source) {
+@@ -57,7 +278,7 @@ static void data_source_handle_cancelled(void *data, struct wl_data_source *sour
+     CLIPLOG("clipboard: our selection was cancelled — replaced by another client, "
+             "or the serial we quoted predates the current selection's");
+     wl_data_source_destroy(source);
+-    free(data);
++    delete static_cast<std::string *>(data);
+ }
+ 
+ static void data_source_handle_target(void *, struct wl_data_source *, const char *) {}
+@@ -74,79 +295,32 @@ static const struct wl_data_source_listener data_source_listener = {
+     .action = data_source_handle_action,
+ };
+ 
+-static void read_selection(struct wl_conn *conn, struct wl_data_offer *offer, const std::string &mime_type) {
+-    struct display *display = conn->dpy;
+-    int fds[2];
+-    pipe(fds);
+-    wl_data_offer_receive(offer, mime_type.c_str(), fds[1]);
+-    close(fds[1]);
+-
+-    /* The wl_display_roundtrip is required here because we perform blocking read calls.
+-     * We need to make sure our request is sent to the compositor, otherwise the source client won’t send any data.
+-     * The blocking read calls stall the Wayland event loop.
+-     */
+-    wl_display_roundtrip(conn->display);
+-
+-    // Read the clipboard contents into a scratch buffer, NOT straight into
+-    // display->clipboard: this read can fail, and a failed read must not be
+-    // allowed to destroy the contents we already have.
+-    std::string received;
+-    while (true) {
+-        char buf[1024];
+-        ssize_t n = read(fds[0], buf, sizeof(buf));
+-        if (n <= 0)
+-            break;
+-        received.append(buf, n);
+-    }
+-
+-    close(fds[0]);
+-    wl_data_offer_destroy(offer);
+-
+-    /* An offer that advertised a text mime type but then transferred nothing
+-     * means the handshake was torn down before the source could write. The
+-     * common cause is losing keyboard focus while this blocking read is in
+-     * flight (the roundtrip above dispatches the wl_keyboard.leave, and the
+-     * compositor invalidates our offer with it) — and because the selection is
+-     * re-delivered on every focus enter, a focus flicker is enough to hit it.
+-     * Committing the empty result there leaves the guest with a clipboard that
+-     * is empty forever: keep what we had instead. */
+-    if (received.empty()) {
+-        CLIPLOG("clipboard: host selection transferred 0 bytes as %s, keeping the "
+-                "previous %zu bytes", mime_type.c_str(), display->clipboard.size());
+-        return;
+-    }
+-
+-    display->clipboard = std::move(received);
+-    CLIPLOG("clipboard: read %zu bytes of host selection as %s",
+-            display->clipboard.size(), mime_type.c_str());
+-}
+-
+ static void data_device_handle_selection(void *data, struct wl_data_device *, struct wl_data_offer *offer) {
+     // An application has set the clipboard contents
+     struct wl_conn *conn = (struct wl_conn *)data;
+     struct display *display = conn->dpy;
+-    if (offer == NULL) {
+-        display->clipboard_offer_mime_types.clear();
++    const std::string mime_type = pick_text_mime(display->clipboard_offer_mime_types);
++    display->clipboard_offer_mime_types.clear();
++    if (offer == NULL)
+         return;
+-    }
+ 
+-    std::string mime_type;
+-    for (auto mime_type_req : MIME_TYPES) {
+-        if (std::find(display->clipboard_offer_mime_types.begin(), display->clipboard_offer_mime_types.end(), mime_type_req) != display->clipboard_offer_mime_types.end()) {
+-            mime_type = mime_type_req;
+-            break;
+-        }
++    /* Data control already reports every host selection. */
++    if (display->ctl->data_control_device || mime_type.empty()) {
++        wl_data_offer_destroy(offer);
++        return;
+     }
+-    display->clipboard_offer_mime_types.clear();
+ 
+-    if (mime_type.empty()) {
+-        // No supported mime-type
++    int read_fd;
++    int write_fd = transfer_pipe(&read_fd);
++    if (write_fd < 0) {
+         wl_data_offer_destroy(offer);
+         return;
+     }
+-
+-    // TODO: only read if necessary. needs careful threading
+-    read_selection(conn, offer, mime_type);
++    wl_data_offer_receive(offer, mime_type.c_str(), write_fd);
++    close(write_fd);
++    wl_data_offer_destroy(offer);
++    wl_display_flush(conn->display);
++    read_host_selection(display, read_fd, mime_type);
+ }
+ 
+ static void data_offer_handle_source_actions(void *, struct wl_data_offer *, uint32_t) {}
+@@ -170,7 +344,6 @@ static void data_device_handle_data_offer(void *data, struct wl_data_device *, s
+     }
+     // An application has created a new data source
+     struct wl_conn *conn = (struct wl_conn *)data;
+-    struct display *display = conn->dpy;
+     wl_data_offer_add_listener(offer, &data_offer_listener, conn);
+ }
+ 
+@@ -217,15 +390,40 @@ WaydroidClipboard::WaydroidClipboard(struct display* display)
+ 
+ // Methods from ::vendor::waydroid::clipboard::V1_0::IWaydroidClipboard follow.
+ Return<void> WaydroidClipboard::sendClipboardData(const hidl_string& in) {
+-    mDisplay->clipboard = in;
++    {
++        std::scoped_lock lock(mDisplay->clipboard_mutex);
++        /* The host text we pushed in, coming back: the host already has it,
++         * possibly with richer types than ours; leave its selection alone. */
++        if (mDisplay->clipboard == in) {
++            CLIPLOG("clipboard: guest set the host's own %zu bytes, not echoing", in.size());
++            return Void();
++        }
++        mDisplay->clipboard = in;
++        /* Whatever host read is in flight predates this copy. */
++        mDisplay->clipboard_generation++;
++    }
+ 
+     std::scoped_lock lock(mDisplay->windowsMutex);
++    struct wl_conn *ctl = mDisplay->ctl.get();
++    if (ctl->data_control_device) {
++        struct ext_data_control_source_v1 *source =
++                ext_data_control_manager_v1_create_data_source(ctl->data_control_manager);
++        ext_data_control_source_v1_add_listener(source, &control_source_listener,
++                                                new std::string(in));
++        for (const auto &mime_type : MIME_TYPES)
++            ext_data_control_source_v1_offer(source, mime_type.c_str());
++        ext_data_control_device_v1_set_selection(ctl->data_control_device, source);
++        wl_display_flush(ctl->display);
++        CLIPLOG("clipboard: guest set %zu bytes", in.size());
++        return Void();
++    }
++
+     struct wl_conn *conn = clipboard_conn(mDisplay);
+     if (!conn->data_device)
+         return Void();
+ 
+     struct wl_data_source *source = wl_data_device_manager_create_data_source(conn->data_device_manager);
+-    wl_data_source_add_listener(source, &data_source_listener, strdup(in.c_str()));
++    wl_data_source_add_listener(source, &data_source_listener, new std::string(in));
+     for (auto mime_type : MIME_TYPES)
+         wl_data_source_offer(source, mime_type.c_str());
+     wl_data_device_set_selection(conn->data_device, source, conn->last_input_serial);
+@@ -235,8 +433,13 @@ Return<void> WaydroidClipboard::sendClipboardData(const hidl_string& in) {
+ }
+ 
+ Return<void> WaydroidClipboard::getClipboardData(getClipboardData_cb out_cb) {
+-    CLIPLOG("clipboard: guest read %zu bytes", mDisplay->clipboard.size());
+-    out_cb(mDisplay->clipboard);
++    std::string text;
++    {
++        std::scoped_lock lock(mDisplay->clipboard_mutex);
++        text = mDisplay->clipboard;
++    }
++    CLIPLOG("clipboard: guest read %zu bytes", text.size());
++    out_cb(text);
+     return Void();
+ }
+ 
+diff --git a/hwcomposer/ime-bridge.cpp b/hwcomposer/ime-bridge.cpp
+index fd745fa..1a046c2 100644
+--- a/hwcomposer/ime-bridge.cpp
++++ b/hwcomposer/ime-bridge.cpp
+@@ -52,6 +52,10 @@ constexpr char kImePackage[] = "id.waydro.hostime";
+ constexpr uint32_t kMsgFocus = 1;
+ constexpr uint32_t kMsgCursor = 2;
+ constexpr uint32_t kMsgDone = 10;
++constexpr uint32_t kMsgClip = 11;
++/* The app takes messages up to this size; a bigger clipboard text stays on the
++ * pull path. */
++constexpr size_t kMaxClip = 16 * 1024 * 1024 - 64;
+ 
+ /* Far above any real message; a peer sending more is not the app. */
+ constexpr uint32_t kMaxMessage = 64 * 1024;
+@@ -215,6 +219,19 @@ void ime_bridge::done() {
+     pending_delete_before = pending_delete_after = 0;
+ }
+ 
++bool ime_bridge::set_clip(const std::string &text) {
++    if (text.size() > kMaxClip)
++        return false;
++    std::scoped_lock lock(display->windowsMutex);
++    if (client_fd < 0)
++        return false;
++    std::string msg;
++    put_u32(msg, kMsgClip);
++    put_string(msg, text);
++    send(msg);
++    return true;
++}
++
+ /* Brings the text-input object in line with what the two sides say: enabled
+  * while a surface of ours has the keyboard and an Android editor has focus. */
+ void ime_bridge::update() {
+diff --git a/hwcomposer/ime-bridge.h b/hwcomposer/ime-bridge.h
+index f93a7bc..0c82f8c 100644
+--- a/hwcomposer/ime-bridge.h
++++ b/hwcomposer/ime-bridge.h
+@@ -61,6 +61,10 @@ struct zwp_text_input_v3;
+  *   composer -> app
+  *     10 DONE   delete before, delete after (UTF-8 bytes), commit string,
+  *               preedit string, preedit cursor begin, end (bytes; -1 hidden)
++ *     11 CLIP   the host clipboard text, when it changes. The app sets it as
++ *               Android's primary clip, so that apps get the usual change
++ *               notification (WebView pastes from a cache it refreshes only
++ *               on that notification).
+  *
+  * All state is guarded by display->windowsMutex, which the reconnect path
+  * already holds when it detaches a connection. */
+@@ -81,6 +85,10 @@ class ime_bridge {
+     void delete_surrounding_text(uint32_t before, uint32_t after);
+     void done();
+ 
++    /* Hands a new host clipboard text to the app; any thread. Returns false
++     * when no app is connected. */
++    bool set_clip(const std::string &text);
++
+   private:
+     void serve();
+     bool accept_client(int fd);
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index f963207..6a76cdb 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -85,6 +85,7 @@
+ #include "idle-inhibit-unstable-v1-client-protocol.h"
+ #include "fractional-scale-v1-client-protocol.h"
+ #include "text-input-unstable-v3-client-protocol.h"
++#include "ext-data-control-v1-client-protocol.h"
+ #include "xdg-activation-v1-client-protocol.h"
+ /* Primary reconnect callbacks live on the resize worker, outside this file. */
+ #pragma GCC poison hotplug
+@@ -3993,6 +3994,10 @@ registry_handle_global(void *data, struct wl_registry *registry,
+         if (conn->is_ctl)
+             conn->text_input_manager = (struct zwp_text_input_manager_v3 *)wl_registry_bind(
+                     registry, id, &zwp_text_input_manager_v3_interface, 1);
++    } else if (strcmp(interface, ext_data_control_manager_v1_interface.name) == 0) {
++        if (conn->is_ctl)
++            conn->data_control_manager = (struct ext_data_control_manager_v1 *)wl_registry_bind(
++                    registry, id, &ext_data_control_manager_v1_interface, 1);
+     } else if (strcmp(interface, "gtk_shell1") == 0) {
+         if (version < 6)
+             conn->supports_cursor_viewport = false;
+@@ -4263,6 +4268,8 @@ static void reset_wayland_globals(struct wl_conn *conn) {
+     conn->data_device_manager = nullptr;
+     conn->text_input_manager = nullptr;
+     conn->text_input = nullptr;
++    conn->data_control_manager = nullptr;
++    conn->data_control_device = nullptr;
+     conn->data_device = nullptr;
+ }
+ 
+@@ -4327,6 +4334,7 @@ static void wl_conn_reconnect(struct wl_conn *conn) {
+     if (conn->text_input && conn->dpy->ime)
+         conn->dpy->ime->detach(conn);
+     conn->text_input = nullptr;
++    clipboard_detach(conn);
+     if (conn->registry)
+         wl_registry_destroy(conn->registry);
+     conn->proxies_valid = false;
+@@ -4349,6 +4357,7 @@ static void wl_conn_reconnect(struct wl_conn *conn) {
+     wl_registry_add_listener(conn->registry, &registry_listener, conn);
+     wl_display_roundtrip(conn->display);
+     ime_attach(conn);
++    clipboard_attach(conn);
+     ALOGI("wl_conn_reconnect: rebound wayland globals on new connection");
+ }
+ 
+@@ -4736,6 +4745,7 @@ create_display(const char *gralloc)
+     display->task_ctl = std::make_unique<task_control>();
+     display->ime = std::make_unique<ime_bridge>(display);
+     ime_attach(display->ctl.get());
++    clipboard_attach(display->ctl.get());
+     display->deactivate_thread = std::thread(deactivate_worker, display);
+     display_resize_start(display);
+     display->conn_worker_thread = std::thread(conn_worker, display);
+@@ -4781,6 +4791,9 @@ destroy_display(struct display *display)
+     display->ime.reset();
+     if (display->ctl->text_input_manager)
+         zwp_text_input_manager_v3_destroy(display->ctl->text_input_manager);
++    clipboard_detach(display->ctl.get());
++    if (display->ctl->data_control_manager)
++        ext_data_control_manager_v1_destroy(display->ctl->data_control_manager);
+ 
+     wl_conn_destroy(display->ctl.get());
+ 
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index 6afd4de..ecb105e 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -258,6 +258,10 @@ struct wl_conn {
+     /* Control connection only; the object belongs to display->ime. */
+     struct zwp_text_input_manager_v3 *text_input_manager = nullptr;
+     struct zwp_text_input_v3 *text_input = nullptr;
++    /* Control connection only: the host clipboard without keyboard focus or
++     * input serials. The device belongs to the clipboard code. */
++    struct ext_data_control_manager_v1 *data_control_manager = nullptr;
++    struct ext_data_control_device_v1 *data_control_device = nullptr;
+ 
+     std::mutex formats_mutex;
+     /* Host format/modifier advertisement of this connection. */
+@@ -490,6 +494,13 @@ void init_input_devices(struct display *display);
+  * WaydroidClipboard.cpp. */
+ void clipboard_watch_conn(struct wl_conn *conn);
+ 
++/* Takes over the host clipboard through ext-data-control on the control
++ * connection when the compositor offers it (after the registry roundtrip), and
++ * drops it before the connection goes away. Without it the clipboard keeps
++ * following keyboard focus on wl_data_device. */
++void clipboard_attach(struct wl_conn *conn);
++void clipboard_detach(struct wl_conn *conn);
++
+ /* Ask the conn worker to open a task's connection. Cheap and idempotent; the
+  * connection appears in display->task_conns once it is up. */
+ void request_task_conn(struct display *display, uint32_t taskId);
+@@ -821,7 +832,14 @@ struct display {
+         unsigned depth = 0;   /* written under m */
+     };
+     recursive_mutex_owned windowsMutex;
++    /* The host clipboard text as Android last saw it; guarded by
++     * clipboard_mutex, since readers of the host selection fill it from their
++     * own threads. */
++    std::mutex clipboard_mutex;
+     std::string clipboard;
++    /* Bumped on every host selection; a read that finishes after a newer
++     * selection arrived is dropped. Guarded by clipboard_mutex. */
++    uint64_t clipboard_generation = 0;
+     std::list<std::string> clipboard_offer_mime_types;
+     /* Which connection the host gave keyboard focus to; empty means ctl. The
+      * selection and its serial belong to the focused client, so with a
+-- 
+2.56.0
+

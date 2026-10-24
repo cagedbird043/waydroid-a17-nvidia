@@ -1,7 +1,7 @@
 From a13623bfec16c26371c29b3e871e778abce917ae Mon Sep 17 00:00:00 2001
 From: Shiro836 <17294277+Shiro836@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 21:39:33 +0300
-Subject: [PATCH 17/24] hwcomposer: the Android display follows the window,
+Subject: [PATCH 17/25] hwcomposer: the Android display follows the window,
  through a display reconnect sent from its own thread
 MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8

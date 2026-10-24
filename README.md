@@ -10,7 +10,7 @@ Waydroid 上运行 Android 17（LineageOS 24.0），NVIDIA 显卡硬件加速，
 
 - **多窗口**：每个 Android 应用一个 KDE 窗口（freeform 卡片），拖动、缩放、关闭都由 KWin 处理；`waydroid show-full-ui` 打开带 KDE 边框的 Android 桌面窗口。
 - **宿主输入法直通**：fcitx5、ibus 等经 Wayland `text-input-v3` 在 Android 里输入，候选框跟随光标。输入法桥是 vendor 应用 `WaydroidHostIme`。
-- 剪贴板双向互通。
+- **剪贴板**：经 ext-data-control 与主机双向同步，不依赖窗口焦点；不再需要主机侧 Python 剪贴板服务。
 
 详细记录见 `reports/porting.md`，待改进见 `TODO.md`。
 
@@ -30,13 +30,13 @@ Waydroid 上运行 Android 17（LineageOS 24.0），NVIDIA 显卡硬件加速，
 
 | 仓库 | 上游 | 分支 | 基线 | 补丁数 |
 |---|---|---|---|---|
-| `hardware/waydroid` | https://github.com/WayDroid-ATV/android_hardware_waydroid | lineage-23.0 (ATV manifest) | `3af187c1de51` | 24 |
+| `hardware/waydroid` | https://github.com/WayDroid-ATV/android_hardware_waydroid | lineage-23.0 (ATV manifest) | `3af187c1de51` | 25 |
 | `external/minigbm` | https://github.com/WayDroid-ATV/android_external_minigbm | lineage-24.0 | `5f5797cacd14` | 8 |
 | `hardware/interfaces` | https://github.com/WayDroid-ATV/android_hardware_interfaces | lineage-24.0 | `1b0bcde9a85b` | 1 |
-| `external/wayland-protocols` | https://android.googlesource.com/platform/external/wayland-protocols | AOSP (TUNA mirror) | `2dabfe6879b2` | 2 |
+| `external/wayland-protocols` | https://android.googlesource.com/platform/external/wayland-protocols | AOSP (TUNA mirror) | `2dabfe6879b2` | 3 |
 | `device/waydroid/waydroid` | https://github.com/WayDroid-ATV/android_device_waydroid_waydroid | lineage-24.0 | `ce2f57ee2768` | 2 |
 | `vendor/waydroid/init` | https://github.com/WayDroid-ATV/android_vendor_waydroid_init | lineage-24.0 | `e97b43d97f70` | 2 |
-| `waydroid-nvidia` | https://github.com/Shiro836/waydroid-nvidia | public-test | `29ffa3a237b0` | 9 |
+| `waydroid-nvidia` | https://github.com/Shiro836/waydroid-nvidia | public-test | `29ffa3a237b0` | 10 |
 
 ## 构建
 

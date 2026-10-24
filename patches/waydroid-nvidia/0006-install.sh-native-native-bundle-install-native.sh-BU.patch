@@ -1,7 +1,7 @@
 From e63b1fbf6a5253ccf066cb86288cdaae910b9e39 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Sat, 24 Oct 2026 09:30:09 +0800
-Subject: [PATCH 6/9] =?utf-8?q?install.sh=EF=BC=9A--native=20=E5=AE=89?=
+Subject: [PATCH 06/10] =?utf-8?q?install.sh=EF=BC=9A--native=20=E5=AE=89?=
  =?utf-8?q?=E8=A3=85=E6=9C=AC=E5=9C=B0=20native=20bundle=20=E7=9B=AE?=
  =?utf-8?q?=E5=BD=95=EF=BC=88=E7=94=B1=20install-native.sh=20=E6=8C=89?=
  =?utf-8?q?=E5=85=B6=20BUILD-RECORD=20=E6=A0=A1=E9=AA=8C=EF=BC=89?=

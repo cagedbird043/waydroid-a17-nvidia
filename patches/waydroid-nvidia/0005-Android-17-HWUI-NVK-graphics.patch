@@ -1,9 +1,9 @@
 From eec39aa15836f460bc4903dddb7e98da4c637fac Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Sat, 24 Oct 2026 09:21:33 +0800
-Subject: [PATCH 5/9] =?utf-8?q?=E4=B8=BA=20Android=2017=20HWUI=20=E6=9A=B4?=
- =?utf-8?q?=E9=9C=B2=E4=B8=A4=E6=9D=A1=E7=8B=AC=E7=AB=8B=20NVK=20graphics?=
- =?utf-8?q?=20=E9=98=9F=E5=88=97?=
+Subject: [PATCH 05/10] =?utf-8?q?=E4=B8=BA=20Android=2017=20HWUI=20?=
+ =?utf-8?q?=E6=9A=B4=E9=9C=B2=E4=B8=A4=E6=9D=A1=E7=8B=AC=E7=AB=8B=20NVK=20?=
+ =?utf-8?q?graphics=20=E9=98=9F=E5=88=97?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8
 Content-Transfer-Encoding: 8bit

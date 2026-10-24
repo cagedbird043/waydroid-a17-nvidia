@@ -1,7 +1,7 @@
 From 45dbb1377fbe658d0fd349a58b891be75e37d7f0 Mon Sep 17 00:00:00 2001
 From: Alessandro Astone <ales.astone@gmail.com>
 Date: Thu, 21 Sep 2023 23:00:31 +0200
-Subject: [PATCH 1/2] staging: Add fractional-scale
+Subject: [PATCH 1/3] staging: Add fractional-scale
 
 Change-Id: I856b18c32167529e1b5ffcdf2314438242b6c1f9
 ---
