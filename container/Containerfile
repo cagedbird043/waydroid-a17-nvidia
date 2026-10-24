@@ -22,5 +22,7 @@ RUN git clone -q --depth 1 --branch "$GLSLANG_TAG" https://github.com/KhronosGro
     && ninja -C /tmp/glslang/build install && rm -rf /tmp/glslang && glslangValidator --version | head -1
 # Mesa's cross rule writes an ld.lld wrapper that execs `ld.lld` from PATH, and runs ninja with
 # PATH=/usr/bin:/bin:/sbin:<Soong PATH>; Soong's interposer forbids ld.lld, so it must be found in /usr/bin.
-# Use the tree's own prebuilt lld (the tree is bind-mounted at the same path inside the container).
-RUN ln -s /home/cagedbird/Projects/waydroid-a17/src/prebuilts/clang/host/linux-x86/clang-r596125/bin/ld.lld /usr/bin/ld.lld
+# Use the tree's own prebuilt lld (scripts/build.sh bind-mounts the project at the same path inside the
+# container): build with --build-arg ROOT="$PWD" from the project root.
+ARG ROOT
+RUN test -n "$ROOT" && ln -s "$ROOT/src/prebuilts/clang/host/linux-x86/clang-r596125/bin/ld.lld" /usr/bin/ld.lld

@@ -6,8 +6,9 @@ pkgname=${_pkg}-dkms
 pkgver=3.3.1+28+gb42ad459
 _ver=$pkgver
 pkgrel=2
-# Manager signing certificate the module accepts: the locally signed manager
-# (/home/cagedbird/Projects/waydroid-a17/ksu/out/expected.txt), not the official tiann key.
+# Manager signing certificate the module accepts: YOUR locally signed manager, not the
+# official tiann key. Replace both with the values apk_certificate.py prints for your
+# manager APK (see kernelsu/README.md). The values below belong to the maintainer's key.
 _ksu_expected_size=0x02ec
 _ksu_expected_hash=d77ee93d9af4c1dbf8b89cf50fd9953db3a61b9142e009a9effeeedb5693eb4f
 _branch=waydroid-experimental

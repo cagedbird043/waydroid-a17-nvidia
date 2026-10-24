@@ -1,6 +1,6 @@
 # Waydroid A17 + NVIDIA：待选改进清单
 
-项目：`/home/cagedbird/Projects/waydroid-a17`。当前状态和报告见 `reports/porting.md`。
+当前状态和报告见 `reports/porting.md`。
 
 ## 现状（2026-10-24 实测）
 
