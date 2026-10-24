@@ -33,14 +33,14 @@ Waydroid with Android 17 (LineageOS 24.0), hardware acceleration on NVIDIA GPUs,
 
 ### Performance
 
-Basemark GPU, Vulkan, 3840×2160, Medium, offscreen: the host with the NVIDIA proprietary driver scores 35657; Waydroid scores 29369, about 82% of the host. The Android build of Basemark only ships ETC2 textures, which the GPU cannot sample natively, so the real driver gap is smaller than this. 3DMark Wild Life Extreme scores about 12300–13100 (about 74 FPS). Details are in [`reports/`](reports/).
+Basemark GPU, Vulkan, 3840×2160, Medium, offscreen: the host with the NVIDIA proprietary driver scores 35657; Waydroid scores 29369, about 82% of the host. The Android build of Basemark only ships ETC2 textures, which NVK does not support natively, while the host uses BC7, so the comparison favors the host. 3DMark Wild Life Extreme scores about 12300–13100 (about 74 FPS). Details are in [`reports/`](reports/).
 
 ### Install (Arch Linux, AUR)
 
 ```bash
 yay -S waydroid-a17-nvidia-bin
 ```
-Basemark GPU, Vulkan, 3840×2160, Medium, offscreen: the host with the NVIDIA proprietary driver scores 35657; Waydroid scores 29369, about 82% of the host. The Android build of Basemark only ships ETC2 textures, which NVK does not support natively, while the host uses BC7, so the comparison favors the host. 3DMark Wild Life Extreme scores about 12300–13100 (about 74 FPS). Details are in [`reports/`](reports/).
+
 The package contains the patched Waydroid host side, the vendor image from this repository's Releases with its matching native driver bundle, and the KWin script. It does not contain the Android system image or KernelSU. After installing:
 
 ```bash
@@ -153,7 +153,7 @@ Waydroid 整合版：Android 17（LineageOS 24.0）+ NVIDIA 显卡硬件加速 +
 
 ### 性能
 
-Basemark GPU（Vulkan、3840×2160、Medium、离屏）：宿主用 NVIDIA 官方驱动 35657 分，Waydroid 29369 分，约为宿主的 82%。Android 版 Basemark 只带 ETC2 纹理，显卡不能直接采样，所以驱动本身的差距比这更小。3DMark Wild Life Extreme 约 12300–13100 分（约 74 FPS）。详见 [`reports/`](reports/)。
+Basemark GPU（Vulkan、3840×2160、Medium、离屏）：宿主用 NVIDIA 官方驱动 35657 分，Waydroid 29369 分，约为宿主的 82%。Android 版 Basemark 只带 ETC2 纹理，NVK 不支持直接采样，宿主用的是 BC7，所以这项对比对宿主有利。3DMark Wild Life Extreme 约 12300–13100 分（约 74 FPS）。详见 [`reports/`](reports/)。
 
 ### 安装（Arch Linux：AUR）
 
@@ -164,7 +164,7 @@ yay -S waydroid-a17-nvidia-bin
 包里有打过补丁的 Waydroid 主机部分、本仓库 Release 的 vendor 镜像和与之配套的 native 驱动包，以及 KWin 脚本；不含 Android system 镜像和 KernelSU。装好后：
 
 ```bash
-Basemark GPU（Vulkan、3840×2160、Medium、离屏）：宿主用 NVIDIA 官方驱动 35657 分，Waydroid 29369 分，约为宿主的 82%。Android 版 Basemark 只带 ETC2 纹理，NVK 不支持直接采样，宿主用的是 BC7，所以这项对比对宿主有利。3DMark Wild Life Extreme 约 12300–13100 分（约 74 FPS）。详见 [`reports/`](reports/)。
+sudo mkdir -p /etc/waydroid-extra/images
 # ATV 20261017 的 system 镜像（GAPPS 或 VANILLA）：https://github.com/WayDroid-ATV/waydroid-builds/releases/tag/20261017
 sudo bsdtar -xf lineage-24.0-20261017-GAPPS-waydroid_x86_64-system.zip -C /etc/waydroid-extra/images system.img
 sudo bsdtar -xf /usr/lib/waydroid-nvidia/vendor/waydroid-nvidia-vendor-x86_64-*.zip -C /etc/waydroid-extra/images vendor.img
