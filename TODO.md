@@ -9,21 +9,20 @@
 - 多窗口（`persist.waydroid.multi_windows=true`）：freeform 卡片 + 带 KDE 边框的桌面窗口。
 - 宿主输入法：text-input-v3 → `WaydroidHostIme`。
 - 剪贴板：ext-data-control，主机复制经输入法推送进 Android；主机侧 Python 剪贴板服务已删除。
-- 文件共享：主机 `~/Downloads` 挂在 Android `Download/Host`（`waydroid.cfg` 的 `shared_folders` 可改）。
+- 文件共享：主机 `~/Downloads` 挂在 Android `Download/Host`（`waydroid.cfg` 的 `shared_folders` 可改），主机侧改动自动进媒体库。
+- Widevine：L3（`dumpsys android.hardware.drm.IDrmFactory/widevine`：`default_security_level: L3`，`hdcp_level_max: Unprotected`），无法提升。
 - root：KernelSU LKM，本地签名管理器 32708。
 - ABI：`x86_64, arm64-v8a, x86`，ARM 翻译用 ATV 自带的 `libndk_translation`，没有 `armeabi-v7a`。
 
 ## 发版
 
-1. **发版流程**：完整编 vendorimage → 删掉 `/var/lib/waydroid/overlay/vendor` 里调试用的文件 → `scripts/reinstall-vendor.sh`（含门禁）→ 回归（卡片、桌面窗口、输入法、剪贴板、KernelSU）→ 分块上传 Release。
+1. **发版流程**：完整编 vendorimage → 删掉 `/var/lib/waydroid/overlay/vendor` 里调试用的文件（`lib64/hw/hwcomposer.waydroid.so`、`app/WaydroidHostIme`、`overlay/WaydroidFrameworkOverlay.apk`） → `scripts/reinstall-vendor.sh`（含门禁）→ 回归（卡片、桌面窗口、输入法、剪贴板、KernelSU）→ 分块上传 Release。
 2. **AUR**：暂缓。计划拆成 `waydroid-a17-nvidia`（打过补丁的 Waydroid 主机部分，`conflicts=(waydroid)`）和 `waydroid-a17-nvidia-vendor-bin`（从 Release 下载 vendor 镜像）；KernelSU 不进 AUR（签名因人而异）。先看 waydroid-nvidia 的 `ci-aur` 分支，避免重复。
 
 ## 功能
 
 1. **重负载实测**：glmark2 太轻；换真实 3D 游戏或 GFXBench，看性能和稳定性，同时盯 Xid。
-2. **Widevine**：vendor 带 `drm-service.widevine`，级别未实测，推测 L3（Netflix 之类只有标清），无法提升。
-3. **跟进上游**：ATV 出新 system 镜像、waydroid-nvidia 出 rc11 时 rebase 重编（`scripts/apply-nvidia.sh`、`scripts/build.sh`、`scripts/reinstall-vendor.sh`）。
-4. **主机文件进图库**：主机放进共享目录的文件，文件管理器和系统文件选择器立即可见，但要等 MediaStore 扫描后图库才列出（`content call --uri content://media --method scan_volume --arg external_primary` 可手动触发）。
+2. **跟进上游**：ATV 出新 system 镜像、waydroid-nvidia 出 rc11 时 rebase 重编（`scripts/apply-nvidia.sh`、`scripts/build.sh`、`scripts/reinstall-vendor.sh`）。
 
 ## 不做
 
@@ -32,10 +31,8 @@
 
 ## 卡片模式与输入法的已知问题
 
-1. **缩放时内容滞后**：拖动 KDE 窗口边框时窗口先变，Android 要等 `cmd` 调整任务尺寸、应用重新排版后才跟上。可试：拖动期间先按比例缩放旧画面占位，或合并多次 resize。
-2. **卡片共用一块 Android 屏幕**：显示尺寸 = 宿主 + 200 headroom，窗口多时可能互相遮挡点击区域。
-3. **卡片位置只在本次 KWin 会话内记住**：`host/kwin-waydroid-placement` 把关闭时的位置按 app_id 记在内存里，注销后清空。
-4. **内嵌预编辑不显示**：fcitx5 用 Ctrl+Alt+P 打开内嵌预编辑后，Android 和 KWrite 一样，拼音仍只在候选框里，问题在 fcitx5/KWin 一侧。
+1. **卡片共用一块 Android 屏幕**：显示尺寸 = 宿主 + 200 headroom，窗口多时可能互相遮挡点击区域。
+2. **内嵌预编辑不显示**：fcitx5 用 Ctrl+Alt+P 打开内嵌预编辑后，Android 和 KWrite 一样，拼音仍只在候选框里，问题在 fcitx5/KWin 一侧。
 
 ## 维护备忘
 

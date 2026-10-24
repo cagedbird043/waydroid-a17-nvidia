@@ -1,0 +1,275 @@
+From 8d6c5b7f6d5685801c1f87b63239055e6dde61f6 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 24 Oct 2026 20:10:43 +0800
+Subject: [PATCH 12/12] =?utf-8?q?waydroid=EF=BC=9A=E5=85=B1=E4=BA=AB?=
+ =?utf-8?q?=E7=9B=AE=E5=BD=95=E9=87=8C=E4=B8=BB=E6=9C=BA=E4=BE=A7=E7=9A=84?=
+ =?utf-8?q?=E6=94=B9=E5=8A=A8=E7=94=A8=20inotify=20=E7=9B=91=E5=90=AC?=
+ =?utf-8?q?=EF=BC=8C=E5=88=86=E6=89=B9=E4=BA=A4=E7=BB=99=20MediaProvider?=
+ =?utf-8?q?=20scan=5Ffile=EF=BC=8C=E5=9B=BE=E5=BA=93=E4=B8=8D=E7=94=A8?=
+ =?utf-8?q?=E7=AD=89=E5=85=A8=E7=9B=98=E6=89=AB=E6=8F=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ waydroid/0004-host-shared-folders.patch | 148 +++++++++++++++++++++---
+ 1 file changed, 135 insertions(+), 13 deletions(-)
+
+diff --git a/waydroid/0004-host-shared-folders.patch b/waydroid/0004-host-shared-folders.patch
+index 2fe7966..87c8b45 100644
+--- a/waydroid/0004-host-shared-folders.patch
++++ b/waydroid/0004-host-shared-folders.patch
+@@ -5,6 +5,8 @@ line (default ~/Downloads:Download/Host, an empty value disables it). Once vold
+ /data/media to the FUSE lower path, the container manager bind-mounts each folder below the
+ session's data directory with an id mapping between the session user and MediaProvider, and
+ the mount reaches Android through propagation. Stopping the container unmounts them.
++Changes the host makes in a shared folder are watched with inotify and handed to
++MediaProvider's scan_file in batches, so galleries list host files without a full rescan.
+ 
+ diff --git a/tools/actions/container_manager.py b/tools/actions/container_manager.py
+ --- a/tools/actions/container_manager.py
+@@ -31,7 +33,6 @@ diff --git a/tools/actions/container_manager.py b/tools/actions/container_manage
+  
+          # Networking
+          command = [tools.config.tools_src +
+-二进制文件 wd-a/tools/actions/__pycache__/container_manager.cpython-314.pyc 和 wd-b/tools/actions/__pycache__/container_manager.cpython-314.pyc 不同
+ diff --git a/tools/helpers/__init__.py b/tools/helpers/__init__.py
+ --- a/tools/helpers/__init__.py
+ +++ b/tools/helpers/__init__.py
+@@ -40,11 +41,11 @@ diff --git a/tools/helpers/__init__.py b/tools/helpers/__init__.py
+  import tools.helpers.version
+  import tools.helpers.logging
+ +import tools.helpers.shared_folders
+-二进制文件 wd-a/tools/helpers/__pycache__/shared_folders.cpython-314.pyc 和 wd-b/tools/helpers/__pycache__/shared_folders.cpython-314.pyc 不同
++二进制文件 wd-a/tools/helpers/__pycache__/shared_folders.cpython-315.pyc 和 wd-b/tools/helpers/__pycache__/shared_folders.cpython-315.pyc 不同
+ diff --git a/tools/helpers/shared_folders.py b/tools/helpers/shared_folders.py
+ --- /dev/null
+ +++ b/tools/helpers/shared_folders.py
+-@@ -0,0 +1,234 @@
++@@ -0,0 +1,355 @@
+ +# Copyright 2026 cagedbird043
+ +# SPDX-License-Identifier: GPL-3.0-or-later
+ +"""Host folders shared into Android's internal storage.
+@@ -65,10 +66,14 @@ diff --git a/tools/helpers/shared_folders.py b/tools/helpers/shared_folders.py
+ +import ctypes
+ +import logging
+ +import os
+++import select
+ +import stat
+++import struct
+ +import subprocess
+ +import threading
+++import time
+ +import tools.config
+++import tools.helpers.lxc
+ +import tools.helpers.mount
+ +
+ +DEFAULT = "~/Downloads:Download/Host"
+@@ -79,8 +84,20 @@ diff --git a/tools/helpers/shared_folders.py b/tools/helpers/shared_folders.py
+ +# vold's bind of /data/media that MediaProvider serves /sdcard from
+ +FUSE_LOWER = "/mnt/pass_through/0/emulated"
+ +BOOT_TIMEOUT = 300
+++# set to stop what the last start() began
+ +_stop = threading.Event()
+ +
+++# Files the host changes in a shared folder bypass MediaProvider; it learns of them by scanning
+++# the changed paths: a scan of a missing path drops its records, one of a folder covers its tree.
+++IN_CLOSE_WRITE, IN_MOVED_FROM, IN_MOVED_TO, IN_CREATE, IN_DELETE = 0x8, 0x40, 0x80, 0x100, 0x200
+++IN_Q_OVERFLOW, IN_IGNORED, IN_ISDIR = 0x4000, 0x8000, 0x40000000
+++IN_ONLYDIR, IN_DONT_FOLLOW = 0x01000000, 0x02000000
+++WATCH_MASK = IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | IN_DELETE | IN_ONLYDIR | IN_DONT_FOLLOW
+++MAX_WATCHES = 4096      # folders watched per share; deeper changes wait for MediaProvider's own scans
+++SCAN_QUIET = 1.5        # seconds without changes before a batch is scanned
+++SCAN_LATEST = 10        # ... unless the oldest change waits this long
+++SCAN_TARGETS = 8        # paths per batch; more are merged into their parent folders
+++
+ +_libc = ctypes.CDLL(None, use_errno=True)
+ +SYS_OPEN_TREE, SYS_MOVE_MOUNT = 428, 429      # same number on every architecture
+ +OPEN_TREE_CLONE = 0x1
+@@ -168,9 +185,11 @@ diff --git a/tools/helpers/shared_folders.py b/tools/helpers/shared_folders.py
+ +
+ +def start(args, session):
+ +    """Drop mounts a crashed session left behind; share the folders once Android has booted."""
+++    global _stop
+++    _stop.set()
+++    _stop = threading.Event()
+ +    umount_all(args, session)
+-+    _stop.clear()
+-+    threading.Thread(target=_wait_and_mount, args=(args, session), daemon=True).start()
+++    threading.Thread(target=_run, args=(args, session, _stop), daemon=True).start()
+ +
+ +
+ +def stop(args, session):
+@@ -191,32 +210,39 @@ diff --git a/tools/helpers/shared_folders.py b/tools/helpers/shared_folders.py
+ +        return False
+ +
+ +
+-+def _wait_and_mount(args, session):
+++def _run(args, session, stop_event):
+ +    for _ in range(BOOT_TIMEOUT):
+-+        if _stop.wait(1):
+++        if stop_event.wait(1):
+ +            return
+ +        if _fuse_lower_ready():
+ +            break
+ +    else:
+ +        logging.warning("shared_folders: {} did not appear, nothing shared".format(FUSE_LOWER))
+ +        return
+++    shares = []
+ +    try:
+-+        mount_all(args, session)
+++        shares = mount_all(args, session)
+++        if shares:
+++            _Scanner(args, shares).run(stop_event)
+ +    except Exception as e:
+ +        logging.warning("shared_folders: %s", e)
+++    finally:
+++        for fd, _ in shares:
+++            os.close(fd)
+ +
+ +
+ +def mount_all(args, session):
+++    """Mount the shared folders; returns (open folder, storage path parts) of each one mounted."""
+ +    pairs = list(_pairs(args, session))
+ +    if not pairs:
+-+        return
+++        return []
+ +    user, group = int(session["user_id"]), int(session["group_id"])
+ +    data = os.path.realpath(session["waydroid_data"])
+ +    data_fd = os.open(data, os.O_RDONLY | os.O_DIRECTORY)
+ +    try:
+ +        if os.fstat(data_fd).st_uid != user:
+ +            logging.warning("shared_folders: {} is not owned by the session user, nothing shared".format(data))
+-+            return
+++            return []
+ +        try:
+ +            storage_fd = _open_dir("media", data_fd)
+ +            try:
+@@ -226,15 +252,19 @@ diff --git a/tools/helpers/shared_folders.py b/tools/helpers/shared_folders.py
+ +            storage_fd = child
+ +        except OSError:
+ +            logging.info("shared_folders: internal storage does not exist yet, shared from the next start on")
+-+            return
+++            return []
+ +        try:
+ +            uid = _media_provider_uid(data_fd)
+ +            if uid is None:
+ +                logging.warning("shared_folders: MediaProvider is not in packages.list, nothing shared")
+-+                return
+++                return []
+ +            idmap = "X-mount.idmap=u:{0}:{2}:1 g:{1}:{2}:1".format(user, group, uid)
+++            shares = []
+ +            for host, parts in pairs:
+-+                _mount_one(host, parts, storage_fd, user, uid, idmap)
+++                fd = _mount_one(host, parts, storage_fd, user, uid, idmap)
+++                if fd is not None:
+++                    shares.append((fd, parts))
+++            return shares
+ +        finally:
+ +            os.close(storage_fd)
+ +    finally:
+@@ -273,9 +303,101 @@ diff --git a/tools/helpers/shared_folders.py b/tools/helpers/shared_folders.py
+ +            finally:
+ +                subprocess.run(["umount", "-l", STAGING], check=False)
+ +            logging.info("shared_folders: {} -> /sdcard/{}".format(host, "/".join(parts)))
+++            return os.dup(src_fd)
+ +        finally:
+ +            os.close(dst_fd)
+ +    except OSError as e:
+ +        logging.warning("shared_folders: cannot share {}: {}".format(host, e))
+ +    finally:
+ +        os.close(src_fd)
+++
+++
+++class _Scanner:
+++    """Watches the shared folders and has MediaProvider scan what changed in them."""
+++
+++    def __init__(self, args, shares):
+++        self.args = args
+++        self.roots = [fd for fd, _ in shares]
+++        self.storage = ["/storage/emulated/0/" + "/".join(parts) for _, parts in shares]
+++        self.watches = {}       # watch descriptor -> (share index, folder relative to the share)
+++        self.count = [0] * len(shares)
+++        self.env = None
+++        self.fd = _check(_libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK))
+++
+++    def watch_tree(self, share, rel):
+++        base = "/proc/self/fd/{}".format(self.roots[share])
+++        # os.walk does not descend into symlinks, so the tree stays inside the share
+++        for path, dirs, _ in os.walk(os.path.join(base, rel)):
+++            if self.count[share] >= MAX_WATCHES:
+++                logging.warning("shared_folders: {} has more than {} folders, the rest is not watched"
+++                                .format(self.storage[share], MAX_WATCHES))
+++                return
+++            wd = _libc.inotify_add_watch(self.fd, path.encode(), WATCH_MASK)
+++            if wd < 0:
+++                dirs.clear()
+++                continue
+++            if wd not in self.watches:
+++                self.count[share] += 1
+++            self.watches[wd] = (share, os.path.relpath(path, base))
+++
+++    def read_events(self, pending):
+++        try:
+++            buf = os.read(self.fd, 65536)
+++        except BlockingIOError:
+++            return
+++        offset = 0
+++        while offset < len(buf):
+++            wd, mask, _, length = struct.unpack_from("iIII", buf, offset)
+++            name = buf[offset + 16:offset + 16 + length].split(b"\0", 1)[0].decode(errors="surrogateescape")
+++            offset += 16 + length
+++            if mask & IN_Q_OVERFLOW:
+++                pending.update((share, "") for share in range(len(self.roots)))
+++                continue
+++            if mask & IN_IGNORED:
+++                if wd in self.watches:
+++                    self.count[self.watches.pop(wd)[0]] -= 1
+++                continue
+++            if wd not in self.watches:
+++                continue
+++            share, folder = self.watches[wd]
+++            rel = os.path.normpath(os.path.join(folder, name))
+++            if mask & IN_ISDIR and mask & (IN_CREATE | IN_MOVED_TO):
+++                self.watch_tree(share, rel)
+++            elif mask & IN_CREATE:
+++                continue    # its IN_CLOSE_WRITE follows once the file is complete
+++            pending.add((share, rel))
+++
+++    def scan(self, pending):
+++        paths = []
+++        for share in range(len(self.roots)):
+++            rels = {rel for s, rel in pending if s == share}
+++            while len(rels) > SCAN_TARGETS:
+++                rels = {os.path.dirname(rel) for rel in rels}
+++            for rel in sorted(rels):
+++                if not any(other != rel and (other == "" or rel.startswith(other + "/")) for other in rels):
+++                    paths.append(self.storage[share] if rel in ("", ".") else self.storage[share] + "/" + rel)
+++        if self.env is None:
+++            self.env = tools.helpers.lxc.android_env_attach_options(self.args)
+++        script = "for p; do content call --uri content://media --method scan_file --arg \"$p\" >/dev/null; done"
+++        subprocess.run(["lxc-attach", "-P", tools.config.defaults["lxc"], "-n", "waydroid", "--clear-env",
+++                        *self.env, "--", "/system/bin/sh", "-c", script, "sh", *paths],
+++                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+++
+++    def run(self, stop_event):
+++        try:
+++            for share in range(len(self.roots)):
+++                self.watch_tree(share, "")
+++            pending, first = set(), 0
+++            while not stop_event.is_set():
+++                ready, _, _ = select.select([self.fd], [], [], SCAN_QUIET)
+++                if ready:
+++                    self.read_events(pending)
+++                    if pending and not first:
+++                        first = time.monotonic()
+++                    if not pending or time.monotonic() - first < SCAN_LATEST:
+++                        continue
+++                if pending and not stop_event.is_set():
+++                    self.scan(pending)
+++                    pending, first = set(), 0
+++        finally:
+++            os.close(self.fd)
+-- 
+2.56.0
+

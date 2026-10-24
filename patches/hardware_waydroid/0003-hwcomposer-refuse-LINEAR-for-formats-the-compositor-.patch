@@ -1,7 +1,7 @@
 From 7fa3913bee4ddc8f7bf86b9c957c12a4c0b5eace Mon Sep 17 00:00:00 2001
 From: waydroid-nvidia-prolapse <build@local>
 Date: Mon, 12 Oct 2026 00:53:11 +0300
-Subject: [PATCH 03/28] hwcomposer: refuse LINEAR for formats the compositor
+Subject: [PATCH 03/29] hwcomposer: refuse LINEAR for formats the compositor
  imports through NVIDIA EGL
 MIME-Version: 1.0
 Content-Type: text/plain; charset=utf-8

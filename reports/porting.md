@@ -21,11 +21,11 @@
 
 | 仓库 | 分支 | 内容 |
 |---|---|---|
-| `src/hardware/waydroid` | `nvidia-a17` | hwcomposer 移植 18 个提交和 `%llx` 格式修正（`hwcomposer.md`）；`c7c062f` show-full-ui 静止画面不出窗口；`ef2e651` A17 图层按任务事件映射到任务；`5db77ae` 多窗口 freeform 卡片模式；`6e906c5` 多窗口下的 Android 桌面窗口；`9edad77` 宿主输入法直通（`hostime/`、`hwcomposer/ime-bridge.*`）；`f622087` 剪贴板改用 ext-data-control；`4ffc464` 其他包的 activity（设置搜索、分享、权限页）进入任务时图层归到焦点任务，修复卡片整窗透明；`7ceb257` 把光标前后文字发给宿主输入法（长按选重音字符等）；`742c344` desk ID 改读 WMShell 自己的记录，修复 SystemUI 反复崩溃 |
+| `src/hardware/waydroid` | `nvidia-a17` | hwcomposer 移植 18 个提交和 `%llx` 格式修正（`hwcomposer.md`）；`c7c062f` show-full-ui 静止画面不出窗口；`ef2e651` A17 图层按任务事件映射到任务；`5db77ae` 多窗口 freeform 卡片模式；`6e906c5` 多窗口下的 Android 桌面窗口；`9edad77` 宿主输入法直通（`hostime/`、`hwcomposer/ime-bridge.*`）；`f622087` 剪贴板改用 ext-data-control；`4ffc464` 其他包的 activity（设置搜索、分享、权限页）进入任务时图层归到焦点任务，修复卡片整窗透明；`7ceb257` 把光标前后文字发给宿主输入法（长按选重音字符等）；`742c344` desk ID 改读 WMShell 自己的记录，修复 SystemUI 反复崩溃；`d061211` 卡片缩放跟手、有自己任务的 activity 不算客人、黑名单认 WMS 组件写法 |
 | `src/external/minigbm` | `nvidia-a17` | gbm_mesa 移植 7 个提交；`cros_gralloc_handle.usage` 恢复为 `int32_t`（`minigbm.md`） |
 | `src/hardware/interfaces` | `nvidia-a17` | composer 2.1/2.4 重连修正（`composer-hal.md`） |
 | `src/external/wayland-protocols` | `nvidia-a17` | 协议版本提升到 1.49；`06ffc32` 加入 ext-data-control-v1 |
-| `src/device/waydroid/waydroid` | `local-build` | x86_64 不编 Mesa nouveau Vulkan；`edf992a` 预装 `WaydroidHostIme` |
+| `src/device/waydroid/waydroid` | `local-build` | x86_64 不编 Mesa nouveau Vulkan；`edf992a` 预装 `WaydroidHostIme`；`e3248b0` 预装 `WaydroidFrameworkOverlay` |
 | `src/vendor/waydroid/init` | `nvidia-a17` | `c75eb53` 识别 nvidia-prolapse；`5a6d921` 视频解码交给 NVDEC |
 | `nvidia/waydroid-nvidia` | `a17-local` | 门禁 EROFS/APEX/VNDK 支持、KernelSU seccomp 补丁、双队列 NVK（`eec39aa`）、本地安装器（`db78568`、`fa99138`）；安装器不重写已有目录、只在图标变化时刷新图标缓存（`d5c3d83`、`0d45957`、`035d267`）；`1b5eaae` 去掉主机侧 Python 剪贴板服务 |
 | `nvidia/product` | （主分支） | `libhwminijail`；native bundle pin（`c5aaf35`） |
@@ -66,6 +66,14 @@
 
 已在桌面上实测（build-22）：计算器和时钟并排，两个窗口交替点击都落在正确位置；键盘输入；拖动标题栏移动；KDE 缩放后应用按新尺寸重排；长按出现的复制/粘贴浮动工具栏正常显示，且不会让窗口跳位；剪贴板双向互通（Android 复制 → `wl-paste`，`wl-copy` → Android 粘贴）；点关闭按钮后窗口和 Android 任务一起移除；dmesg 无 Xid。
 
+### 卡片缩放
+
+拖动 KDE 窗口边框时，hwcomposer 把每个新尺寸交给 `cmd activity task resize`（同一任务的请求只留最新的一个）。A17 开着 shell transition 时，WM 对每次改尺寸先截一张任务快照，由 WMShell 的 `DefaultTransitionHandler` 播约 400 ms 的尺寸变化动画（`port_window_size_animation`），下一次改尺寸要排在它后面，卡片因此明显落后于拖动。vendor RRO `WaydroidFrameworkOverlay`（`hardware/waydroid/overlay`）把 `config_disableTransitionAnimation` 设为 true：`WindowContainer.canStartChangeTransition()` 因此为 false，改尺寸不再截快照、不播动画。所有 Waydroid 窗口的动画本来就由 KWin 负责，Android 自己的过渡动画在主机上看不到。实测每次改尺寸从 hwcomposer 收到主机尺寸到卡片显示新内容约 40 ms（原来约 400 ms 再加 3 帧稳定期）。
+
+同时修了两个会让卡片尺寸错乱的问题：
+- WMShell 的 desk 背景 `DesktopWallpaperActivity` 不画 `Task=` 图层，旧逻辑把它算成焦点任务的「客人」，整屏高的背景被并进卡片内容区，卡片被撑到 1199 dp 高并跑出屏幕。有自己任务的 activity 现在归自己的任务。
+- 黑名单比对 activity 类名时没认出 WMS 事件里的 `pkg/.Cls` 写法，desk 背景曾生成一个 1×29 的空窗口。
+
 剪贴板由 hwcomposer 负责（Android 的 `ClipboardService` 只调用 HIDL `IWaydroidClipboard`，从不调用主机侧 Python 的 `waydroidclipboard`，该服务已删除，见 `waydroid/0003-drop-python-clipboard-service.patch`）。hwcomposer 在控制连接上绑定 `ext_data_control_manager_v1`（剪贴板管理器用的协议）：
 - 主机每次复制都会通知 hwcomposer，不需要 Waydroid 窗口有焦点；hwcomposer 在独立线程读出文本，经 `@waydroid-hostime` 发给 `WaydroidHostIme`，由它 `setPrimaryClip`。必须走这一步：只把文本留给 `ClipboardService` 被动拉取时，框架不发剪贴板变化通知，WebView（浏览器等）会一直粘贴旧内容。
 - Android 复制时 hwcomposer 直接设置主机剪贴板，不需要 input serial，切走焦点后仍在；Android 回传的正是主机文本时不回写，主机保留原有选区。
@@ -93,7 +101,9 @@
 - 挂载点放在主机的 Waydroid data 目录下，该目录归普通用户所有，root 在其中建目录和挂载时一律按 fd 操作（`open_tree` + `move_mount`），不按路径。
 - 存储路径要放在标准目录下面：MediaProvider 只允许应用在接受该类型的顶层目录里建文件（`Download` 接受所有类型），顶层自建的 `Host` 目录里能建 txt 但建不了 png。
 
-实测：以 uid 2000 经 FUSE 在 `Download/Host` 建 png、txt、目录，读主机文件，主机上属主为 1000:1000；主机新建的文件 Android 立即可见；`waydroid session stop` 后挂载全部卸掉。主机放入的文件要等 MediaStore 扫描后图库才列出（`content call --uri content://media --method scan_volume --arg external_primary`）。
+实测：以 uid 2000 经 FUSE 在 `Download/Host` 建 png、txt、目录，读主机文件，主机上属主为 1000:1000；主机新建的文件 Android 立即可见；`waydroid session stop` 后挂载全部卸掉。
+
+主机侧的改动 Android 媒体库收不到通知，所以 container manager 用 inotify 监听共享目录（不跟符号链接，每个共享最多 4096 个子目录），改动静默 1.5 秒（最长 10 秒）后成批交给 MediaProvider 的 `scan_file`：扫一个已不存在的路径会删掉它的记录，扫目录会覆盖整棵子树；一批超过 8 个路径时并到上级目录。实测：主机新建图片、子目录里建图片、移动、删除文件、一次拷 30 张、删整个目录，6 秒内媒体库都和主机一致。
 
 ## GApps
 

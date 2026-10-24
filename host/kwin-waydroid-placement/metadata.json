@@ -4,9 +4,8 @@
         "Name": "Waydroid card placement",
         "Description": "Reopens each Waydroid app card where it was last closed",
         "License": "MIT",
-        "Version": "1"
+        "Version": "2"
     },
-    "X-Plasma-API": "javascript",
-    "X-Plasma-MainScript": "code/main.js",
+    "X-Plasma-API": "declarativescript",
     "KPackageStructure": "KWin/Script"
 }

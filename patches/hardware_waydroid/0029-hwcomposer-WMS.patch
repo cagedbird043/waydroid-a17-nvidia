@@ -1,0 +1,134 @@
+From d0612111ef504a2d954eccf95b78c3291cfcb85b Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 24 Oct 2026 20:10:43 +0800
+Subject: [PATCH 29/29] =?utf-8?q?hwcomposer=EF=BC=9A=E5=8D=A1=E7=89=87?=
+ =?utf-8?q?=E7=BC=A9=E6=94=BE=E8=B7=9F=E6=89=8B=EF=BC=9B=E9=BB=91=E5=90=8D?=
+ =?utf-8?q?=E5=8D=95=E8=AF=86=E5=88=AB=20WMS=20=E7=9A=84=E7=BB=84=E4=BB=B6?=
+ =?utf-8?q?=E5=86=99=E6=B3=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+- vendor RRO WaydroidFrameworkOverlay 关掉 config_disableTransitionAnimation：任务改尺寸不再拍快照、播 400 ms 动画，下一次 resize 不用排队等它
+- 有自己任务的 activity 不再算成焦点任务的客人：WMShell 的 desk 背景曾被当作 Jelly 的内容区，卡片被撑到整屏高
+- 黑名单把 WMS 的 "pkg/.Cls" 写法也认出来，DesktopWallpaperActivity 不再生成 1×29 的空窗口
+---
+ hwcomposer/hwcomposer.cpp          |  8 +++++++-
+ hwcomposer/modes/multi-window.cpp  |  6 ++++++
+ hwcomposer/modes/waydroid_mode.cpp | 17 +++++++++++++++++
+ overlay/Android.bp                 |  6 ++++++
+ overlay/AndroidManifest.xml        |  5 +++++
+ overlay/res/values/config.xml      |  7 +++++++
+ 6 files changed, 48 insertions(+), 1 deletion(-)
+ create mode 100644 overlay/Android.bp
+ create mode 100644 overlay/AndroidManifest.xml
+ create mode 100644 overlay/res/values/config.xml
+
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index 92b21ea..838b644 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -583,12 +583,18 @@ void close_windows_for_dead_tasks(struct waydroid_hwc_composer_device_1 *pdev) {
+     }
+ }
+ 
++/* component is an activity class, or a WMS component ("pkg/.Cls", "pkg/pkg.Cls"). */
+ bool is_blacklisted(struct waydroid_hwc_composer_device_1* pdev, const std::string &app_id, const std::string &component) {
+     auto match = pdev->blacklisted_apps.find(app_id);
+     if (match == pdev->blacklisted_apps.end())
+         return false;
+     auto &components = match->second;
+-    return components.empty() || std::find(components.begin(), components.end(), component) != components.end();
++    if (components.empty())
++        return true;
++    std::string cls = component.substr(component.find('/') + 1);
++    if (!cls.empty() && cls[0] == '.')
++        cls = app_id + cls;
++    return std::find(components.begin(), components.end(), cls) != components.end();
+ }
+ 
+ static void apply_surface_damage(hwc_layer_1 *hwc_layer, surface_context &surface_context) {
+diff --git a/hwcomposer/modes/multi-window.cpp b/hwcomposer/modes/multi-window.cpp
+index 4337d89..3822c55 100644
+--- a/hwcomposer/modes/multi-window.cpp
++++ b/hwcomposer/modes/multi-window.cpp
+@@ -60,6 +60,12 @@ window *multi_window_mode::get_window(waydroid_hwc_composer_device_1 *pdev, laye
+         // Create windows based on Task ID in layer name
+         if (is_blacklisted(pdev, layer_info.aid, layer_info.component))
+             return nullptr;
++        /* A frame resolve_task gave to a blacklisted task (another window of
++         * its package, drawn during a transition) gets no card either. */
++        auto task = pdev->display->tasks.find(layer_info.tid);
++        if (task != pdev->display->tasks.end()
++                && is_blacklisted(pdev, task->second.appID, task->second.component))
++            return nullptr;
+ 
+         /* Swipe-closed tasks keep drawing for a few frames while they tear
+          * down; recreating their window here would flash the card back. */
+diff --git a/hwcomposer/modes/waydroid_mode.cpp b/hwcomposer/modes/waydroid_mode.cpp
+index 4efe974..4df16b3 100644
+--- a/hwcomposer/modes/waydroid_mode.cpp
++++ b/hwcomposer/modes/waydroid_mode.cpp
+@@ -223,6 +223,23 @@ void resolve_task(struct display &disp, const std::set<std::string> &on_screen,
+                 best_score = score;
+             }
+         }
++        /* An activity WMS reports a task of its own for stays with that task even
++         * while the task draws no "Task=" layer (WMShell's desk backdrop): as a guest
++         * of the focused task it would claim the whole display as that card's area. */
++        if (!best || best->second.appID != pkg) {
++            std::pair<const std::string, task_info> *own_task = nullptr;
++            for (auto &entry : disp.tasks) {
++                if (entry.second.appID == pkg
++                        && component_class(entry.second.component, pkg) == activity
++                        && (!own_task || std::stoul(entry.first) > std::stoul(own_task->first)))
++                    own_task = &entry;
++            }
++            if (own_task) {
++                best = own_task;
++                for (auto &entry : disp.tasks)
++                    entry.second.guests.erase(pkg);
++            }
++        }
+         if (!best) {
+             for (auto &entry : disp.tasks) {
+                 if (entry.second.focused && !entry.second.closing && !entry.second.appID.empty()) {
+diff --git a/overlay/Android.bp b/overlay/Android.bp
+new file mode 100644
+index 0000000..8ed8105
+--- /dev/null
++++ b/overlay/Android.bp
+@@ -0,0 +1,6 @@
++// Framework settings the ATV system image does not carry, applied from the vendor partition.
++runtime_resource_overlay {
++    name: "WaydroidFrameworkOverlay",
++    sdk_version: "current",
++    vendor: true,
++}
+diff --git a/overlay/AndroidManifest.xml b/overlay/AndroidManifest.xml
+new file mode 100644
+index 0000000..b4fa4a4
+--- /dev/null
++++ b/overlay/AndroidManifest.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="id.waydro.overlay.framework">
++    <overlay android:targetPackage="android" android:isStatic="true" android:priority="1" />
++</manifest>
+diff --git a/overlay/res/values/config.xml b/overlay/res/values/config.xml
+new file mode 100644
+index 0000000..09355f0
+--- /dev/null
++++ b/overlay/res/values/config.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <!-- Each task is a host window that the host sizes: a task bounds change skips the
++         snapshot WM takes for its size-change animation. That animation runs about 400 ms and
++         queues the next resize behind it, so the card trails a drag. -->
++    <bool name="config_disableTransitionAnimation">true</bool>
++</resources>
+-- 
+2.56.0
+
