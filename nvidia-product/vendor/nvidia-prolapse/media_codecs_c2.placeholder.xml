@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!-- Placeholder. The real file lists the HOST GPU's decoders (nvc2-xmlgen from nv_video_query_caps()) and is bound
+     over /odm/etc/media_codecs_c2.xml at install time. The Codec2 service refuses to start while this file differs
+     from the live caps, so a missing bind fails loudly. -->
+<MediaCodecs>
+</MediaCodecs>

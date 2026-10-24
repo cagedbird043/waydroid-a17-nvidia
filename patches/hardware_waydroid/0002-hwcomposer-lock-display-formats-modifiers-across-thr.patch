@@ -1,0 +1,133 @@
+From 9acc399462d1e91c3e01f30b95406dc0a40f1136 Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Mon, 12 Oct 2026 00:51:46 +0300
+Subject: [PATCH 02/24] hwcomposer: lock display->formats/modifiers across
+ threads
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+What: add display->formats_mutex and hold it for every access to
+display->formats and display->modifiers: the writers dmabuf_format() and
+dmabuf_modifiers() (zwp_linux_dmabuf_v1 listener, Wayland dispatch thread)
+and the readers isFormatSupported() and compositor_supports() (SurfaceFlinger's
+HWC binder thread, via displayable_buffer()/create_buffer()).
+
+Why: nothing serialised the two sides. modifiers[format].push_back() can
+reallocate the vector while compositor_supports() iterates it on another
+thread. The PR author reproduced this as a Scudo "invalid chunk state when
+deallocating" abort inside dmabuf_modifiers() -> push_back under a video
+load; a dead composer takes SurfaceFlinger down with it (DEAD_OBJECT).
+Whether the writer still runs after start-up on a given compositor (bind
+order, re-binds) was not measured here; the lock makes the order irrelevant.
+
+Source: The-JimmyDev, PR #20 commit 45d12b1a72452e4ebe54003887ff1897e438b1e6
+  https://github.com/Shiro836/waydroid-nvidia/pull/20/commits/45d12b1a72452e4ebe54003887ff1897e438b1e6
+Licence: the patched code is android_hardware_waydroid (Apache-2.0); the PR
+was submitted to waydroid-nvidia, whose patches/hwcomposer/ inherit Apache-2.0
+(waydroid-nvidia LICENSE section 2).
+
+Deviation from the source: compositor_supports() searches the vector under
+the lock instead of copying it out (no allocation per call; same safety), and
+dmabuf_modifiers() takes the lock only around the size read and push_back,
+not around property_set() (a socket round trip to init that the readers on
+the binder thread should not wait for).
+
+适配 ATV 的 wl_conn：格式集合、修饰符和互斥锁归属各连接，避免跨任务连接共享广告数据。
+
+(cherry picked from commit 9f47a68ee655eb440c3db7507342f2db3bf2722a)
+---
+ hwcomposer/gralloc_handler.cpp |  3 +++
+ hwcomposer/wayland-hwc.cpp     | 14 ++++++++++----
+ hwcomposer/wayland-hwc.h       |  3 +++
+ 3 files changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
+index 83e11a0..8c07146 100644
+--- a/hwcomposer/gralloc_handler.cpp
++++ b/hwcomposer/gralloc_handler.cpp
+@@ -121,6 +121,7 @@ namespace {
+     };
+ 
+     bool isFormatSupported(struct wl_conn *conn, uint32_t format) {
++        std::lock_guard<std::mutex> lock(conn->formats_mutex);
+         return conn->formats.count(format) == 1;
+     }
+ 
+@@ -173,6 +174,8 @@ namespace {
+ bool compositor_supports(wl_conn *conn, uint32_t drm_format, uint64_t modifier) {
+     if (modifier == DRM_FORMAT_MOD_INVALID)
+         return false;
++    /* Search under the lock: the Wayland thread may reallocate this vector at any time. */
++    std::lock_guard<std::mutex> lock(conn->formats_mutex);
+     auto it = conn->modifiers.find(drm_format);
+     if (it == conn->modifiers.end())
+         return false;
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index 6cfafef..97d4952 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -2876,22 +2876,28 @@ dmabuf_modifiers(void *data, struct zwp_linux_dmabuf_v1 * dmabuf,
+     if (modifier == DRM_FORMAT_MOD_INVALID)
+         return;
+ 
++    size_t index;
++    {
++        std::lock_guard<std::mutex> lock(conn->formats_mutex);
++        index = conn->modifiers[format].size();
++        conn->modifiers[format].push_back(modifier);
++    }
++
+     std::stringstream prop_name_stream;
+     std::stringstream prop_value_stream;
+-    prop_name_stream << "waydroid.modifiers." << std::hex << format << "." << std::dec << conn->modifiers[format].size();
++    prop_name_stream << "waydroid.modifiers." << std::hex << format << "." << std::dec << index;
+     prop_value_stream << std::hex << modifier;
+     std::string prop_name = prop_name_stream.str();
+     std::string prop_value = prop_value_stream.str();
+     property_set(prop_name.c_str(), prop_value.c_str());
+ 
+-    conn->modifiers[format].push_back(modifier);
+ }
+ 
+ static void
+ dmabuf_format(void *data, struct zwp_linux_dmabuf_v1 *, uint32_t format)
+ {
+-    struct wl_conn *conn = (struct wl_conn *)data;
+-    struct display *d = conn->dpy;
++    struct wl_conn *conn = static_cast<wl_conn *>(data);
++    std::lock_guard<std::mutex> lock(conn->formats_mutex);
+     conn->formats.insert(format);
+ }
+ 
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index aeed995..be30fb1 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -44,6 +44,7 @@
+ #include <errno.h>
+ #include <chrono>
+ #include <map>
++#include <mutex>
+ #include <list>
+ #include <set>
+ #include <pthread.h>
+@@ -241,6 +242,7 @@ struct wl_conn {
+     struct wl_data_device_manager *data_device_manager;
+     struct wl_data_device *data_device;
+ 
++    std::mutex formats_mutex;
+     /* Host format/modifier advertisement of this connection. */
+     std::unordered_set<uint32_t> formats;
+     std::map<uint32_t, std::vector<uint64_t>> modifiers;
+@@ -742,6 +744,7 @@ struct display {
+     int req_height;
+     int refresh;
+ 
++
+     std::map<uint32_t, std::string> layer_names;
+     std::map<uint32_t, struct handleExt> layer_handles_ext;
+     struct handleExt target_layer_handle_ext;
+-- 
+2.56.0
+

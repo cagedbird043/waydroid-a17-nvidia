@@ -1,0 +1,1424 @@
+From e2428ad5d31853579e8f923140fefed970e5930a Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia project <ci@waydroid-nvidia>
+Date: Fri, 16 Oct 2026 19:59:08 +0300
+Subject: [PATCH 2/2] wayland-protocols: the protocol versions
+ hwcomposer.waydroid uses, from wayland-protocols 1.49
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+The patched hwcomposer (vendor-image/patches/hardware/waydroid) speaks newer
+protocol versions than AOSP 13's copies: linux-dmabuf v4 feedback
+(zwp_linux_dmabuf_feedback_v1, cross-GPU present), presentation-time,
+viewporter, xdg-shell, pointer-constraints, tablet v2 and xdg-decoration.
+Replace exactly these seven XMLs with the wayland-protocols 1.49 release
+files (the release hwcomposer/pins.env pins; sha256 in its tarball).
+Requests/events are only added, so every existing client keeps building.
+
+适配 Android 17 基线：保留其已合入的 dmabuf 热拔插容错及隐式修饰符说明，
+在既有 presentation 枚举描述和 xdg_surface 角色检查说明上合并 1.49 内容。
+补齐 modifier 事件的 v4 废弃说明及 presented 析构语义；七份 XML 的协议版本
+保持原补丁目标，未改动 ATV 的协议生成规则或其它扩展。
+
+(cherry picked from commit 5a5e59973b799d6e670d1e1c8d8c1c5b654003e3)
+---
+ .../presentation-time/presentation-time.xml   |  28 +-
+ .../stable/viewporter/viewporter.xml          |  15 +-
+ .../stable/xdg-shell/xdg-shell.xml            | 359 +++++++++++++-----
+ .../linux-dmabuf/linux-dmabuf-unstable-v1.xml | 268 +++++++++++--
+ .../pointer-constraints-unstable-v1.xml       |  13 +-
+ .../unstable/tablet/tablet-unstable-v2.xml    |  26 +-
+ .../xdg-decoration-unstable-v1.xml            |  40 +-
+ 7 files changed, 574 insertions(+), 175 deletions(-)
+
+diff --git a/freedesktop.org/stable/presentation-time/presentation-time.xml b/freedesktop.org/stable/presentation-time/presentation-time.xml
+index b666664..c2431c5 100644
+--- a/freedesktop.org/stable/presentation-time/presentation-time.xml
++++ b/freedesktop.org/stable/presentation-time/presentation-time.xml
+@@ -25,7 +25,7 @@
+     DEALINGS IN THE SOFTWARE.
+   </copyright>
+ 
+-  <interface name="wp_presentation" version="1">
++  <interface name="wp_presentation" version="2">
+     <description summary="timed presentation related wl_surface requests">
+ 
+ <!-- Introduction -->
+@@ -97,10 +97,9 @@
+         presentation interface. The presentation clock does not change
+         during the lifetime of the client connection.
+ 
+-        The clock identifier is platform dependent. On Linux/glibc,
+-        the identifier value is one of the clockid_t values accepted
+-        by clock_gettime(). clock_gettime() is defined by
+-        POSIX.1-2001.
++        The clock identifier is platform dependent. On POSIX platforms, the
++        identifier value is one of the clockid_t values accepted by
++        clock_gettime(). clock_gettime() is defined by POSIX.1-2001.
+ 
+         Timestamps in this clock domain are expressed as tv_sec_hi,
+         tv_sec_lo, tv_nsec triples, each component being an unsigned
+@@ -124,7 +123,7 @@
+ 
+   </interface>
+ 
+-  <interface name="wp_presentation_feedback" version="1">
++  <interface name="wp_presentation_feedback" version="2">
+     <description summary="presentation time feedback event">
+       A presentation_feedback object returns an indication that a
+       wl_surface content update has become visible to the user.
+@@ -165,7 +164,7 @@
+         <description summary="presentation was vsync'd">
+           The presentation was synchronized to the "vertical retrace" by
+           the display hardware such that tearing does not happen.
+-          Relying on user space scheduling is not acceptable for this
++          Relying on software scheduling is not acceptable for this
+           flag. If presentation is done by a copy to the active
+           frontbuffer, then it must guarantee that tearing cannot
+           happen.
+@@ -175,7 +174,7 @@
+         <description summary="hardware provided the presentation timestamp">
+           The display hardware provided measurements that the hardware
+           driver converted into a presentation timestamp. Sampling a
+-          clock in user space is not acceptable for this flag.
++          clock in software is not acceptable for this flag.
+         </description>
+       </entry>
+       <entry name="hw_completion" value="0x4">
+@@ -198,7 +197,7 @@
+       </entry>
+     </enum>
+ 
+-    <event name="presented">
++    <event name="presented" type="destructor">
+       <description summary="the content update was displayed">
+         The associated content update was displayed to the user at the
+         indicated time (tv_sec_hi/lo, tv_nsec). For the interpretation of
+@@ -225,9 +224,12 @@
+         targeting the next few vblanks. If such prediction cannot
+         usefully be done, the argument is zero.
+ 
+-        If the output does not have a constant refresh rate, explicit
+-        video mode switches excluded, then the refresh argument must
+-        be zero.
++        For version 2 and later, if the output does not have a constant
++        refresh rate, explicit video mode switches excluded, then the
++        refresh argument must be either an appropriate rate picked by the
++        compositor (e.g. fastest rate), or 0 if no such rate exists.
++        For version 1, if the output does not have a constant refresh rate,
++        the refresh argument must be zero.
+ 
+         The 64-bit value combined from seq_hi and seq_lo is the value
+         of the output's vertical retrace counter when the content
+@@ -256,7 +258,7 @@
+       <arg name="flags" type="uint" enum="kind" summary="combination of 'kind' values"/>
+     </event>
+ 
+-    <event name="discarded">
++    <event name="discarded" type="destructor">
+       <description summary="the content update was not displayed">
+         The content update was never displayed to the user.
+       </description>
+diff --git a/freedesktop.org/stable/viewporter/viewporter.xml b/freedesktop.org/stable/viewporter/viewporter.xml
+index c732d8c..1374aec 100644
+--- a/freedesktop.org/stable/viewporter/viewporter.xml
++++ b/freedesktop.org/stable/viewporter/viewporter.xml
+@@ -71,8 +71,7 @@
+       src_y, src_width, src_height), and the destination size (dst_width,
+       dst_height). The contents of the source rectangle are scaled to the
+       destination size, and content outside the source rectangle is ignored.
+-      This state is double-buffered, and is applied on the next
+-      wl_surface.commit.
++      This state is double-buffered, see wl_surface.commit.
+ 
+       The two parts of crop and scale state are independent: the source
+       rectangle, and the destination size. Initially both are unset, that
+@@ -111,12 +110,6 @@
+       when the surface state is applied. A NULL wl_buffer does not raise the
+       out_of_buffer error.
+ 
+-      The x, y arguments of wl_surface.attach are applied as normal to
+-      the surface. They indicate how many pixels to remove from the
+-      surface size from the left and the top. In other words, they are
+-      still in the surface-local coordinate system, just like dst_width
+-      and dst_height are.
+-
+       If the wl_surface associated with the wp_viewport is destroyed,
+       all wp_viewport requests except 'destroy' raise the protocol error
+       no_surface.
+@@ -155,8 +148,7 @@
+ 	or negative, or x or y are negative, raise the bad_value protocol
+ 	error.
+ 
+-	The crop and scale state is double-buffered state, and will be
+-	applied on the next wl_surface.commit.
++	The crop and scale state is double-buffered, see wl_surface.commit.
+       </description>
+       <arg name="x" type="fixed" summary="source rectangle x"/>
+       <arg name="y" type="fixed" summary="source rectangle y"/>
+@@ -175,8 +167,7 @@
+ 	contains zero or negative values raises the bad_value protocol
+ 	error.
+ 
+-	The crop and scale state is double-buffered state, and will be
+-	applied on the next wl_surface.commit.
++	The crop and scale state is double-buffered, see wl_surface.commit.
+       </description>
+       <arg name="width" type="int" summary="surface width"/>
+       <arg name="height" type="int" summary="surface height"/>
+diff --git a/freedesktop.org/stable/xdg-shell/xdg-shell.xml b/freedesktop.org/stable/xdg-shell/xdg-shell.xml
+index 364d130..f8b78ee 100644
+--- a/freedesktop.org/stable/xdg-shell/xdg-shell.xml
++++ b/freedesktop.org/stable/xdg-shell/xdg-shell.xml
+@@ -29,7 +29,7 @@
+     DEALINGS IN THE SOFTWARE.
+   </copyright>
+ 
+-  <interface name="xdg_wm_base" version="3">
++  <interface name="xdg_wm_base" version="7">
+     <description summary="create desktop-style surfaces">
+       The xdg_wm_base interface is exposed as a global object enabling clients
+       to turn their wl_surfaces into windows in a desktop environment. It
+@@ -50,6 +50,8 @@
+ 	     summary="the client provided an invalid surface state"/>
+       <entry name="invalid_positioner" value="5"
+ 	     summary="the client provided an invalid positioner"/>
++      <entry name="unresponsive" value="6"
++	     summary="the client didn’t respond to a ping event in time"/>
+     </enum>
+ 
+     <request name="destroy" type="destructor">
+@@ -58,7 +60,7 @@
+ 
+ 	Destroying a bound xdg_wm_base object while there are surfaces
+ 	still alive created by this xdg_wm_base object instance is illegal
+-	and will result in a protocol error.
++	and will result in a defunct_surfaces error.
+       </description>
+     </request>
+ 
+@@ -73,17 +75,16 @@
+ 
+     <request name="get_xdg_surface">
+       <description summary="create a shell surface from a surface">
+-	This creates an xdg_surface for the given surface. While xdg_surface
+-	itself is not a role, the corresponding surface may only be assigned
+-	a role extending xdg_surface, such as xdg_toplevel or xdg_popup. It is
+-	illegal to create an xdg_surface for a wl_surface which already has an
+-	assigned role and this will result in a protocol error.
+-
+ 	This creates an xdg_surface for the given surface. An xdg_surface is
+ 	used as basis to define a role to a given surface, such as xdg_toplevel
+ 	or xdg_popup. It also manages functionality shared between xdg_surface
+ 	based surface roles.
+ 
++	While xdg_surface itself is not a role, the corresponding surface may
++	only be assigned a role extending xdg_surface, such as xdg_toplevel or
++	xdg_popup. It is illegal to create an xdg_surface for a wl_surface which
++	already has anassigned role and this will result in a role error.
++
+ 	See the documentation of xdg_surface for more details about what an
+ 	xdg_surface is and how it is used.
+       </description>
+@@ -94,7 +95,8 @@
+     <request name="pong">
+       <description summary="respond to a ping event">
+ 	A client must respond to a ping event with a pong request or
+-	the client may be deemed unresponsive. See xdg_wm_base.ping.
++	the client may be deemed unresponsive. See xdg_wm_base.ping
++	and xdg_wm_base.error.unresponsive.
+       </description>
+       <arg name="serial" type="uint" summary="serial of the ping event"/>
+     </request>
+@@ -108,7 +110,9 @@
+ 	Compositors can use this to determine if the client is still
+ 	alive. It's unspecified what will happen if the client doesn't
+ 	respond to the ping request, or in what timeframe. Clients should
+-	try to respond in a reasonable amount of time.
++	try to respond in a reasonable amount of time. The “unresponsive”
++	error is provided for compositors that wish to disconnect unresponsive
++	clients.
+ 
+ 	A compositor is free to ping in any way it wants, but a client must
+ 	always respond to any xdg_wm_base object it created.
+@@ -117,7 +121,7 @@
+     </event>
+   </interface>
+ 
+-  <interface name="xdg_positioner" version="3">
++  <interface name="xdg_positioner" version="7">
+     <description summary="child surface positioner">
+       The xdg_positioner provides a collection of rules for the placement of a
+       child surface relative to a parent surface. Rules can be defined to ensure
+@@ -137,7 +141,7 @@
+       For an xdg_positioner object to be considered complete, it must have a
+       non-zero size set by set_size, and a non-zero anchor rectangle set by
+       set_anchor_rect. Passing an incomplete xdg_positioner object when
+-      positioning a surface raises an error.
++      positioning a surface raises an invalid_positioner error.
+     </description>
+ 
+     <enum name="error">
+@@ -196,14 +200,14 @@
+     <request name="set_anchor">
+       <description summary="set anchor rectangle anchor">
+ 	Defines the anchor point for the anchor rectangle. The specified anchor
+-	is used derive an anchor point that the child surface will be
++	is used to derive an anchor point that the child surface will be
+ 	positioned relative to. If a corner anchor is set (e.g. 'top_left' or
+ 	'bottom_right'), the anchor point will be at the specified corner;
+ 	otherwise, the derived anchor point will be centered on the specified
+ 	edge, or in the center of the anchor rectangle if no edge is specified.
+       </description>
+       <arg name="anchor" type="uint" enum="anchor"
+-	   summary="anchor"/>
++	   summary="anchor point"/>
+     </request>
+ 
+     <enum name="gravity">
+@@ -225,7 +229,8 @@
+ 	specified (e.g. 'bottom_right' or 'top_left'), then the child surface
+ 	will be placed towards the specified gravity; otherwise, the child
+ 	surface will be centered over the anchor point on any axis that had no
+-	gravity specified.
++	gravity specified. If the gravity is not in the ‘gravity’ enum, an
++	invalid_input error is raised.
+       </description>
+       <arg name="gravity" type="uint" enum="gravity"
+ 	   summary="gravity direction"/>
+@@ -338,7 +343,7 @@
+ 
+ 	The default adjustment is none.
+       </description>
+-      <arg name="constraint_adjustment" type="uint"
++      <arg name="constraint_adjustment" type="uint" enum="constraint_adjustment"
+ 	   summary="bit mask of constraint adjustments"/>
+     </request>
+ 
+@@ -374,7 +379,7 @@
+     </request>
+ 
+     <request name="set_parent_size" since="3">
+-      <description summary="">
++      <description summary="set parent size">
+ 	Set the parent window geometry the compositor should use when
+ 	positioning the popup. The compositor may use this information to
+ 	determine the future state the popup should be constrained using. If
+@@ -401,7 +406,7 @@
+     </request>
+   </interface>
+ 
+-  <interface name="xdg_surface" version="3">
++  <interface name="xdg_surface" version="7">
+     <description summary="desktop user interface surface base interface">
+       An interface that may be implemented by a wl_surface, for
+       implementations that provide a desktop-style user interface.
+@@ -428,10 +433,13 @@
+       manipulate a buffer prior to the first xdg_surface.configure call must
+       also be treated as errors.
+ 
+-      After creating a role-specific object and setting it up, the client must
++      After creating a role-specific object and setting it up (e.g. by sending
++      the title, app ID, size constraints, parent, etc), the client must
+       perform an initial commit without any buffer attached. The compositor
+-      will reply with an xdg_surface.configure event. The client must
+-      acknowledge it and is then allowed to attach a buffer to map the surface.
++      will reply with initial wl_surface state such as
++      wl_surface.preferred_buffer_scale followed by an xdg_surface.configure
++      event. The client must acknowledge it and is then allowed to attach a
++      buffer to map the surface.
+ 
+       Mapping an xdg_surface-based role surface is defined as making it
+       possible for the surface to be shown by the compositor. Note that
+@@ -446,19 +454,30 @@
+ 
+       A newly-unmapped surface is considered to have met condition (1) out
+       of the 3 required conditions for mapping a surface if its role surface
+-      has not been destroyed.
++      has not been destroyed, i.e. the client must perform the initial commit
++      again before attaching a buffer.
+     </description>
+ 
+     <enum name="error">
+-      <entry name="not_constructed" value="1"/>
+-      <entry name="already_constructed" value="2"/>
+-      <entry name="unconfigured_buffer" value="3"/>
++      <entry name="not_constructed" value="1"
++	     summary="Surface was not fully constructed"/>
++      <entry name="already_constructed" value="2"
++	     summary="Surface was already constructed"/>
++      <entry name="unconfigured_buffer" value="3"
++	     summary="Attaching a buffer to an unconfigured surface"/>
++      <entry name="invalid_serial" value="4"
++	     summary="Invalid serial number when acking a configure event"/>
++      <entry name="invalid_size" value="5"
++	     summary="Width or height was zero or negative"/>
++      <entry name="defunct_role_object" value="6"
++	     summary="Surface was destroyed before its role object"/>
+     </enum>
+ 
+     <request name="destroy" type="destructor">
+       <description summary="destroy the xdg_surface">
+ 	Destroy the xdg_surface object. An xdg_surface must only be destroyed
+-	after its role object has been destroyed.
++	after its role object has been destroyed, otherwise
++	a defunct_role_object error is raised.
+       </description>
+     </request>
+ 
+@@ -485,8 +504,8 @@
+ 	xdg_popup is and how it is used.
+       </description>
+       <arg name="id" type="new_id" interface="xdg_popup"/>
+-      <arg name="parent" type="object" interface="xdg_surface" allow-null="true"/>
+-      <arg name="positioner" type="object" interface="xdg_positioner"/>
++      <arg name="parent" type="object" interface="xdg_surface" allow-null="true" summary="parent surface for this popup"/>
++      <arg name="positioner" type="object" interface="xdg_positioner" summary="positioner for this popup"/>
+     </request>
+ 
+     <request name="set_window_geometry">
+@@ -494,10 +513,12 @@
+ 	The window geometry of a surface is its "visible bounds" from the
+ 	user's perspective. Client-side decorations often have invisible
+ 	portions like drop-shadows which should be ignored for the
+-	purposes of aligning, placing and constraining windows.
++	purposes of aligning, placing and constraining windows. Note that
++	in some situations, compositors may clip rendering to the window
++	geometry, so the client should avoid putting functional elements
++	outside of it.
+ 
+-	The window geometry is double buffered, and will be applied at the
+-	time wl_surface.commit of the corresponding wl_surface is called.
++	The window geometry is double-buffered state, see wl_surface.commit.
+ 
+ 	When maintaining a position, the compositor should treat the (x, y)
+ 	coordinate of the window geometry as the top left corner of the window.
+@@ -513,18 +534,27 @@
+ 	commit. This unset is meant for extremely simple clients.
+ 
+ 	The arguments are given in the surface-local coordinate space of
+-	the wl_surface associated with this xdg_surface.
++	the wl_surface associated with this xdg_surface, and may extend outside
++	of the wl_surface itself to mark parts of the subsurface tree as part of
++	the window geometry.
+ 
+-	The width and height must be greater than zero. Setting an invalid size
+-	will raise an error. When applied, the effective window geometry will be
+-	the set window geometry clamped to the bounding rectangle of the
+-	combined geometry of the surface of the xdg_surface and the associated
++	When applied, the effective window geometry will be the set window
++	geometry clamped to the bounding rectangle of the combined
++	geometry of the surface of the xdg_surface and the associated
+ 	subsurfaces.
++
++	The effective geometry will not be recalculated unless a new call to
++	set_window_geometry is done and the new pending surface state is
++	subsequently applied.
++
++	The width and height of the effective window geometry must be
++	greater than zero. Setting an invalid size will raise an
++	invalid_size error.
+       </description>
+-      <arg name="x" type="int"/>
+-      <arg name="y" type="int"/>
+-      <arg name="width" type="int"/>
+-      <arg name="height" type="int"/>
++      <arg name="x" type="int" summary="x coordinate of the top-left corner of the window inside this surface"/>
++      <arg name="y" type="int" summary="y coordinate of the top-left corner of the window inside this surface"/>
++      <arg name="width" type="int" summary="width of the window"/>
++      <arg name="height" type="int" summary="height of the window"/>
+     </request>
+ 
+     <request name="ack_configure">
+@@ -540,6 +570,8 @@
+ 
+ 	If the client receives multiple configure events before it
+ 	can respond to one, it only has to ack the last configure event.
++	Acking a configure event that was never sent raises an invalid_serial
++	error.
+ 
+ 	A client is not required to commit immediately after sending
+ 	an ack_configure request - it may even ack_configure several times
+@@ -548,6 +580,17 @@
+ 	A client may send multiple ack_configure requests before committing, but
+ 	only the last request sent before a commit indicates which configure
+ 	event the client really is responding to.
++
++	Sending an ack_configure request consumes the serial number sent with
++	the request, as well as serial numbers sent by all configure events
++	sent on this xdg_surface prior to the configure event referenced by
++	the committed serial.
++
++	It is an error to issue multiple ack_configure requests referencing a
++	serial from the same configure event, or to issue an ack_configure
++	request referencing a serial from a configure event issued before the
++	event identified by the last ack_configure request for the same
++	xdg_surface. Doing so will raise an invalid_serial error.
+       </description>
+       <arg name="serial" type="uint" summary="the serial from the configure event"/>
+     </request>
+@@ -576,7 +619,7 @@
+ 
+   </interface>
+ 
+-  <interface name="xdg_toplevel" version="3">
++  <interface name="xdg_toplevel" version="7">
+     <description summary="toplevel surface">
+       This interface defines an xdg_surface role which allows a surface to,
+       among other things, set window-like properties such as maximize,
+@@ -584,13 +627,17 @@
+       id, and well as trigger user interactive operations such as interactive
+       resize and move.
+ 
++      An xdg_toplevel by default is responsible for providing the full intended
++      visual representation of the toplevel, which depending on the window
++      state, may mean things like a title bar, window controls and drop shadow.
++
+       Unmapping an xdg_toplevel means that the surface cannot be shown
+       by the compositor until it is explicitly mapped again.
+       All active operations (e.g., move, resize) are canceled and all
+       attributes (e.g. title, state, stacking, ...) are discarded for
+       an xdg_toplevel surface when it is unmapped. The xdg_toplevel returns to
+       the state it had right after xdg_surface.get_toplevel. The client
+-      can re-map the toplevel by perfoming a commit without any buffer
++      can re-map the toplevel by performing a commit without any buffer
+       attached, waiting for a configure event and handling it as usual (see
+       xdg_surface description).
+ 
+@@ -604,26 +651,39 @@
+       </description>
+     </request>
+ 
++    <enum name="error">
++      <entry name="invalid_resize_edge" value="0" summary="provided value is
++        not a valid variant of the resize_edge enum"/>
++      <entry name="invalid_parent" value="1"
++        summary="invalid parent toplevel"/>
++      <entry name="invalid_size" value="2"
++	summary="client provided an invalid min or max size"/>
++    </enum>
++
+     <request name="set_parent">
+       <description summary="set the parent of this surface">
+ 	Set the "parent" of this surface. This surface should be stacked
+ 	above the parent surface and all other ancestor surfaces.
+ 
+-	Parent windows should be set on dialogs, toolboxes, or other
++	Parent surfaces should be set on dialogs, toolboxes, or other
+ 	"auxiliary" surfaces, so that the parent is raised when the dialog
+ 	is raised.
+ 
+-	Setting a null parent for a child window removes any parent-child
+-	relationship for the child. Setting a null parent for a window which
+-	currently has no parent is a no-op.
++	Setting a null parent for a child surface unsets its parent. Setting
++	a null parent for a surface which currently has no parent is a no-op.
+ 
+-	If the parent is unmapped then its children are managed as
+-	though the parent of the now-unmapped parent has become the
+-	parent of this surface. If no parent exists for the now-unmapped
+-	parent then the children are managed as though they have no
+-	parent surface.
++	Only mapped surfaces can have child surfaces. Setting a parent which
++	is not mapped is equivalent to setting a null parent. If a surface
++	becomes unmapped, its children's parent is set to the parent of
++	the now-unmapped surface. If the now-unmapped surface has no parent,
++	its children's parent is unset. If the now-unmapped surface becomes
++	mapped again, its parent-child relationship is not restored.
++
++	The parent toplevel must not be one of the child toplevel's
++	descendants, and the parent must be different from the child toplevel,
++	otherwise the invalid_parent protocol error is raised.
+       </description>
+-      <arg name="parent" type="object" interface="xdg_toplevel" allow-null="true"/>
++      <arg name="parent" type="object" interface="xdg_toplevel" allow-null="true" summary="parent surface for this surface"/>
+     </request>
+ 
+     <request name="set_title">
+@@ -636,7 +696,7 @@
+ 
+ 	The string must be encoded in UTF-8.
+       </description>
+-      <arg name="title" type="string"/>
++      <arg name="title" type="string" summary="title of the surface"/>
+     </request>
+ 
+     <request name="set_app_id">
+@@ -663,9 +723,9 @@
+ 	application identifiers and how they relate to well-known D-Bus
+ 	names and .desktop files.
+ 
+-	[0] http://standards.freedesktop.org/desktop-entry-spec/
++	[0] https://standards.freedesktop.org/desktop-entry-spec/
+       </description>
+-      <arg name="app_id" type="string"/>
++      <arg name="app_id" type="string" summary="application identifier surface belongs to"/>
+     </request>
+ 
+     <request name="show_window_menu">
+@@ -677,7 +737,8 @@
+ 	This request asks the compositor to pop up such a window menu at
+ 	the given position, relative to the local surface coordinates of
+ 	the parent surface. There are no guarantees as to what menu items
+-	the window menu contains.
++	the window menu contains, or even if a window menu will be drawn
++	at all.
+ 
+ 	This request must be used in response to some sort of user action
+ 	like a button press, key press, or touch down event.
+@@ -753,12 +814,13 @@
+ 	guarantee that the device focus will return when the resize is
+ 	completed.
+ 
+-	The edges parameter specifies how the surface should be resized,
+-	and is one of the values of the resize_edge enum. The compositor
+-	may use this information to update the surface position for
+-	example when dragging the top left corner. The compositor may also
+-	use this information to adapt its behavior, e.g. choose an
+-	appropriate cursor image.
++	The edges parameter specifies how the surface should be resized, and
++	is one of the values of the resize_edge enum. Values not matching
++	a variant of the enum will cause the invalid_resize_edge protocol error.
++	The compositor may use this information to update the surface position
++	for example when dragging the top left corner. The compositor may also
++	use this information to adapt its behavior, e.g. choose an appropriate
++	cursor image.
+       </description>
+       <arg name="seat" type="object" interface="wl_seat" summary="the wl_seat of the user event"/>
+       <arg name="serial" type="uint" summary="the serial of the user event"/>
+@@ -772,13 +834,13 @@
+ 	configure event to ensure that both the client and the compositor
+ 	setting the state can be synchronized.
+ 
+-	States set in this way are double-buffered. They will get applied on
+-	the next commit.
++	States set in this way are double-buffered, see wl_surface.commit.
+       </description>
+       <entry name="maximized" value="1" summary="the surface is maximized">
+ 	<description summary="the surface is maximized">
+ 	  The surface is maximized. The window geometry specified in the configure
+-	  event must be obeyed by the client.
++	  event must be obeyed by the client, or the xdg_wm_base.invalid_surface_state
++	  error is raised.
+ 
+ 	  The client should draw without shadow or other
+ 	  decoration outside of the window geometry.
+@@ -809,27 +871,78 @@
+ 	</description>
+       </entry>
+       <entry name="tiled_left" value="5" since="2">
+-	<description summary="the surface is tiled">
++	<description summary="the surface’s left edge is tiled">
+ 	  The window is currently in a tiled layout and the left edge is
+ 	  considered to be adjacent to another part of the tiling grid.
++
++	  The client should draw without shadow or other decoration outside of
++	  the window geometry on the left edge.
+ 	</description>
+       </entry>
+       <entry name="tiled_right" value="6" since="2">
+-	<description summary="the surface is tiled">
++	<description summary="the surface’s right edge is tiled">
+ 	  The window is currently in a tiled layout and the right edge is
+ 	  considered to be adjacent to another part of the tiling grid.
++
++	  The client should draw without shadow or other decoration outside of
++	  the window geometry on the right edge.
+ 	</description>
+       </entry>
+       <entry name="tiled_top" value="7" since="2">
+-	<description summary="the surface is tiled">
++	<description summary="the surface’s top edge is tiled">
+ 	  The window is currently in a tiled layout and the top edge is
+ 	  considered to be adjacent to another part of the tiling grid.
++
++	  The client should draw without shadow or other decoration outside of
++	  the window geometry on the top edge.
+ 	</description>
+       </entry>
+       <entry name="tiled_bottom" value="8" since="2">
+-	<description summary="the surface is tiled">
++	<description summary="the surface’s bottom edge is tiled">
+ 	  The window is currently in a tiled layout and the bottom edge is
+ 	  considered to be adjacent to another part of the tiling grid.
++
++	  The client should draw without shadow or other decoration outside of
++	  the window geometry on the bottom edge.
++	</description>
++      </entry>
++      <entry name="suspended" value="9" since="6">
++        <description summary="surface repaint is suspended">
++	  The surface is currently not ordinarily being repainted; for
++	  example because its content is occluded by another window, or its
++	  outputs are switched off due to screen locking.
++	</description>
++      </entry>
++      <entry name="constrained_left" value="10" since="7">
++	<description summary="the surface’s left edge is constrained">
++          The left edge of the window is currently constrained, meaning it
++          shouldn't attempt to resize from that edge. It can for example mean
++          it's tiled next to a monitor edge on the constrained side of the
++          window.
++	</description>
++      </entry>
++      <entry name="constrained_right" value="11" since="7">
++	<description summary="the surface’s right edge is constrained">
++          The right edge of the window is currently constrained, meaning it
++          shouldn't attempt to resize from that edge. It can for example mean
++          it's tiled next to a monitor edge on the constrained side of the
++          window.
++	</description>
++      </entry>
++      <entry name="constrained_top" value="12" since="7">
++	<description summary="the surface’s top edge is constrained">
++          The top edge of the window is currently constrained, meaning it
++          shouldn't attempt to resize from that edge. It can for example mean
++          it's tiled next to a monitor edge on the constrained side of the
++          window.
++	</description>
++      </entry>
++      <entry name="constrained_bottom" value="13" since="7">
++	<description summary="the surface’s bottom edge is constrained">
++          The bottom edge of the window is currently constrained, meaning it
++          shouldn't attempt to resize from that edge. It can for example mean
++          it's tiled next to a monitor edge on the constrained side of the
++          window.
+ 	</description>
+       </entry>
+     </enum>
+@@ -844,8 +957,7 @@
+ 	The width and height arguments are in window geometry coordinates.
+ 	See xdg_surface.set_window_geometry.
+ 
+-	Values set in this way are double-buffered. They will get applied
+-	on the next commit.
++	Values set in this way are double-buffered, see wl_surface.commit.
+ 
+ 	The compositor can use this information to allow or disallow
+ 	different states like maximize or fullscreen and draw accurate
+@@ -865,14 +977,14 @@
+ 	request.
+ 
+ 	Requesting a maximum size to be smaller than the minimum size of
+-	a surface is illegal and will result in a protocol error.
++	a surface is illegal and will result in an invalid_size error.
+ 
+ 	The width and height must be greater than or equal to zero. Using
+-	strictly negative values for width and height will result in a
+-	protocol error.
++	strictly negative values for width or height will result in an
++	invalid_size error.
+       </description>
+-      <arg name="width" type="int"/>
+-      <arg name="height" type="int"/>
++      <arg name="width" type="int" summary="maximum width of the window"/>
++      <arg name="height" type="int" summary="maximum height of the window"/>
+     </request>
+ 
+     <request name="set_min_size">
+@@ -885,8 +997,7 @@
+ 	The width and height arguments are in window geometry coordinates.
+ 	See xdg_surface.set_window_geometry.
+ 
+-	Values set in this way are double-buffered. They will get applied
+-	on the next commit.
++	Values set in this way are double-buffered, see wl_surface.commit.
+ 
+ 	The compositor can use this information to allow or disallow
+ 	different states like maximize or fullscreen and draw accurate
+@@ -906,14 +1017,14 @@
+ 	request.
+ 
+ 	Requesting a minimum size to be larger than the maximum size of
+-	a surface is illegal and will result in a protocol error.
++	a surface is illegal and will result in an invalid_size error.
+ 
+ 	The width and height must be greater than or equal to zero. Using
+-	strictly negative values for width and height will result in a
+-	protocol error.
++	strictly negative values for width and height will result in an
++	invalid_size error.
+       </description>
+-      <arg name="width" type="int"/>
+-      <arg name="height" type="int"/>
++      <arg name="width" type="int" summary="minimum width of the window"/>
++      <arg name="height" type="int" summary="minimum height of the window"/>
+     </request>
+ 
+     <request name="set_maximized">
+@@ -983,7 +1094,7 @@
+ 
+ 	If the surface doesn't cover the whole output, the compositor will
+ 	position the surface in the center of the output and compensate with
+-	with border fill covering the rest of the output. The content of the
++	border fill covering the rest of the output. The content of the
+ 	border fill is undefined, but should be assumed to be in some way that
+ 	attempts to blend into the surrounding area (e.g. solid black).
+ 
+@@ -992,7 +1103,7 @@
+ 	up of subsurfaces, popups or similarly coupled surfaces) are not
+ 	visible below the fullscreened surface.
+       </description>
+-      <arg name="output" type="object" interface="wl_output" allow-null="true"/>
++      <arg name="output" type="object" interface="wl_output" allow-null="true" summary="preferred output to place surface on"/>
+     </request>
+ 
+     <request name="unset_fullscreen">
+@@ -1049,12 +1160,15 @@
+ 	arguments should be interpreted, and possibly how it should be
+ 	drawn.
+ 
++	The states are sent as an array of 32-bit unsigned integers in
++	native endianness. State values are defined in the state enum.
++
+ 	Clients must send an ack_configure in response to this event. See
+ 	xdg_surface.configure and xdg_surface.ack_configure for details.
+       </description>
+-      <arg name="width" type="int"/>
+-      <arg name="height" type="int"/>
+-      <arg name="states" type="array"/>
++      <arg name="width" type="int" summary="suggested width of window"/>
++      <arg name="height" type="int" summary="suggested height of window"/>
++      <arg name="states" type="array" summary="suggested states of the window"/>
+     </event>
+ 
+     <event name="close">
+@@ -1069,9 +1183,68 @@
+ 	a dialog to ask the user to save their data, etc.
+       </description>
+     </event>
++
++    <!-- Version 4 additions -->
++
++    <event name="configure_bounds" since="4">
++      <description summary="recommended window geometry bounds">
++	The configure_bounds event may be sent prior to a xdg_toplevel.configure
++	event to communicate the bounds a window geometry size is recommended
++	to constrain to.
++
++	The passed width and height are in surface coordinate space. If width
++	and height are 0, it means bounds is unknown and equivalent to as if no
++	configure_bounds event was ever sent for this surface.
++
++	The bounds can for example correspond to the size of a monitor excluding
++	any panels or other shell components, so that a surface isn't created in
++	a way that it cannot fit.
++
++	The bounds may change at any point, and in such a case, a new
++	xdg_toplevel.configure_bounds will be sent, followed by
++	xdg_toplevel.configure and xdg_surface.configure.
++      </description>
++      <arg name="width" type="int" summary="suggested maximum width of surface"/>
++      <arg name="height" type="int" summary="suggested maximum height of surface"/>
++    </event>
++
++    <!-- Version 5 additions -->
++
++    <enum name="wm_capabilities" since="5">
++      <entry name="window_menu" value="1" summary="show_window_menu is available"/>
++      <entry name="maximize" value="2" summary="set_maximized and unset_maximized are available"/>
++      <entry name="fullscreen" value="3" summary="set_fullscreen and unset_fullscreen are available"/>
++      <entry name="minimize" value="4" summary="set_minimized is available"/>
++    </enum>
++
++    <event name="wm_capabilities" since="5">
++      <description summary="compositor capabilities">
++	This event advertises the capabilities supported by the compositor. If
++	a capability isn't supported, clients should hide or disable the UI
++	elements that expose this functionality. For instance, if the
++	compositor doesn't advertise support for minimized toplevels, a button
++	triggering the set_minimized request should not be displayed.
++
++	The compositor will ignore requests it doesn't support. For instance,
++	a compositor which doesn't advertise support for minimized will ignore
++	set_minimized requests.
++
++	Compositors must send this event once before the first
++	xdg_surface.configure event. When the capabilities change, compositors
++	must send this event again and then send an xdg_surface.configure
++	event.
++
++	The configured state should not be applied immediately. See
++	xdg_surface.configure for details.
++
++	The capabilities are sent as an array of 32-bit unsigned integers in
++	native endianness. Capability values are defined in the wm_capabilities enum.
++      </description>
++      <arg name="capabilities" type="array" summary="array of 32-bit capabilities"/>
++    </event>
+   </interface>
+ 
+-  <interface name="xdg_popup" version="3">
++  <interface name="xdg_popup" version="7">
+     <description summary="short-lived, popup surfaces for menus">
+       A popup surface is a short-lived, temporary surface. It can be used to
+       implement for example menus, popovers, tooltips and other similar user
+@@ -1109,8 +1282,8 @@
+ 	This destroys the popup. Explicitly destroying the xdg_popup
+ 	object will also dismiss the popup, and unmap the surface.
+ 
+-	If this xdg_popup is not the "topmost" popup, a protocol error
+-	will be sent.
++	If this xdg_popup is not the "topmost" popup, the
++	xdg_wm_base.not_the_topmost_popup protocol error will be sent.
+       </description>
+     </request>
+ 
+@@ -1142,10 +1315,6 @@
+ 	nested grabbing popup as well. When a compositor dismisses popups, it
+ 	will follow the same dismissing order as required from the client.
+ 
+-	The parent of a grabbing popup must either be another xdg_popup with an
+-	active explicit grab, or an xdg_popup or xdg_toplevel, if there are no
+-	explicit grabs already taken.
+-
+ 	If the topmost grabbing popup is destroyed, the grab will be returned to
+ 	the parent of the popup, if that parent previously had an explicit grab.
+ 
+diff --git a/freedesktop.org/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml b/freedesktop.org/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
+index afa55ca..6f11e92 100644
+--- a/freedesktop.org/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
++++ b/freedesktop.org/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
+@@ -24,17 +24,18 @@
+     DEALINGS IN THE SOFTWARE.
+   </copyright>
+ 
+-  <interface name="zwp_linux_dmabuf_v1" version="3">
++  <interface name="zwp_linux_dmabuf_v1" version="5">
+     <description summary="factory for creating dmabuf-based wl_buffers">
+       Following the interfaces from:
+       https://www.khronos.org/registry/egl/extensions/EXT/EGL_EXT_image_dma_buf_import.txt
+       https://www.khronos.org/registry/EGL/extensions/EXT/EGL_EXT_image_dma_buf_import_modifiers.txt
+       and the Linux DRM sub-system's AddFb2 ioctl.
+ 
+-      This interface offers ways to create generic dmabuf-based
+-      wl_buffers. Immediately after a client binds to this interface,
+-      the set of supported formats and format modifiers is sent with
+-      'format' and 'modifier' events.
++      This interface offers ways to create generic dmabuf-based wl_buffers.
++
++      Clients can use the get_surface_feedback request to get dmabuf feedback
++      for a particular surface. If the client wants to retrieve feedback not
++      tied to a surface, they can use the get_default_feedback request.
+ 
+       The following are required from clients:
+ 
+@@ -82,14 +83,17 @@
+           client. If the client uses a failed wl_buffer as an argument to any
+           request, the behaviour is compositor implementation-defined.
+ 
+-      Warning! The protocol described in this file is experimental and
+-      backward incompatible changes may be made. Backward compatible changes
+-      may be added together with the corresponding interface version bump.
+-      Backward incompatible changes are done by bumping the version number in
+-      the protocol and interface names and resetting the interface version.
+-      Once the protocol is to be declared stable, the 'z' prefix and the
+-      version number in the protocol and interface names are removed and the
+-      interface version number is reset.
++      For all DRM formats and unless specified in another protocol extension,
++      pre-multiplied alpha is used for pixel values.
++
++      Unless specified otherwise in another protocol extension, implicit
++      synchronization is used. In other words, compositors and clients must
++      wait and signal fences implicitly passed via the DMA-BUF's reservation
++      mechanism.
++
++      Disclaimer: This protocol extension has been marked stable. This copy is
++      no longer used and only retained for backwards compatibility. The
++      canonical version can be found in the stable/ directory.
+     </description>
+ 
+     <request name="destroy" type="destructor">
+@@ -120,10 +124,9 @@
+         For the definition of the format codes, see the
+         zwp_linux_buffer_params_v1::create request.
+ 
+-        Warning: the 'format' event is likely to be deprecated and replaced
+-        with the 'modifier' event introduced in zwp_linux_dmabuf_v1
+-        version 3, described below. Please refrain from using the information
+-        received from this event.
++        Starting version 4, the format event is deprecated and must not be
++        sent by compositors. Instead, use get_default_feedback or
++        get_surface_feedback.
+       </description>
+       <arg name="format" type="uint" summary="DRM_FORMAT code"/>
+     </event>
+@@ -149,6 +152,10 @@
+         For the definition of the format and modifier codes, see the
+         zwp_linux_buffer_params_v1::create and zwp_linux_buffer_params_v1::add
+         requests.
++
++        Starting version 4, the modifier event is deprecated and must not be
++        sent by compositors. Instead, use get_default_feedback or
++        get_surface_feedback.
+       </description>
+       <arg name="format" type="uint" summary="DRM_FORMAT code"/>
+       <arg name="modifier_hi" type="uint"
+@@ -156,9 +163,34 @@
+       <arg name="modifier_lo" type="uint"
+            summary="low 32 bits of layout modifier"/>
+     </event>
++
++    <!-- Version 4 additions -->
++
++    <request name="get_default_feedback" since="4">
++      <description summary="get default feedback">
++        This request creates a new wp_linux_dmabuf_feedback object not bound
++        to a particular surface. This object will deliver feedback about dmabuf
++        parameters to use if the client doesn't support per-surface feedback
++        (see get_surface_feedback).
++      </description>
++      <arg name="id" type="new_id" interface="zwp_linux_dmabuf_feedback_v1"/>
++    </request>
++
++    <request name="get_surface_feedback" since="4">
++      <description summary="get feedback for a surface">
++        This request creates a new wp_linux_dmabuf_feedback object for the
++        specified wl_surface. This object will deliver feedback about dmabuf
++        parameters to use for buffers attached to this surface.
++
++        If the surface is destroyed before the wp_linux_dmabuf_feedback object,
++        the feedback object becomes inert.
++      </description>
++      <arg name="id" type="new_id" interface="zwp_linux_dmabuf_feedback_v1"/>
++      <arg name="surface" type="object" interface="wl_surface"/>
++    </request>
+   </interface>
+ 
+-  <interface name="zwp_linux_buffer_params_v1" version="3">
++  <interface name="zwp_linux_buffer_params_v1" version="5">
+     <description summary="parameters for creating a dmabuf-based wl_buffer">
+       This temporary object is a collection of dmabufs and other
+       parameters that together form a single logical buffer. The temporary
+@@ -215,10 +247,11 @@
+         compression, etc. driver-specific modifications to the base format
+         defined by the DRM fourcc code.
+ 
+-        Warning: It should be an error if the format/modifier pair was not
+-        advertised with the modifier event. This is not enforced yet because
+-        some implementations always accept DRM_FORMAT_MOD_INVALID. Also
+-        version 2 of this protocol does not have the modifier event.
++        Starting from version 4, the invalid_format protocol error is sent if
++        the format + modifier pair was not advertised as supported.
++
++        Starting from version 5, the invalid_format protocol error is sent if
++        all planes don't use the same modifier.
+ 
+         This request raises the PLANE_IDX error if plane_idx is too large.
+         The error PLANE_SET is raised if attempting to set a plane that
+@@ -314,7 +347,7 @@
+         successful. It provides the new wl_buffer referencing the dmabuf(s).
+ 
+         Upon receiving this event, the client should destroy the
+-        zlinux_dmabuf_params object.
++        zwp_linux_buffer_params_v1 object.
+       </description>
+       <arg name="buffer" type="new_id" interface="wl_buffer"
+            summary="the newly created wl_buffer"/>
+@@ -327,7 +360,7 @@
+         has not been fulfilled.
+ 
+         Upon receiving this event, the client should destroy the
+-        zlinux_buffer_params object.
++        zwp_linux_buffer_params_v1 object.
+       </description>
+     </event>
+ 
+@@ -349,7 +382,7 @@
+             of planes and the format, bad format, non-positive width or
+             height, or bad offset or stride.
+           - INVALID_WL_BUFFER, in case the cause for failure is unknown or
+-            plaform specific.
++            platform specific.
+         - the server creates an invalid wl_buffer, marks it as failed and
+           sends a 'failed' event to the client. The result of using this
+           invalid wl_buffer as an argument in any request by the client is
+@@ -365,7 +398,192 @@
+       <arg name="format" type="uint" summary="DRM_FORMAT code"/>
+       <arg name="flags" type="uint" enum="flags" summary="see enum flags"/>
+     </request>
++  </interface>
++
++  <interface name="zwp_linux_dmabuf_feedback_v1" version="5">
++    <description summary="dmabuf feedback">
++      This object advertises dmabuf parameters feedback. This includes the
++      preferred devices and the supported formats/modifiers.
++
++      The parameters are sent once when this object is created and whenever they
++      change. The done event is always sent once after all parameters have been
++      sent. When a single parameter changes, all parameters are re-sent by the
++      compositor.
++
++      Compositors can re-send the parameters when the current client buffer
++      allocations are sub-optimal. Compositors should not re-send the
++      parameters if re-allocating the buffers would not result in a more optimal
++      configuration. In particular, compositors should avoid sending the exact
++      same parameters multiple times in a row.
++
++      The tranche_target_device and tranche_formats events are grouped by
++      tranches of preference. For each tranche, a tranche_target_device, one
++      tranche_flags and one or more tranche_formats events are sent, followed
++      by a tranche_done event finishing the list. The tranches are sent in
++      descending order of preference. All formats and modifiers in the same
++      tranche have the same preference.
++
++      To send parameters, the compositor sends one main_device event, tranches
++      (each consisting of one tranche_target_device event, one tranche_flags
++      event, tranche_formats events and then a tranche_done event), then one
++      done event.
++    </description>
+ 
++    <request name="destroy" type="destructor">
++      <description summary="destroy the feedback object">
++        Using this request a client can tell the server that it is not going to
++        use the wp_linux_dmabuf_feedback object anymore.
++      </description>
++    </request>
++
++    <event name="done">
++      <description summary="all feedback has been sent">
++        This event is sent after all parameters of a wp_linux_dmabuf_feedback
++        object have been sent.
++
++        This allows changes to the wp_linux_dmabuf_feedback parameters to be
++        seen as atomic, even if they happen via multiple events.
++      </description>
++    </event>
++
++    <event name="format_table">
++      <description summary="format and modifier table">
++        This event provides a file descriptor which can be memory-mapped to
++        access the format and modifier table.
++
++        The table contains a tightly packed array of consecutive format +
++        modifier pairs. Each pair is 16 bytes wide. It contains a format as a
++        32-bit unsigned integer, followed by 4 bytes of unused padding, and a
++        modifier as a 64-bit unsigned integer. The native endianness is used.
++
++        The client must map the file descriptor in read-only private mode.
++
++        Compositors are not allowed to mutate the table file contents once this
++        event has been sent. Instead, compositors must create a new, separate
++        table file and re-send feedback parameters. Compositors are allowed to
++        store duplicate format + modifier pairs in the table.
++      </description>
++      <arg name="fd" type="fd" summary="table file descriptor"/>
++      <arg name="size" type="uint" summary="table size, in bytes"/>
++    </event>
++
++    <event name="main_device">
++      <description summary="preferred main device">
++        This event advertises the main device that the server prefers to use
++        when direct scan-out to the target device isn't possible. The
++        advertised main device may be different for each
++        wp_linux_dmabuf_feedback object, and may change over time.
++
++        There is exactly one main device. The compositor must send at least
++        one preference tranche with tranche_target_device equal to main_device.
++
++        Clients need to create buffers that the main device can import and
++        read from, otherwise creating the dmabuf wl_buffer will fail (see the
++        wp_linux_buffer_params.create and create_immed requests for details).
++        The main device will also likely be kept active by the compositor,
++        so clients can use it instead of waking up another device for power
++        savings.
++
++        In general the device is a DRM node. The DRM node type (primary vs.
++        render) is unspecified. Clients must not rely on the compositor sending
++        a particular node type. Clients cannot check two devices for equality
++        by comparing the dev_t value.
++
++        If explicit modifiers are not supported and the client performs buffer
++        allocations on a different device than the main device, then the client
++        must force the buffer to have a linear layout.
++      </description>
++      <arg name="device" type="array" summary="device dev_t value"/>
++    </event>
++
++    <event name="tranche_done">
++      <description summary="a preference tranche has been sent">
++        This event splits tranche_target_device and tranche_formats events in
++        preference tranches. It is sent after a set of tranche_target_device
++        and tranche_formats events; it represents the end of a tranche. The
++        next tranche will have a lower preference.
++      </description>
++    </event>
++
++    <event name="tranche_target_device">
++      <description summary="target device">
++        This event advertises the target device that the server prefers to use
++        for a buffer created given this tranche. The advertised target device
++        may be different for each preference tranche, and may change over time.
++
++        There is exactly one target device per tranche.
++
++        The target device may be a scan-out device, for example if the
++        compositor prefers to directly scan-out a buffer created given this
++        tranche. The target device may be a rendering device, for example if
++        the compositor prefers to texture from said buffer.
++
++        The client can use this hint to allocate the buffer in a way that makes
++        it accessible from the target device, ideally directly. The buffer must
++        still be accessible from the main device, either through direct import
++        or through a potentially more expensive fallback path. If the buffer
++        can't be directly imported from the main device then clients must be
++        prepared for the compositor changing the tranche priority or making
++        wl_buffer creation fail (see the wp_linux_buffer_params.create and
++        create_immed requests for details).
++
++        If the device is a DRM node, the DRM node type (primary vs. render) is
++        unspecified. Clients must not rely on the compositor sending a
++        particular node type. Clients cannot check two devices for equality by
++        comparing the dev_t value.
++
++        This event is tied to a preference tranche, see the tranche_done event.
++      </description>
++      <arg name="device" type="array" summary="device dev_t value"/>
++    </event>
++
++    <event name="tranche_formats">
++      <description summary="supported buffer format modifier">
++        This event advertises the format + modifier combinations that the
++        compositor supports.
++
++        It carries an array of indices, each referring to a format + modifier
++        pair in the last received format table (see the format_table event).
++        Each index is a 16-bit unsigned integer in native endianness.
++
++        For legacy support, DRM_FORMAT_MOD_INVALID is an allowed modifier.
++        It indicates that the server can support the format with an implicit
++        modifier. When a buffer has DRM_FORMAT_MOD_INVALID as its modifier, it
++        is as if no explicit modifier is specified. The effective modifier
++        will be derived from the dmabuf.
++
++        A compositor that sends valid modifiers and DRM_FORMAT_MOD_INVALID for
++        a given format supports both explicit modifiers and implicit modifiers.
++
++        Compositors must not send duplicate format + modifier pairs within the
++        same tranche or across two different tranches with the same target
++        device and flags.
++
++        This event is tied to a preference tranche, see the tranche_done event.
++
++        For the definition of the format and modifier codes, see the
++        wp_linux_buffer_params.create request.
++      </description>
++      <arg name="indices" type="array" summary="array of 16-bit indexes"/>
++    </event>
++
++    <enum name="tranche_flags" bitfield="true">
++      <entry name="scanout" value="1" summary="direct scan-out tranche"/>
++    </enum>
++
++    <event name="tranche_flags">
++      <description summary="tranche flags">
++        This event sets tranche-specific flags.
++
++        The scanout flag is a hint that direct scan-out may be attempted by the
++        compositor on the target device if the client appropriately allocates a
++        buffer. How to allocate a buffer that can be scanned out on the target
++        device is implementation-defined.
++
++        This event is tied to a preference tranche, see the tranche_done event.
++      </description>
++      <arg name="flags" type="uint" enum="tranche_flags" summary="tranche flags"/>
++    </event>
+   </interface>
+ 
+ </protocol>
+diff --git a/freedesktop.org/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml b/freedesktop.org/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+index efd64b6..83b0a1c 100644
+--- a/freedesktop.org/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
++++ b/freedesktop.org/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+@@ -225,9 +225,8 @@
+ 	information to warp the pointer upon unlock in order to avoid pointer
+ 	jumps.
+ 
+-	The cursor position hint is double buffered. The new hint will only take
+-	effect when the associated surface gets it pending state applied. See
+-	wl_surface.commit for details.
++	The cursor position hint is double-buffered state, see
++	wl_surface.commit.
+       </description>
+       <arg name="surface_x" type="fixed"
+ 	   summary="surface-local x coordinate"/>
+@@ -239,9 +238,7 @@
+       <description summary="set a new lock region">
+ 	Set a new region used to lock the pointer.
+ 
+-	The new lock region is double-buffered. The new lock region will
+-	only take effect when the associated surface gets its pending state
+-	applied. See wl_surface.commit for details.
++	The new lock region is double-buffered, see wl_surface.commit.
+ 
+ 	For details about the lock region, see wp_locked_pointer.
+       </description>
+@@ -298,9 +295,7 @@
+       <description summary="set a new confine region">
+ 	Set a new region used to confine the pointer.
+ 
+-	The new confine region is double-buffered. The new confine region will
+-	only take effect when the associated surface gets its pending state
+-	applied. See wl_surface.commit for details.
++	The new confine region is double-buffered, see wl_surface.commit.
+ 
+ 	If the confinement is active when the new confinement region is applied
+ 	and the pointer ends up outside of newly applied region, the pointer may
+diff --git a/freedesktop.org/unstable/tablet/tablet-unstable-v2.xml b/freedesktop.org/unstable/tablet/tablet-unstable-v2.xml
+index b286d96..d78b141 100644
+--- a/freedesktop.org/unstable/tablet/tablet-unstable-v2.xml
++++ b/freedesktop.org/unstable/tablet/tablet-unstable-v2.xml
+@@ -105,14 +105,9 @@
+     will likely include some form of removing a tool when all tablets the
+     tool was used on are removed.
+ 
+-    Warning! The protocol described in this file is experimental and
+-    backward incompatible changes may be made. Backward compatible changes
+-    may be added together with the corresponding interface version bump.
+-    Backward incompatible changes are done by bumping the version number in
+-    the protocol and interface names and resetting the interface version.
+-    Once the protocol is to be declared stable, the 'z' prefix and the
+-    version number in the protocol and interface names are removed and the
+-    interface version number is reset.
++    Disclaimer: This protocol extension has been marked stable. This copy is
++    no longer used and only retained for backwards compatibility. The
++    canonical version can be found in the stable/ directory.
+   </description>
+ 
+   <interface name="zwp_tablet_manager_v2" version="1">
+@@ -247,7 +242,7 @@
+ 	previously been used as cursor surface for a different tool, a
+ 	protocol error is raised.
+       </description>
+-      <arg name="serial" type="uint" summary="serial of the enter event"/>
++      <arg name="serial" type="uint" summary="serial of the proximity_in event"/>
+       <arg name="surface" type="object" interface="wl_surface" allow-null="true"/>
+       <arg name="hotspot_x" type="int" summary="surface-local x coordinate"/>
+       <arg name="hotspot_y" type="int" summary="surface-local y coordinate"/>
+@@ -596,14 +591,23 @@
+ 
+     <event name="name">
+       <description summary="tablet device name">
++        A descriptive name for the tablet device.
++
++	If the device has no descriptive name, this event is not sent.
++
+ 	This event is sent in the initial burst of events before the
+-	wp_tablet.done event.
++        wp_tablet.done event.
+       </description>
+       <arg name="name" type="string" summary="the device name"/>
+     </event>
+ 
+     <event name="id">
+       <description summary="tablet device USB vendor/product id">
++	The USB vendor and product IDs for the tablet device.
++
++	If the device has no USB vendor/product ID, this event is not sent.
++	This can happen for virtual devices or non-USB devices, for instance.
++
+ 	This event is sent in the initial burst of events before the
+ 	wp_tablet.done event.
+       </description>
+@@ -1156,7 +1160,7 @@
+     </event>
+ 
+     <event name="leave">
+-      <description summary="enter event">
++      <description summary="leave event">
+ 	Notification that this pad is no longer focused on the specified
+ 	surface.
+       </description>
+diff --git a/freedesktop.org/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml b/freedesktop.org/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+index e596775..023589a 100644
+--- a/freedesktop.org/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
++++ b/freedesktop.org/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+@@ -23,7 +23,7 @@
+     DEALINGS IN THE SOFTWARE.
+   </copyright>
+ 
+-  <interface name="zxdg_decoration_manager_v1" version="1">
++  <interface name="zxdg_decoration_manager_v1" version="2">
+     <description summary="window decoration manager">
+       This interface allows a compositor to announce support for server-side
+       decorations.
+@@ -60,18 +60,33 @@
+       <description summary="create a new toplevel decoration object">
+         Create a new decoration object associated with the given toplevel.
+ 
+-        Creating an xdg_toplevel_decoration from an xdg_toplevel which has a
+-        buffer attached or committed is a client error, and any attempts by a
+-        client to attach or manipulate a buffer prior to the first
+-        xdg_toplevel_decoration.configure event must also be treated as
+-        errors.
++        For objects of version 1, creating an xdg_toplevel_decoration from an
++        xdg_toplevel which has a buffer attached or committed is a client
++        error, and any attempts by a client to attach or manipulate a buffer
++        prior to the first xdg_toplevel_decoration.configure event must also be
++        treated as errors.
++
++        For objects of version 2 or newer, creating an xdg_toplevel_decoration
++        from an xdg_toplevel which has a buffer attached or committed is
++        allowed. The initial decoration mode of the surface if a buffer is
++        already attached depends on whether a xdg_toplevel_decoration object
++        has been associated with the surface or not prior to this request.
++
++        If an xdg_toplevel_decoration was associated with the surface, then
++        destroyed without a surface commit, the previous decoration mode is
++        retained.
++
++        If no xdg_toplevel_decoration was associated with the surface prior to
++        this request, or if a surface commit has been performed after a previous
++        xdg_toplevel_decoration object associated with the surface was
++        destroyed, the decoration mode is assumed to be client-side.
+       </description>
+       <arg name="id" type="new_id" interface="zxdg_toplevel_decoration_v1"/>
+       <arg name="toplevel" type="object" interface="xdg_toplevel"/>
+     </request>
+   </interface>
+ 
+-  <interface name="zxdg_toplevel_decoration_v1" version="1">
++  <interface name="zxdg_toplevel_decoration_v1" version="2">
+     <description summary="decoration object for a toplevel surface">
+       The decoration object allows the compositor to toggle server-side window
+       decorations for a toplevel surface. The client can request to switch to
+@@ -88,12 +103,14 @@
+         summary="xdg_toplevel already has a decoration object"/>
+       <entry name="orphaned" value="2"
+         summary="xdg_toplevel destroyed before the decoration object"/>
++      <entry name="invalid_mode" value="3" summary="invalid mode"/>
+     </enum>
+ 
+     <request name="destroy" type="destructor">
+       <description summary="destroy the decoration object">
+         Switch back to a mode without any server-side decorations at the next
+-        commit.
++        commit, unless a new xdg_toplevel_decoration is created for the surface
++        first.
+       </description>
+     </request>
+ 
+@@ -127,6 +144,9 @@
+         Such clients are responsible for preventing configure loops and must
+         make sure not to send multiple successive set_mode requests with the
+         same decoration mode.
++
++        If an invalid mode is supplied by the client, the invalid_mode protocol
++        error is raised by the compositor.
+       </description>
+       <arg name="mode" type="uint" enum="mode" summary="the decoration mode"/>
+     </request>
+@@ -141,8 +161,8 @@
+     </request>
+ 
+     <event name="configure">
+-      <description summary="suggest a surface change">
+-        The configure event asks the client to change its decoration mode. The
++      <description summary="notify a decoration mode change">
++        The configure event configures the effective decoration mode. The
+         configured state should not be applied immediately. Clients must send an
+         ack_configure in response to this event. See xdg_surface.configure and
+         xdg_surface.ack_configure for details.
+-- 
+2.56.0
+

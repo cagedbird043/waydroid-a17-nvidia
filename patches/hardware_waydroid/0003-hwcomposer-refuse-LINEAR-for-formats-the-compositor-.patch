@@ -1,0 +1,133 @@
+From 2741c5079772227b48d81ba4218d7fedfcfb07f5 Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Mon, 12 Oct 2026 00:53:11 +0300
+Subject: [PATCH 03/24] hwcomposer: refuse LINEAR for formats the compositor
+ imports through NVIDIA EGL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+What: dmabuf_modifiers() records, under formats_mutex, every format for which
+the compositor advertises an NVIDIA-vendor (0x03) modifier
+(display->nvidia_modifier_formats). compositor_supports() then reports
+DRM_FORMAT_MOD_LINEAR as unsupported for exactly those formats, so the
+prepare-time gate (waydroid_mode_impl.h, displayable_buffer) routes such a
+layer to SurfaceFlinger composition and the set-time backstop never attaches
+it.
+
+Why: NVIDIA's EGL imports a LINEAR dma-buf only as GL_TEXTURE_EXTERNAL_OES
+(external_only = TRUE; measured here 2026-10-11 with a stock GBM + glvnd host
+test: LINEAR 2D and renderbuffer binds fail with GL_INVALID_OPERATION,
+EXTERNAL_OES works). A compositor that samples client buffers as
+GL_TEXTURE_2D but still advertises LINEAR (Mutter/Cogl) fails the import with
+zwp_linux_buffer_params error 7, which is fatal to the Wayland connection
+(waydroid-nvidia #11).
+
+Source: QuinOvaX, quinovax/waydroid-nvidia main f2c2f39
+  (compositor_uses_nvidia_egl() in patches/hwcomposer/0001-wip-nvidia-fixes.patch)
+  https://github.com/quinovax/waydroid-nvidia/commit/f2c2f39
+  It replaces PR #20 b9f9421 (The-JimmyDev), which refused LINEAR on every
+  compositor and so broke the hybrid iGPU present path.
+Licence: Apache-2.0 (android_hardware_waydroid; the fork's patches/hwcomposer/
+inherit it, waydroid-nvidia LICENSE section 2).
+
+Deviations from the source:
+- Per format instead of global. KWin 6.7.5 on NVIDIA (this host) advertises
+  LINEAR only for P010, NV12 and XYUV, and for those formats LINEAR is the only
+  modifier; every RGB format lists only NVIDIA block-linear modifiers
+  (waydroid.modifiers.* properties, 519 entries). The global gate would refuse
+  NV12 LINEAR video buffers that KWin explicitly accepts and push every video
+  frame through SurfaceFlinger. Hybrid iGPU compositors list no NVIDIA
+  modifier, so LINEAR stays allowed there (unchanged from the source).
+- No once-computed, unlocked `static int cached`: the source computed the
+  answer on first call and kept it forever, so a call before the compositor's
+  modifier events arrived cached "not NVIDIA" for the life of the process, and
+  it read display->modifiers without a lock. Here the writer maintains the set
+  under formats_mutex and the reader consults it under the same lock: no
+  cache, no ordering dependency.
+
+Measured 2026-10-12:
+- KWin 6.7.5: no decision changes (LINEAR is never listed for a format that
+  also has NVIDIA modifiers). Gallery video, launcher, Settings, recents,
+  games render as before.
+- cage 0.3.1 / wlroots 0.20.2 (nested): lists LINEAR next to NVIDIA modifiers
+  for RGB formats, so the gate is active. The gate routes the Gallery video's
+  RGB565 LINEAR buffers (usage 0x920) to SurfaceFlinger (CLIENT). Without the
+  gate (A/B with the unpatched build) wlroots imports and shows them
+  correctly as a DEVICE layer. So on wlroots the gate is conservative and
+  costs a GPU composition pass for such layers; it is needed where the
+  import fails (Mutter, waydroid-nvidia #11; Mutter not available here,
+  not measured).
+
+将 NVIDIA 修饰符检测集合放入各 wl_conn，并使用该连接的 formats_mutex，保留 ATV 的连接隔离。
+
+(cherry picked from commit 584f1d4ba5fa9976d2526865a55520aebd61ad7d)
+---
+ hwcomposer/gralloc_handler.cpp | 16 ++++++++++++++++
+ hwcomposer/wayland-hwc.cpp     |  2 ++
+ hwcomposer/wayland-hwc.h       |  2 ++
+ 3 files changed, 20 insertions(+)
+
+diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
+index 8c07146..54075b5 100644
+--- a/hwcomposer/gralloc_handler.cpp
++++ b/hwcomposer/gralloc_handler.cpp
+@@ -176,6 +176,22 @@ bool compositor_supports(wl_conn *conn, uint32_t drm_format, uint64_t modifier)
+         return false;
+     /* Search under the lock: the Wayland thread may reallocate this vector at any time. */
+     std::lock_guard<std::mutex> lock(conn->formats_mutex);
++    /* NVIDIA's EGL imports a LINEAR dma-buf only as GL_TEXTURE_EXTERNAL_OES (eglQueryDmaBuf-
++     * ModifiersEXT external_only = TRUE). A compositor that also lists NVIDIA block-linear
++     * modifiers for this format imports it through NVIDIA's EGL, and if it samples client
++     * buffers as GL_TEXTURE_2D (Mutter/Cogl) an advertised LINEAR is a fatal
++     * zwp_linux_buffer_params error 7 ("Could not bind the given EGLImage to a
++     * CoglTexture2D", waydroid-nvidia #11). So LINEAR is refused for such a format and the
++     * layer is composed by SurfaceFlinger instead. Per format, not global: KWin on NVIDIA lists
++     * LINEAR only for YUV formats that have no NVIDIA modifier (it handles those as external
++     * textures), and hybrid iGPU compositors list no NVIDIA modifiers, so both keep LINEAR. */
++    if (modifier == DRM_FORMAT_MOD_LINEAR && conn->nvidia_modifier_formats.count(drm_format)) {
++        static std::atomic<bool> logged{false};
++        if (!logged.exchange(true))
++            ALOGI("compositor imports format 0x%x through NVIDIA EGL; LINEAR buffers of such "
++                  "formats are composed by SurfaceFlinger", drm_format);
++        return false;
++    }
+     auto it = conn->modifiers.find(drm_format);
+     if (it == conn->modifiers.end())
+         return false;
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index 97d4952..3ef68ae 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -2881,6 +2881,8 @@ dmabuf_modifiers(void *data, struct zwp_linux_dmabuf_v1 * dmabuf,
+         std::lock_guard<std::mutex> lock(conn->formats_mutex);
+         index = conn->modifiers[format].size();
+         conn->modifiers[format].push_back(modifier);
++        if (fourcc_mod_get_vendor(modifier) == DRM_FORMAT_MOD_VENDOR_NVIDIA)
++            conn->nvidia_modifier_formats.insert(format);
+     }
+ 
+     std::stringstream prop_name_stream;
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index be30fb1..99641c3 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -246,6 +246,7 @@ struct wl_conn {
+     /* Host format/modifier advertisement of this connection. */
+     std::unordered_set<uint32_t> formats;
+     std::map<uint32_t, std::vector<uint64_t>> modifiers;
++    std::unordered_set<uint32_t> nvidia_modifier_formats;
+     bool supports_cursor_viewport;
+     bool supports_cursor_hw_buffer;
+ 
+@@ -745,6 +746,7 @@ struct display {
+     int refresh;
+ 
+ 
++
+     std::map<uint32_t, std::string> layer_names;
+     std::map<uint32_t, struct handleExt> layer_handles_ext;
+     struct handleExt target_layer_handle_ext;
+-- 
+2.56.0
+

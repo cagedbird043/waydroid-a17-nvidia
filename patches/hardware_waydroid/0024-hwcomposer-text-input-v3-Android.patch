@@ -1,0 +1,1276 @@
+From 17c36f713a0617e484eab98e56d6573b79635821 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 15:51:55 +0800
+Subject: [PATCH 24/24] =?utf-8?q?hwcomposer=EF=BC=9A=E9=80=9A=E8=BF=87=20t?=
+ =?utf-8?q?ext-input-v3=20=E6=8A=8A=E5=AE=BF=E4=B8=BB=E8=BE=93=E5=85=A5?=
+ =?utf-8?q?=E6=B3=95=E6=8E=A5=E5=85=A5=20Android?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+新增 vendor 输入法 WaydroidHostIme（id.waydro.hostime）：无界面，
+把宿主输入法（fcitx5/ibus 等）的上屏与预编辑写入当前输入框，
+并上报光标位置。hwcomposer 在控制连接上绑定 zwp_text_input_v3，
+经抽象 unix socket @waydroid-hostime 与输入法通信（只接受该包的 uid），
+光标换算到卡片/桌面窗口坐标后 set_cursor_rectangle，候选框贴在光标旁。
+开机由 vendor init 以 shell 身份启用并设为默认输入法
+（用户若已选其他非原生键盘则不改动）。
+---
+ hostime/Android.bp                         |  27 ++
+ hostime/AndroidManifest.xml                |  22 ++
+ hostime/res/values/strings.xml             |   4 +
+ hostime/res/xml/method.xml                 |   3 +
+ hostime/src/id/waydro/hostime/HostIme.java | 370 +++++++++++++++++++
+ hostime/waydroid-hostime-enable.sh         |  11 +
+ hostime/waydroid-hostime.rc                |   2 +
+ hwcomposer/Android.bp                      |   1 +
+ hwcomposer/ime-bridge.cpp                  | 405 +++++++++++++++++++++
+ hwcomposer/ime-bridge.h                    | 118 ++++++
+ hwcomposer/task-control.cpp                |  20 +
+ hwcomposer/task-control.h                  |   4 +
+ hwcomposer/wayland-hwc.cpp                 |  45 ++-
+ hwcomposer/wayland-hwc.h                   |   9 +
+ 14 files changed, 1038 insertions(+), 3 deletions(-)
+ create mode 100644 hostime/Android.bp
+ create mode 100644 hostime/AndroidManifest.xml
+ create mode 100644 hostime/res/values/strings.xml
+ create mode 100644 hostime/res/xml/method.xml
+ create mode 100644 hostime/src/id/waydro/hostime/HostIme.java
+ create mode 100755 hostime/waydroid-hostime-enable.sh
+ create mode 100644 hostime/waydroid-hostime.rc
+ create mode 100644 hwcomposer/ime-bridge.cpp
+ create mode 100644 hwcomposer/ime-bridge.h
+
+diff --git a/hostime/Android.bp b/hostime/Android.bp
+new file mode 100644
+index 0000000..7d8d724
+--- /dev/null
++++ b/hostime/Android.bp
+@@ -0,0 +1,27 @@
++// Input method that hands Android editors to the host input method; the
++// composer's side is hwcomposer/ime-bridge.h.
++android_app {
++    name: "WaydroidHostIme",
++    srcs: ["src/**/*.java"],
++    resource_dirs: ["res"],
++    sdk_version: "current",
++    vendor: true,
++    optimize: {
++        enabled: false,
++    },
++    required: ["waydroid-hostime-enable"],
++}
++
++sh_binary {
++    name: "waydroid-hostime-enable",
++    src: "waydroid-hostime-enable.sh",
++    vendor: true,
++    required: ["waydroid-hostime.rc"],
++}
++
++prebuilt_etc {
++    name: "waydroid-hostime.rc",
++    src: "waydroid-hostime.rc",
++    sub_dir: "init",
++    vendor: true,
++}
+diff --git a/hostime/AndroidManifest.xml b/hostime/AndroidManifest.xml
+new file mode 100644
+index 0000000..fb2bf7d
+--- /dev/null
++++ b/hostime/AndroidManifest.xml
+@@ -0,0 +1,22 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    package="id.waydro.hostime">
++
++    <application
++        android:label="@string/app_name"
++        android:directBootAware="true">
++        <service
++            android:name=".HostIme"
++            android:label="@string/app_name"
++            android:permission="android.permission.BIND_INPUT_METHOD"
++            android:directBootAware="true"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="android.view.InputMethod" />
++            </intent-filter>
++            <meta-data
++                android:name="android.view.im"
++                android:resource="@xml/method" />
++        </service>
++    </application>
++</manifest>
+diff --git a/hostime/res/values/strings.xml b/hostime/res/values/strings.xml
+new file mode 100644
+index 0000000..fbebb00
+--- /dev/null
++++ b/hostime/res/values/strings.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="app_name">Host input method</string>
++</resources>
+diff --git a/hostime/res/xml/method.xml b/hostime/res/xml/method.xml
+new file mode 100644
+index 0000000..30b2c14
+--- /dev/null
++++ b/hostime/res/xml/method.xml
+@@ -0,0 +1,3 @@
++<?xml version="1.0" encoding="utf-8"?>
++<input-method xmlns:android="http://schemas.android.com/apk/res/android"
++    android:supportsSwitchingToNextInputMethod="true" />
+diff --git a/hostime/src/id/waydro/hostime/HostIme.java b/hostime/src/id/waydro/hostime/HostIme.java
+new file mode 100644
+index 0000000..7b24d93
+--- /dev/null
++++ b/hostime/src/id/waydro/hostime/HostIme.java
+@@ -0,0 +1,370 @@
++package id.waydro.hostime;
++
++import android.graphics.Matrix;
++import android.graphics.RectF;
++import android.inputmethodservice.InputMethodService;
++import android.net.LocalSocket;
++import android.net.LocalSocketAddress;
++import android.os.Handler;
++import android.os.Looper;
++import android.text.InputType;
++import android.util.Log;
++import android.view.inputmethod.CursorAnchorInfo;
++import android.view.inputmethod.EditorInfo;
++import android.view.inputmethod.InputConnection;
++
++import java.io.ByteArrayOutputStream;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.nio.charset.StandardCharsets;
++
++/**
++ * Hands the focused editor to the host input method through the composer
++ * (hardware/waydroid/hwcomposer/ime-bridge.h, which documents the protocol).
++ * It draws nothing: the host shows the preedit and candidates, this puts the
++ * resulting text into the editor and tells the host where the cursor is.
++ * Keys reach the editor as with no input method at all.
++ */
++public class HostIme extends InputMethodService {
++    private static final String TAG = "HostIme";
++    private static final String SOCKET = "waydroid-hostime";
++
++    private static final int MSG_FOCUS = 1;
++    private static final int MSG_CURSOR = 2;
++    private static final int MSG_DONE = 10;
++
++    /* zwp_text_input_v3 content hints and purposes. */
++    private static final int HINT_COMPLETION = 0x1;
++    private static final int HINT_SPELLCHECK = 0x2;
++    private static final int HINT_AUTO_CAPITALIZATION = 0x4;
++    private static final int HINT_HIDDEN_TEXT = 0x40;
++    private static final int HINT_SENSITIVE_DATA = 0x80;
++    private static final int HINT_MULTILINE = 0x200;
++    private static final int PURPOSE_NORMAL = 0;
++    private static final int PURPOSE_DIGITS = 2;
++    private static final int PURPOSE_NUMBER = 3;
++    private static final int PURPOSE_PHONE = 4;
++    private static final int PURPOSE_URL = 5;
++    private static final int PURPOSE_EMAIL = 6;
++    private static final int PURPOSE_NAME = 7;
++    private static final int PURPOSE_PASSWORD = 8;
++    private static final int PURPOSE_PIN = 9;
++    private static final int PURPOSE_DATE = 10;
++    private static final int PURPOSE_TIME = 11;
++    private static final int PURPOSE_DATETIME = 12;
++
++    private final Handler main = new Handler(Looper.getMainLooper());
++    private final Object lock = new Object();
++    private Thread reader;
++    private volatile boolean stopped;
++    /* Guarded by lock. */
++    private LocalSocket socket;
++    private OutputStream out;
++
++    /* Main thread. The last state sent, resent after a reconnect. */
++    private boolean editorActive;
++    private int hint;
++    private int purpose;
++    private final RectF lastCursor = new RectF();
++    private boolean haveCursor;
++    private boolean composing;
++
++    @Override
++    public void onCreate() {
++        super.onCreate();
++        reader = new Thread(this::readLoop, "HostIme reader");
++        reader.start();
++    }
++
++    @Override
++    public void onDestroy() {
++        stopped = true;
++        closeSocket();
++        reader.interrupt();
++        super.onDestroy();
++    }
++
++    @Override
++    public boolean onEvaluateInputViewShown() {
++        return false;
++    }
++
++    @Override
++    public boolean onEvaluateFullscreenMode() {
++        return false;
++    }
++
++    @Override
++    public void onStartInput(EditorInfo info, boolean restarting) {
++        super.onStartInput(info, restarting);
++        composing = false;
++        haveCursor = false;
++        int cls = info.inputType & InputType.TYPE_MASK_CLASS;
++        editorActive = cls != InputType.TYPE_NULL;
++        hint = 0;
++        purpose = PURPOSE_NORMAL;
++        if (editorActive)
++            describe(info.inputType);
++        sendFocus();
++        InputConnection ic = getCurrentInputConnection();
++        if (editorActive && ic != null) {
++            ic.requestCursorUpdates(InputConnection.CURSOR_UPDATE_IMMEDIATE
++                    | InputConnection.CURSOR_UPDATE_MONITOR);
++        }
++    }
++
++    @Override
++    public void onFinishInput() {
++        super.onFinishInput();
++        composing = false;
++        haveCursor = false;
++        if (editorActive) {
++            editorActive = false;
++            sendFocus();
++        }
++    }
++
++    @Override
++    public void onUpdateCursorAnchorInfo(CursorAnchorInfo info) {
++        float left = info.getInsertionMarkerHorizontal();
++        float top = info.getInsertionMarkerTop();
++        float bottom = info.getInsertionMarkerBottom();
++        if (Float.isNaN(left) || Float.isNaN(top) || Float.isNaN(bottom)) {
++            /* No insertion marker (a selection): use the composing text's
++             * first character, else keep the last position. */
++            int start = info.getComposingTextStart();
++            RectF r = start >= 0 ? info.getCharacterBounds(start) : null;
++            if (r == null)
++                return;
++            left = r.left;
++            top = r.top;
++            bottom = r.bottom;
++        }
++        RectF rect = new RectF(left, top, left + 1, bottom);
++        Matrix m = info.getMatrix();
++        if (m != null)
++            m.mapRect(rect);
++        if (haveCursor && rect.equals(lastCursor))
++            return;
++        lastCursor.set(rect);
++        haveCursor = true;
++        sendCursor();
++    }
++
++    private void describe(int type) {
++        int cls = type & InputType.TYPE_MASK_CLASS;
++        int variation = type & InputType.TYPE_MASK_VARIATION;
++        switch (cls) {
++            case InputType.TYPE_CLASS_NUMBER:
++                purpose = variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD ? PURPOSE_PIN
++                        : (type & (InputType.TYPE_NUMBER_FLAG_DECIMAL
++                                | InputType.TYPE_NUMBER_FLAG_SIGNED)) != 0 ? PURPOSE_NUMBER
++                        : PURPOSE_DIGITS;
++                if (purpose == PURPOSE_PIN)
++                    hint |= HINT_HIDDEN_TEXT | HINT_SENSITIVE_DATA;
++                return;
++            case InputType.TYPE_CLASS_PHONE:
++                purpose = PURPOSE_PHONE;
++                return;
++            case InputType.TYPE_CLASS_DATETIME:
++                purpose = variation == InputType.TYPE_DATETIME_VARIATION_DATE ? PURPOSE_DATE
++                        : variation == InputType.TYPE_DATETIME_VARIATION_TIME ? PURPOSE_TIME
++                        : PURPOSE_DATETIME;
++                return;
++            default:
++                break;
++        }
++        switch (variation) {
++            case InputType.TYPE_TEXT_VARIATION_PASSWORD:
++            case InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD:
++            case InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD:
++                purpose = PURPOSE_PASSWORD;
++                hint |= HINT_HIDDEN_TEXT | HINT_SENSITIVE_DATA;
++                break;
++            case InputType.TYPE_TEXT_VARIATION_URI:
++                purpose = PURPOSE_URL;
++                break;
++            case InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS:
++            case InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS:
++                purpose = PURPOSE_EMAIL;
++                break;
++            case InputType.TYPE_TEXT_VARIATION_PERSON_NAME:
++                purpose = PURPOSE_NAME;
++                break;
++            default:
++                break;
++        }
++        if ((type & InputType.TYPE_TEXT_FLAG_MULTI_LINE) != 0)
++            hint |= HINT_MULTILINE;
++        if ((type & (InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS | InputType.TYPE_TEXT_FLAG_CAP_WORDS
++                | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)) != 0)
++            hint |= HINT_AUTO_CAPITALIZATION;
++        if ((type & InputType.TYPE_TEXT_FLAG_AUTO_CORRECT) != 0)
++            hint |= HINT_SPELLCHECK;
++        if ((type & InputType.TYPE_TEXT_FLAG_AUTO_COMPLETE) != 0)
++            hint |= HINT_COMPLETION;
++    }
++
++    private void sendFocus() {
++        send(MSG_FOCUS, new int[] {editorActive ? 1 : 0, hint, purpose});
++    }
++
++    private void sendCursor() {
++        send(MSG_CURSOR, new int[] {Math.round(lastCursor.left), Math.round(lastCursor.top),
++                Math.round(lastCursor.right), Math.round(lastCursor.bottom)});
++    }
++
++    private void send(int type, int[] fields) {
++        synchronized (lock) {
++            if (out == null)
++                return;
++            try {
++                ByteArrayOutputStream body = new ByteArrayOutputStream();
++                DataOutputStream d = new DataOutputStream(body);
++                d.writeInt(type);
++                for (int f : fields)
++                    d.writeInt(f);
++                DataOutputStream o = new DataOutputStream(out);
++                o.writeInt(body.size());
++                body.writeTo(o);
++                o.flush();
++            } catch (IOException e) {
++                Log.w(TAG, "send failed: " + e);
++                closeSocketLocked();
++            }
++        }
++    }
++
++    private void closeSocket() {
++        synchronized (lock) {
++            closeSocketLocked();
++        }
++    }
++
++    private void closeSocketLocked() {
++        try {
++            if (socket != null)
++                socket.close();
++        } catch (IOException ignored) {
++        }
++        socket = null;
++        out = null;
++    }
++
++    /* Connects to the composer, retrying while it is not there, and applies
++     * what it sends on the main thread. */
++    private void readLoop() {
++        while (!stopped) {
++            LocalSocket s = new LocalSocket();
++            DataInputStream in;
++            try {
++                s.connect(new LocalSocketAddress(SOCKET, LocalSocketAddress.Namespace.ABSTRACT));
++                in = new DataInputStream(s.getInputStream());
++                synchronized (lock) {
++                    socket = s;
++                    out = s.getOutputStream();
++                }
++            } catch (IOException e) {
++                try {
++                    s.close();
++                } catch (IOException ignored) {
++                }
++                try {
++                    Thread.sleep(1000);
++                } catch (InterruptedException ie) {
++                    return;
++                }
++                continue;
++            }
++            Log.i(TAG, "connected to the composer");
++            main.post(() -> {
++                sendFocus();
++                if (haveCursor)
++                    sendCursor();
++            });
++            try {
++                while (true) {
++                    int len = in.readInt();
++                    if (len < 4 || len > 64 * 1024)
++                        throw new IOException("bad message length " + len);
++                    byte[] buf = new byte[len];
++                    in.readFully(buf);
++                    DataInputStream m = new DataInputStream(new java.io.ByteArrayInputStream(buf));
++                    if (m.readInt() != MSG_DONE)
++                        continue;
++                    final int before = m.readInt();
++                    final int after = m.readInt();
++                    final String commit = readString(m);
++                    final String preedit = readString(m);
++                    m.readInt();
++                    m.readInt();
++                    main.post(() -> apply(before, after, commit, preedit));
++                }
++            } catch (IOException e) {
++                Log.i(TAG, "composer connection closed: " + e);
++            }
++            closeSocket();
++        }
++    }
++
++    private static String readString(DataInputStream m) throws IOException {
++        int n = m.readInt();
++        if (n < 0)
++            return null;
++        byte[] b = new byte[n];
++        m.readFully(b);
++        return new String(b, StandardCharsets.UTF_8);
++    }
++
++    /* The order zwp_text_input_v3.done prescribes: drop the preedit, delete
++     * around the cursor, insert the commit, set the new preedit. */
++    private void apply(int before, int after, String commit, String preedit) {
++        InputConnection ic = getCurrentInputConnection();
++        if (ic == null)
++            return;
++        ic.beginBatchEdit();
++        if (before > 0 || after > 0) {
++            if (composing) {
++                ic.setComposingText("", 1);
++                composing = false;
++            }
++            ic.deleteSurroundingText(
++                    chars(ic.getTextBeforeCursor(before, 0), before, true),
++                    chars(ic.getTextAfterCursor(after, 0), after, false));
++        }
++        if (commit != null) {
++            /* Replaces the composing region, if any. */
++            ic.commitText(commit, 1);
++            composing = false;
++        }
++        if (preedit != null && !preedit.isEmpty()) {
++            ic.setComposingText(preedit, 1);
++            composing = true;
++        } else if (composing) {
++            ic.setComposingText("", 1);
++            composing = false;
++        }
++        ic.endBatchEdit();
++    }
++
++    /* The number of UTF-16 units covering `bytes` UTF-8 bytes, counted away
++     * from the cursor. */
++    private static int chars(CharSequence text, int bytes, boolean beforeCursor) {
++        if (text == null || bytes <= 0)
++            return 0;
++        String s = text.toString();
++        int units = 0;
++        int counted = 0;
++        int i = beforeCursor ? s.length() : 0;
++        while (counted < bytes && (beforeCursor ? i > 0 : i < s.length())) {
++            int cp = beforeCursor ? s.codePointBefore(i) : s.codePointAt(i);
++            int n = Character.charCount(cp);
++            i += beforeCursor ? -n : n;
++            units += n;
++            counted += new String(Character.toChars(cp)).getBytes(StandardCharsets.UTF_8).length;
++        }
++        return units;
++    }
++}
+diff --git a/hostime/waydroid-hostime-enable.sh b/hostime/waydroid-hostime-enable.sh
+new file mode 100755
+index 0000000..d7eca84
+--- /dev/null
++++ b/hostime/waydroid-hostime-enable.sh
+@@ -0,0 +1,11 @@
++#!/system/bin/sh
++# Enables the host input method bridge and makes it the default unless the
++# user picked another input method than the stock keyboard. Runs as shell:
++# InputMethodManagerService takes "ime" commands only from shell or root.
++ime=id.waydro.hostime/.HostIme
++cmd input_method ime enable "$ime" > /dev/null
++case "$(settings get secure default_input_method)" in
++    "" | null | com.android.inputmethod.latin/*)
++        cmd input_method ime set "$ime" > /dev/null
++        ;;
++esac
+diff --git a/hostime/waydroid-hostime.rc b/hostime/waydroid-hostime.rc
+new file mode 100644
+index 0000000..dd38cfe
+--- /dev/null
++++ b/hostime/waydroid-hostime.rc
+@@ -0,0 +1,2 @@
++on property:sys.boot_completed=1
++    exec_background - shell shell -- /vendor/bin/waydroid-hostime-enable
+diff --git a/hwcomposer/Android.bp b/hwcomposer/Android.bp
+index d2a97e9..4ba289d 100644
+--- a/hwcomposer/Android.bp
++++ b/hwcomposer/Android.bp
+@@ -62,6 +62,7 @@ cc_library_shared {
+         "prime-copy.cpp",
+         "display-resize.cpp",
+         "task-control.cpp",
++        "ime-bridge.cpp",
+     ],
+     header_libs: [
+         "libsystem_headers",
+diff --git a/hwcomposer/ime-bridge.cpp b/hwcomposer/ime-bridge.cpp
+new file mode 100644
+index 0000000..fd745fa
+--- /dev/null
++++ b/hwcomposer/ime-bridge.cpp
+@@ -0,0 +1,405 @@
++/*
++ * Copyright © 2026 Waydroid Project.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include "ime-bridge.h"
++
++#include <poll.h>
++#include <sys/eventfd.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++#include <algorithm>
++#include <cerrno>
++#include <cmath>
++#include <cstddef>
++#include <cstring>
++#include <mutex>
++#include <vector>
++
++#include <log/log.h>
++#include <wayland-client.h>
++
++#include "text-input-unstable-v3-client-protocol.h"
++#include "wayland-hwc.h"
++
++namespace {
++
++constexpr char kSocketName[] = "waydroid-hostime";
++constexpr char kImePackage[] = "id.waydro.hostime";
++
++constexpr uint32_t kMsgFocus = 1;
++constexpr uint32_t kMsgCursor = 2;
++constexpr uint32_t kMsgDone = 10;
++
++/* Far above any real message; a peer sending more is not the app. */
++constexpr uint32_t kMaxMessage = 64 * 1024;
++
++void put_u32(std::string &out, uint32_t v) {
++    const char b[4] = {char(v >> 24), char(v >> 16), char(v >> 8), char(v)};
++    out.append(b, 4);
++}
++
++void put_string(std::string &out, const std::optional<std::string> &s) {
++    if (!s) {
++        put_u32(out, uint32_t(-1));
++        return;
++    }
++    put_u32(out, s->size());
++    out += *s;
++}
++
++uint32_t get_u32(const uint8_t *p) {
++    return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
++}
++
++void text_input_enter(void *data, struct zwp_text_input_v3 *, struct wl_surface *surface) {
++    static_cast<ime_bridge *>(data)->enter(surface);
++}
++
++void text_input_leave(void *data, struct zwp_text_input_v3 *, struct wl_surface *surface) {
++    static_cast<ime_bridge *>(data)->leave(surface);
++}
++
++void text_input_preedit(void *data, struct zwp_text_input_v3 *, const char *text,
++                        int32_t begin, int32_t end) {
++    static_cast<ime_bridge *>(data)->preedit_string(text, begin, end);
++}
++
++void text_input_commit(void *data, struct zwp_text_input_v3 *, const char *text) {
++    static_cast<ime_bridge *>(data)->commit_string(text);
++}
++
++void text_input_delete(void *data, struct zwp_text_input_v3 *, uint32_t before, uint32_t after) {
++    static_cast<ime_bridge *>(data)->delete_surrounding_text(before, after);
++}
++
++void text_input_done(void *data, struct zwp_text_input_v3 *, uint32_t) {
++    /* A serial behind our commits still carries text to apply; the spec only
++     * asks not to take it as the current state, and we keep none. */
++    static_cast<ime_bridge *>(data)->done();
++}
++
++const struct zwp_text_input_v3_listener text_input_listener = {
++    text_input_enter,
++    text_input_leave,
++    text_input_preedit,
++    text_input_commit,
++    text_input_delete,
++    text_input_done,
++};
++
++}  // namespace
++
++ime_bridge::ime_bridge(struct display *display) : display(display) {
++    listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    wake_fd = eventfd(0, EFD_CLOEXEC);
++    struct sockaddr_un addr = {};
++    addr.sun_family = AF_UNIX;
++    /* Abstract: sun_path[0] stays 0. */
++    memcpy(addr.sun_path + 1, kSocketName, sizeof(kSocketName) - 1);
++    const socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + sizeof(kSocketName) - 1;
++    if (listen_fd < 0 || wake_fd < 0 || bind(listen_fd, (struct sockaddr *)&addr, len) != 0
++            || listen(listen_fd, 2) != 0) {
++        ALOGE("hostime: cannot listen on @%s: %s; host input method disabled", kSocketName,
++              strerror(errno));
++        return;
++    }
++    thread = std::thread(&ime_bridge::serve, this);
++}
++
++ime_bridge::~ime_bridge() {
++    if (thread.joinable()) {
++        uint64_t one = 1;
++        (void)!write(wake_fd, &one, sizeof(one));
++        thread.join();
++    }
++    if (client_fd >= 0)
++        close(client_fd);
++    if (listen_fd >= 0)
++        close(listen_fd);
++    if (wake_fd >= 0)
++        close(wake_fd);
++}
++
++void ime_bridge::attach(struct wl_conn *c, struct zwp_text_input_v3 *ti) {
++    std::scoped_lock lock(display->windowsMutex);
++    conn = c;
++    text_input = ti;
++    entered = nullptr;
++    enabled = false;
++    zwp_text_input_v3_add_listener(text_input, &text_input_listener, this);
++}
++
++void ime_bridge::detach(struct wl_conn *c) {
++    std::scoped_lock lock(display->windowsMutex);
++    if (conn != c)
++        return;
++    if (text_input)
++        zwp_text_input_v3_destroy(text_input);
++    text_input = nullptr;
++    conn = nullptr;
++    entered = nullptr;
++    enabled = false;
++}
++
++void ime_bridge::enter(struct wl_surface *surface) {
++    std::scoped_lock lock(display->windowsMutex);
++    entered = surface;
++    /* Text input starts disabled on every enter. */
++    enabled = false;
++    update();
++}
++
++void ime_bridge::leave(struct wl_surface *surface) {
++    std::scoped_lock lock(display->windowsMutex);
++    if (entered != surface)
++        return;
++    entered = nullptr;
++    enabled = false;
++}
++
++void ime_bridge::preedit_string(const char *text, int32_t begin, int32_t end) {
++    std::scoped_lock lock(display->windowsMutex);
++    pending_preedit = text ? text : "";
++    pending_preedit_begin = begin;
++    pending_preedit_end = end;
++}
++
++void ime_bridge::commit_string(const char *text) {
++    std::scoped_lock lock(display->windowsMutex);
++    pending_commit = text ? text : "";
++}
++
++void ime_bridge::delete_surrounding_text(uint32_t before, uint32_t after) {
++    std::scoped_lock lock(display->windowsMutex);
++    pending_delete_before = before;
++    pending_delete_after = after;
++}
++
++void ime_bridge::done() {
++    std::scoped_lock lock(display->windowsMutex);
++    std::string msg;
++    put_u32(msg, kMsgDone);
++    put_u32(msg, pending_delete_before);
++    put_u32(msg, pending_delete_after);
++    put_string(msg, pending_commit);
++    /* No preedit_string before done means the preedit is now empty. */
++    put_string(msg, pending_preedit ? pending_preedit : std::optional<std::string>(""));
++    put_u32(msg, pending_preedit ? pending_preedit_begin : 0);
++    put_u32(msg, pending_preedit ? pending_preedit_end : 0);
++    send(msg);
++    pending_preedit.reset();
++    pending_commit.reset();
++    pending_delete_before = pending_delete_after = 0;
++}
++
++/* Brings the text-input object in line with what the two sides say: enabled
++ * while a surface of ours has the keyboard and an Android editor has focus. */
++void ime_bridge::update() {
++    if (!text_input || !conn)
++        return;
++    const bool want = entered && editor_active;
++    if (!want) {
++        if (enabled) {
++            zwp_text_input_v3_disable(text_input);
++            zwp_text_input_v3_commit(text_input);
++            enabled = false;
++            wl_display_flush(conn->display);
++        }
++        return;
++    }
++    bool changed = false;
++    if (!enabled) {
++        zwp_text_input_v3_enable(text_input);
++        zwp_text_input_v3_set_content_type(text_input, content_hint, content_purpose);
++        enabled = true;
++        cursor_sent = false;
++        changed = true;
++    }
++    if (cursor && !cursor_sent) {
++        /* Android display pixels to the entered surface's local space. */
++        const struct layerFrame origin = surface_display_origin(conn, entered);
++        const double scale = display->scale > 0 ? display->scale : 1.0;
++        const int32_t x = floor((cursor->left - origin.x) / scale);
++        const int32_t y = floor((cursor->top - origin.y) / scale);
++        const int32_t w = std::max(1, (int32_t)ceil((cursor->right - cursor->left) / scale));
++        const int32_t h = std::max(1, (int32_t)ceil((cursor->bottom - cursor->top) / scale));
++        zwp_text_input_v3_set_cursor_rectangle(text_input, x, y, w, h);
++        cursor_sent = true;
++        changed = true;
++    }
++    if (changed) {
++        zwp_text_input_v3_commit(text_input);
++        wl_display_flush(conn->display);
++    }
++}
++
++void ime_bridge::send(const std::string &payload) {
++    if (client_fd < 0)
++        return;
++    std::string frame;
++    put_u32(frame, payload.size());
++    frame += payload;
++    size_t off = 0;
++    while (off < frame.size()) {
++        ssize_t n = ::send(client_fd, frame.data() + off, frame.size() - off, MSG_NOSIGNAL);
++        if (n < 0 && errno == EINTR)
++            continue;
++        if (n <= 0) {
++            ALOGW("hostime: write to the app failed: %s", strerror(errno));
++            return;
++        }
++        off += n;
++    }
++}
++
++void ime_bridge::drop_client() {
++    if (client_fd >= 0)
++        close(client_fd);
++    client_fd = -1;
++    editor_active = false;
++    cursor.reset();
++    update();
++}
++
++/* Only the app's uid may take the socket: whatever is typed goes to it. */
++bool ime_bridge::accept_client(int fd) {
++    struct ucred cred = {};
++    socklen_t len = sizeof(cred);
++    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0)
++        return false;
++    if (ime_uid < 0 || (int)cred.uid != ime_uid) {
++        /* Not cached yet, or the app was reinstalled under a new uid. */
++        ime_uid = display->task_ctl->package_uid(kImePackage);
++    }
++    if (ime_uid < 0 || (int)cred.uid != ime_uid) {
++        ALOGW("hostime: refusing pid %d uid %u (%s runs as %d)", cred.pid, cred.uid,
++              kImePackage, ime_uid);
++        return false;
++    }
++    ALOGI("hostime: %s connected (pid %d)", kImePackage, cred.pid);
++    return true;
++}
++
++void ime_bridge::handle_message(uint32_t type, const uint8_t *data, size_t size) {
++    if (type == kMsgFocus && size >= 12) {
++        editor_active = get_u32(data) != 0;
++        const uint32_t hint = get_u32(data + 4);
++        const uint32_t purpose = get_u32(data + 8);
++        /* A new editor type needs a fresh enable to reach the input method. */
++        if (enabled && (hint != content_hint || purpose != content_purpose) && text_input) {
++            zwp_text_input_v3_disable(text_input);
++            zwp_text_input_v3_commit(text_input);
++            enabled = false;
++        }
++        content_hint = hint;
++        content_purpose = purpose;
++        if (!editor_active)
++            cursor.reset();
++        update();
++    } else if (type == kMsgCursor && size >= 16) {
++        const hwc_rect_t r = {(int32_t)get_u32(data), (int32_t)get_u32(data + 4),
++                              (int32_t)get_u32(data + 8), (int32_t)get_u32(data + 12)};
++        if (!cursor || memcmp(&*cursor, &r, sizeof(r)) != 0) {
++            cursor = r;
++            cursor_sent = false;
++            update();
++        }
++    }
++}
++
++void ime_bridge::serve() {
++    std::vector<uint8_t> buf;
++    while (true) {
++        int fd;
++        {
++            std::scoped_lock lock(display->windowsMutex);
++            fd = client_fd;
++        }
++        struct pollfd fds[3] = {
++            {wake_fd, POLLIN, 0},
++            {listen_fd, POLLIN, 0},
++            {fd, POLLIN, 0},
++        };
++        if (poll(fds, fd >= 0 ? 3 : 2, -1) < 0) {
++            if (errno == EINTR)
++                continue;
++            ALOGE("hostime: poll failed: %s", strerror(errno));
++            return;
++        }
++        if (fds[0].revents)
++            return;
++
++        if (fds[1].revents & POLLIN) {
++            int c = accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
++            /* package_uid forks a shell command: no lock across it. */
++            if (c >= 0 && !accept_client(c)) {
++                close(c);
++                c = -1;
++            }
++            if (c >= 0) {
++                std::scoped_lock lock(display->windowsMutex);
++                /* The app restarted: its new connection replaces the old one. */
++                drop_client();
++                client_fd = c;
++                buf.clear();
++            }
++            continue;
++        }
++
++        if (fd >= 0 && fds[2].revents) {
++            uint8_t chunk[4096];
++            ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
++            if (n < 0 && errno == EINTR)
++                continue;
++            std::scoped_lock lock(display->windowsMutex);
++            if (fd != client_fd)
++                continue;
++            if (n <= 0) {
++                ALOGI("hostime: the app disconnected");
++                drop_client();
++                continue;
++            }
++            buf.insert(buf.end(), chunk, chunk + n);
++            size_t off = 0;
++            while (buf.size() - off >= 4) {
++                const uint32_t len = get_u32(buf.data() + off);
++                if (len < 4 || len > kMaxMessage) {
++                    ALOGW("hostime: malformed message (length %u), dropping the app", len);
++                    drop_client();
++                    buf.clear();
++                    off = 0;
++                    break;
++                }
++                if (buf.size() - off - 4 < len)
++                    break;
++                const uint8_t *msg = buf.data() + off + 4;
++                handle_message(get_u32(msg), msg + 4, len - 4);
++                off += 4 + len;
++            }
++            buf.erase(buf.begin(), buf.begin() + off);
++        }
++    }
++}
+diff --git a/hwcomposer/ime-bridge.h b/hwcomposer/ime-bridge.h
+new file mode 100644
+index 0000000..f93a7bc
+--- /dev/null
++++ b/hwcomposer/ime-bridge.h
+@@ -0,0 +1,118 @@
++/*
++ * Copyright © 2026 Waydroid Project.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <thread>
++
++#include <hardware/hwcomposer.h>
++
++struct display;
++struct wl_conn;
++struct wl_surface;
++struct zwp_text_input_v3;
++
++/* The host input method (fcitx5, ibus, whatever the compositor runs) typing
++ * into Android.
++ *
++ * The composer is a Wayland client, so it holds a zwp_text_input_v3 on the
++ * control connection: the compositor routes keys through the host input method
++ * while text input is enabled and hands back preedit and commit strings, and
++ * keys the input method does not take still arrive on wl_keyboard as before.
++ * Android's side is the vendor input method app (id.waydro.hostime), which
++ * has no input view of its own: it puts the strings into the focused editor
++ * and reports where that editor's cursor is, so the host draws its candidate
++ * window next to it.
++ *
++ * The app connects to the abstract unix socket "waydroid-hostime"; only the
++ * uid the package runs as is accepted, since the socket carries everything
++ * typed. Messages are a big-endian uint32 length followed by that many bytes:
++ * a uint32 type, then the fields, int32 big-endian, strings as an int32 byte
++ * length (-1 for none) and UTF-8.
++ *
++ *   app -> composer
++ *     1 FOCUS   active, content hint, content purpose (zwp_text_input_v3 values)
++ *     2 CURSOR  left, top, right, bottom of the cursor, Android display pixels
++ *   composer -> app
++ *     10 DONE   delete before, delete after (UTF-8 bytes), commit string,
++ *               preedit string, preedit cursor begin, end (bytes; -1 hidden)
++ *
++ * All state is guarded by display->windowsMutex, which the reconnect path
++ * already holds when it detaches a connection. */
++class ime_bridge {
++  public:
++    explicit ime_bridge(struct display *display);
++    ~ime_bridge();
++
++    /* The control connection bound a text-input object, or is going away. */
++    void attach(struct wl_conn *conn, struct zwp_text_input_v3 *text_input);
++    void detach(struct wl_conn *conn);
++
++    /* zwp_text_input_v3 events, on the control connection's wayland thread. */
++    void enter(struct wl_surface *surface);
++    void leave(struct wl_surface *surface);
++    void preedit_string(const char *text, int32_t cursor_begin, int32_t cursor_end);
++    void commit_string(const char *text);
++    void delete_surrounding_text(uint32_t before, uint32_t after);
++    void done();
++
++  private:
++    void serve();
++    bool accept_client(int fd);
++    void handle_message(uint32_t type, const uint8_t *data, size_t size);
++    void drop_client();
++    void update();
++    void send(const std::string &payload);
++
++    struct display *display;
++    int listen_fd = -1;
++    int wake_fd = -1;
++    std::thread thread;
++
++    int client_fd = -1;
++    int ime_uid = -1;
++
++    struct wl_conn *conn = nullptr;
++    struct zwp_text_input_v3 *text_input = nullptr;
++    struct wl_surface *entered = nullptr;
++    bool enabled = false;
++
++    bool editor_active = false;
++    uint32_t content_hint = 0;
++    uint32_t content_purpose = 0;
++    std::optional<hwc_rect_t> cursor;
++    bool cursor_sent = false;
++
++    /* Events since the last done. */
++    std::optional<std::string> pending_preedit;
++    int32_t pending_preedit_begin = 0;
++    int32_t pending_preedit_end = 0;
++    std::optional<std::string> pending_commit;
++    uint32_t pending_delete_before = 0;
++    uint32_t pending_delete_after = 0;
++};
+diff --git a/hwcomposer/task-control.cpp b/hwcomposer/task-control.cpp
+index 66904a1..44920ba 100644
+--- a/hwcomposer/task-control.cpp
++++ b/hwcomposer/task-control.cpp
+@@ -177,6 +177,26 @@ void task_control::move_to_desk(uint32_t task_id) {
+     cond.notify_one();
+ }
+ 
++int task_control::package_uid(const std::string &package) {
++    /* "package:<name> uid:<uid>" for every installed package whose name
++     * contains the filter; pick the exact one. */
++    std::string out;
++    if (!run_tool("cmd", {"package", "list", "packages", "-U", package}, &out, /*quiet=*/true))
++        return -1;
++    const std::string want = "package:" + package + " uid:";
++    size_t pos = 0;
++    while (pos < out.size()) {
++        size_t end = out.find('\n', pos);
++        if (end == std::string::npos)
++            end = out.size();
++        const std::string line = out.substr(pos, end - pos);
++        if (line.rfind(want, 0) == 0)
++            return atoi(line.c_str() + want.size());
++        pos = end + 1;
++    }
++    return -1;
++}
++
+ /* WMShell's desktop-mode shell command (DesktopModeShellCommandHandler). */
+ static bool desktopmode(std::vector<std::string> args) {
+     args.insert(args.begin(), {"activity", "service", "SystemUIService", "WMShell", "desktopmode"});
+diff --git a/hwcomposer/task-control.h b/hwcomposer/task-control.h
+index 6ccf355..8178e86 100644
+--- a/hwcomposer/task-control.h
++++ b/hwcomposer/task-control.h
+@@ -72,6 +72,10 @@ class task_control {
+      * which also activates the desk for the launches after it. */
+     void move_to_desk(uint32_t task_id);
+ 
++    /* The uid the package runs as, or -1 when it is not installed or the
++     * package manager is not up. Synchronous. */
++    int package_uid(const std::string &package);
++
+   private:
+     void worker();
+     int desk_id();
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index 80a1149..f963207 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -84,6 +84,7 @@
+ #include "relative-pointer-unstable-v1-client-protocol.h"
+ #include "idle-inhibit-unstable-v1-client-protocol.h"
+ #include "fractional-scale-v1-client-protocol.h"
++#include "text-input-unstable-v3-client-protocol.h"
+ #include "xdg-activation-v1-client-protocol.h"
+ /* Primary reconnect callbacks live on the resize worker, outside this file. */
+ #pragma GCC poison hotplug
+@@ -709,6 +710,11 @@ layer_offset(struct wl_conn *conn, struct wl_surface *surface)
+     return it == conn->layers.end() ? layerFrame{0, 0} : it->second;
+ }
+ 
++/* For ime_bridge, which keeps cursor positions in Android display pixels. */
++struct layerFrame surface_display_origin(struct wl_conn *conn, struct wl_surface *surface)
++{
++    return layer_offset(conn, surface);
++}
+ /* Input lands on whichever surface the compositor picked: a toplevel or one of
+  * its layer subsurfaces. Both carry their window as user data, but a freed
+  * proxy's memory can be handed back out by another connection's next
+@@ -3982,6 +3988,11 @@ registry_handle_global(void *data, struct wl_registry *registry,
+             conn->data_device = wl_data_device_manager_get_data_device(conn->data_device_manager, conn->seat);
+             clipboard_watch_conn(conn);
+         }
++    } else if (strcmp(interface, zwp_text_input_manager_v3_interface.name) == 0) {
++        /* The control connection carries every window that takes keys. */
++        if (conn->is_ctl)
++            conn->text_input_manager = (struct zwp_text_input_manager_v3 *)wl_registry_bind(
++                    registry, id, &zwp_text_input_manager_v3_interface, 1);
+     } else if (strcmp(interface, "gtk_shell1") == 0) {
+         if (version < 6)
+             conn->supports_cursor_viewport = false;
+@@ -4250,12 +4261,25 @@ static void reset_wayland_globals(struct wl_conn *conn) {
+     conn->activation = nullptr;
+     conn->fractional_scale_manager = nullptr;
+     conn->data_device_manager = nullptr;
++    conn->text_input_manager = nullptr;
++    conn->text_input = nullptr;
+     conn->data_device = nullptr;
+ }
+ 
+-/* Tear down everything that belongs to the connection and reconnect,
+- * rebinding globals. The caller has already dropped the display-side state
+- * that references this connection's proxies. */
++/* Gives the control connection's text-input object to the bridge. Needs the
++ * seat and the manager, both bound by the registry roundtrip before this. */
++static void ime_attach(struct wl_conn *conn) {
++    if (!conn->is_ctl || !conn->dpy->ime)
++        return;
++    if (!conn->text_input_manager || !conn->seat) {
++        ALOGW("hostime: the compositor has no zwp_text_input_manager_v3; host input method off");
++        return;
++    }
++    conn->text_input = zwp_text_input_manager_v3_get_text_input(conn->text_input_manager, conn->seat);
++    conn->dpy->ime->attach(conn, conn->text_input);
++    wl_display_flush(conn->display);
++}
++
+ /* If the previous reconnect was moments ago, the new connection died right
+  * away (e.g. a protocol error every frame). Back off so a reconnect loop
+  * cannot saturate a core and drown the host compositor in connection churn.
+@@ -4271,6 +4295,9 @@ static void wl_conn_reconnect_backoff(struct wl_conn *conn) {
+     conn->last_reconnect = now;
+ }
+ 
++/* Tear down everything that belongs to the connection and reconnect,
++ * rebinding globals. The caller has already dropped the display-side state
++ * that references this connection's proxies. */
+ static void wl_conn_reconnect(struct wl_conn *conn) {
+     conn->layers.clear();
+     conn->touch_surfaces.clear();
+@@ -4297,6 +4324,9 @@ static void wl_conn_reconnect(struct wl_conn *conn) {
+     conn->present_path = (int)present_path::unknown;
+     conn->presentation_clk_id = UINT32_MAX;
+ 
++    if (conn->text_input && conn->dpy->ime)
++        conn->dpy->ime->detach(conn);
++    conn->text_input = nullptr;
+     if (conn->registry)
+         wl_registry_destroy(conn->registry);
+     conn->proxies_valid = false;
+@@ -4318,6 +4348,7 @@ static void wl_conn_reconnect(struct wl_conn *conn) {
+     conn->registry = wl_display_get_registry(conn->display);
+     wl_registry_add_listener(conn->registry, &registry_listener, conn);
+     wl_display_roundtrip(conn->display);
++    ime_attach(conn);
+     ALOGI("wl_conn_reconnect: rebound wayland globals on new connection");
+ }
+ 
+@@ -4703,6 +4734,8 @@ create_display(const char *gralloc)
+ 
+     display->task = IWaydroidTask::getService();
+     display->task_ctl = std::make_unique<task_control>();
++    display->ime = std::make_unique<ime_bridge>(display);
++    ime_attach(display->ctl.get());
+     display->deactivate_thread = std::thread(deactivate_worker, display);
+     display_resize_start(display);
+     display->conn_worker_thread = std::thread(conn_worker, display);
+@@ -4742,6 +4775,12 @@ destroy_display(struct display *display)
+      * frees a wl_buffer, so both must go while ctl is still connected. */
+     display->windows.clear();
+     display->task_streams.clear();
++    /* Destroys the text-input object, which lives on ctl, and stops the
++     * socket thread before the display it locks goes away. */
++    display->ime->detach(display->ctl.get());
++    display->ime.reset();
++    if (display->ctl->text_input_manager)
++        zwp_text_input_manager_v3_destroy(display->ctl->text_input_manager);
+ 
+     wl_conn_destroy(display->ctl.get());
+ 
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index 508dbba..6afd4de 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -52,6 +52,7 @@
+ #include <hardware/hwcomposer.h>
+ #include <cutils/properties.h>
+ #include <vendor/waydroid/task/1.0/IWaydroidTask.h>
++#include "ime-bridge.h"
+ #include "task-control.h"
+ #include <wayland-util.h>
+ #include <wayland-client.h>
+@@ -254,6 +255,9 @@ struct wl_conn {
+     struct wp_fractional_scale_manager_v1 *fractional_scale_manager;
+     struct wl_data_device_manager *data_device_manager;
+     struct wl_data_device *data_device;
++    /* Control connection only; the object belongs to display->ime. */
++    struct zwp_text_input_manager_v3 *text_input_manager = nullptr;
++    struct zwp_text_input_v3 *text_input = nullptr;
+ 
+     std::mutex formats_mutex;
+     /* Host format/modifier advertisement of this connection. */
+@@ -511,6 +515,9 @@ void force_screen_wakeup(struct display *display);
+  * A task that has no card yet is remembered and raised when one is created.
+  * Caller must hold windowsMutex. */
+ void request_window_activation(struct window *window);
++/* Where a surface of the connection sits in the Android display (its card's
++ * content origin; {0,0} for a window showing the whole display). */
++struct layerFrame surface_display_origin(struct wl_conn *conn, struct wl_surface *surface);
+ void note_pending_raise(struct display *display, const std::string &taskID);
+ void take_pending_raise(struct display *display, struct window *window);
+ 
+@@ -856,6 +863,8 @@ struct display {
+      * task_control for why task operations do not go through it). */
+     sp<IWaydroidTask> task;
+     std::unique_ptr<task_control> task_ctl;
++    /* Host input method into Android; see ime-bridge.h. */
++    std::unique_ptr<ime_bridge> ime;
+ 
+     const hwc_procs_t *procs;
+ 
+-- 
+2.56.0
+

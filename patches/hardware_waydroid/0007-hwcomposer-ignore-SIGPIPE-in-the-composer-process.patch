@@ -1,0 +1,69 @@
+From 7f184687edcf83e4bd6643c86e3bb6a054c87522 Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Mon, 12 Oct 2026 00:58:00 +0300
+Subject: [PATCH 07/24] hwcomposer: ignore SIGPIPE in the composer process
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+What: signal(SIGPIPE, SIG_IGN) at the start of hwc_open().
+
+Why: SIGPIPE's default action terminates the composer with no tombstone and
+no log line from us (init only reports "received signal 13"), and
+SurfaceFlinger and zygote restart behind it. The writers that can raise it
+here are the input FIFOs /dev/input/wl_*_events (reader: system_server's
+EventHub, which closes them whenever it restarts) and the clipboard transfer
+pipe in data_source_handle_send() (reader: a host application that may close
+it early). With SIGPIPE ignored those writes return EPIPE; the input writers
+already log a failed write and work again once a new reader opens the FIFO.
+
+Source: QuinOvaX, quinovax/waydroid-nvidia dev 1608854 / 74f7b93
+  https://github.com/quinovax/waydroid-nvidia/commit/16088545af9a95423c8762baeb4b80f4a5dadc2a
+  https://github.com/quinovax/waydroid-nvidia/commit/74f7b9308fa1d1e4e81fb52570735ed562ee3fc1
+Licence: Apache-2.0 (android_hardware_waydroid; the fork's patches/hwcomposer/
+inherit it).
+
+Deviation from the source: same one-line fix; the rationale differs. The
+source attributes the SIGPIPE to wl_display_flush()/roundtrip writes to the
+compositor socket, but libwayland sends with MSG_NOSIGNAL (wayland 1.25.0
+src/connection.c:494-495), so that socket cannot raise it; the FIFO and pipe
+writers above can.
+
+保留 ATV 的启动时窗口属性清理，并在同一初始化路径忽略 SIGPIPE。
+
+(cherry picked from commit 4d2f3674579beee2864c0995735a1a1409a4634b)
+---
+ hwcomposer/hwcomposer.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index 28b3f3c..951801e 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -20,6 +20,7 @@
+ #include <errno.h>
+ #include <pthread.h>
+ #include <semaphore.h>
++#include <signal.h>
+ #include <stdlib.h>
+ #include <sys/time.h>
+ #include <sys/resource.h>
+@@ -1192,6 +1193,15 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
+     }
+ 
+     open_windows::clear_stale_props();
++    /* A write to a pipe or FIFO without a reader must fail with EPIPE, not kill the composer
++     * with SIGPIPE (default action: terminate, no tombstone, no log line from us). The writers
++     * here are the input FIFOs (/dev/input/wl_*_events, read by system_server's EventHub, which
++     * closes them when it restarts) and the clipboard transfer pipe (WaydroidClipboard.cpp,
++     * read by a host application that may close it early). The input writers log a failed
++     * write and succeed again once a new reader opens the FIFO; a failed clipboard write is a
++     * paste the host application abandoned. libwayland itself sends with
++     * MSG_NOSIGNAL, so the compositor socket never raised SIGPIPE. */
++    signal(SIGPIPE, SIG_IGN);
+ 
+     waydroid_hwc_composer_device_1 *pdev = new waydroid_hwc_composer_device_1();
+     if (!pdev) {
+-- 
+2.56.0
+

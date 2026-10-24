@@ -1,0 +1,13 @@
+[Unit]
+Description=Load the KernelSU kernel module (kernelsu-dkms)
+Before=waydroid-container.service
+ConditionPathExists=/usr/bin/load-kernelsu
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecCondition=/bin/sh -c '! grep -qw "^kernelsu" /proc/modules'
+ExecStart=/usr/bin/load-kernelsu
+
+[Install]
+WantedBy=multi-user.target

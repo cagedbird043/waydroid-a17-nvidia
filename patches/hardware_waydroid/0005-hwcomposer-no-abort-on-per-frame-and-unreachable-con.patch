@@ -1,0 +1,203 @@
+From 58ab7c1eabd66a87fef3dd71517c7e2e48dc9222 Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Mon, 12 Oct 2026 00:56:58 +0300
+Subject: [PATCH 05/24] hwcomposer: no abort() on per-frame and unreachable
+ conditions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+What: the composer no longer abort()s when
+- the layer list changed between prepare and set (skipped_layers_helper::
+  setup_set): it looks the client target up again in the set's list, and the
+  compositing mode drops the frame with an error if there is none (instead of
+  assert(fbt));
+- the compositor sends zwp_linux_buffer_params 'failed' (create_failed): the
+  rejected buffer is not shown, rate-limited error log;
+- it meets an unknown hwc_transform (drawn untransformed), an unknown
+  LayerSplitType (empty key) or an unknown gralloc type (generic path), all
+  unreachable today, each logged at error level;
+- the compositor has neither xdg_wm_base nor wl_shell: create_display() now
+  refuses such a compositor with a named error, so hwc_open() fails with
+  -ENODEV at start, and window::create() can no longer reach that branch.
+
+Why: this process is the HIDL composer (vendor.hwcomposer-2-1). Its death
+restarts SurfaceFlinger and, through SurfaceFlinger's onrestart, zygote: a
+framework soft reboot for a one-frame condition. The source reports 90
+"The system died" in three minutes from these aborts on a Venus guest.
+
+Source: QuinOvaX, quinovax/waydroid-nvidia dev ad04e0a
+  https://github.com/quinovax/waydroid-nvidia/commit/ad04e0a5c49e3bb48382fa535a6952aaff67b8a6
+Licence: Apache-2.0 (android_hardware_waydroid; the fork's patches/hwcomposer/
+inherit it).
+
+Deviations from the source:
+- setup_set: the source clamped the client target to layer 0 (draws the wrong
+  layer as the client target); here the real client target is found, and the
+  missing-target case is handled where it is used.
+- No shell: the source returned nullptr from window::create() into callers
+  that do not check it; here the compositor is refused at connection time.
+- The Wayland-connection-lost abort() is handled separately (next patch), not
+  by leaving a frozen HAL.
+
+保留 ATV 断线后的连接级重连，不以退出替代；将缺少 xdg_wm_base/wl_shell 的启动失败检测移入 wl_conn_open，其余帧错误改为返回失败。
+
+(cherry picked from commit 9980e08f90baea77759ee8c196bdd358e29059af)
+---
+ hwcomposer/gralloc_handler.cpp        | 15 ++++++++++----
+ hwcomposer/modes/waydroid_mode.cpp    | 28 +++++++++++++++++++++------
+ hwcomposer/modes/waydroid_mode_impl.h | 10 +++++++++-
+ hwcomposer/wayland-hwc.cpp            | 15 +++++++++++---
+ 4 files changed, 54 insertions(+), 14 deletions(-)
+
+diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
+index 8743dd1..db42b22 100644
+--- a/hwcomposer/gralloc_handler.cpp
++++ b/hwcomposer/gralloc_handler.cpp
+@@ -109,11 +109,15 @@ std::unique_ptr<buffer> create_shm_wl_buffer(wl_conn *conn, const buffer_metadat
+ }
+ 
+ namespace {
+-    //TODO: Implement failure handling for dmabuf
++    /* The 'failed' event is the compositor's non-fatal way of rejecting an import (the other
++     * is an invalid_wl_buffer protocol error, which ends the connection and is handled by
++     * hwc_wayland_thread()). The buffer will not show; the connection and the HAL go on. */
+     void create_failed(void *data __unused, zwp_linux_buffer_params_v1 *params __unused)
+     {
+-        ALOGE("%s: zwp_linux_buffer_params.create_immed failed.", __func__);
+-        abort();
++        static int failures = 0;
++        if ((failures++ % 100) == 0)
++            ALOGE("%s: the compositor rejected a dma-buf import (zwp_linux_buffer_params "
++                  "'failed', %d so far); that buffer is not shown", __func__, failures);
+     }
+ 
+     const struct zwp_linux_buffer_params_v1_listener params_listener = {
+@@ -510,7 +514,10 @@ gralloc_handler::get_buffer_metadata_func gralloc_handler::select_get_buffer_met
+         case GrallocType::GRALLOC_DEFAULT:
+             return get_buffer_metadata_generic;
+         default:
+-            abort();
++            /* unreachable: every GrallocType is handled above */
++            ALOGE("unknown gralloc type %d; using the generic (wl_shm) buffer path",
++                  (int)gralloc_type);
++            return get_buffer_metadata_generic;
+     }
+ }
+ 
+diff --git a/hwcomposer/modes/waydroid_mode.cpp b/hwcomposer/modes/waydroid_mode.cpp
+index 7152caf..cf15ec7 100644
+--- a/hwcomposer/modes/waydroid_mode.cpp
++++ b/hwcomposer/modes/waydroid_mode.cpp
+@@ -66,11 +66,25 @@ void skipped_layers_helper::setup_for_each_layer(size_t i, const hwc_layer_1 &la
+ }
+ 
+ void skipped_layers_helper::setup_set(hwc_layer_1* layers, size_t size) {
+-    if (m_framebuffer_target_index >= size) {
+-        ALOGE("layers changed between prepare and set");
+-        abort();
++    if (m_framebuffer_target_index < size
++        && layers[m_framebuffer_target_index].compositionType == HWC_FRAMEBUFFER_TARGET) {
++        m_framebuffer_target = &layers[m_framebuffer_target_index];
++        return;
++    }
++    /* The layer list changed between prepare and set. Find the client target in the list we
++     * were actually given instead of abort()ing: this process is the composer, and its death
++     * restarts SurfaceFlinger and zygote (vendor.hwcomposer-2-1 onrestart). */
++    ALOGE("layers changed between prepare and set (client target index %zu, %zu layers); "
++          "looking it up again", m_framebuffer_target_index, size);
++    m_framebuffer_target_index = UNSET_VALUE;
++    m_framebuffer_target = nullptr;
++    for (size_t i = 0; i < size; i++) {
++        if (layers[i].compositionType == HWC_FRAMEBUFFER_TARGET) {
++            m_framebuffer_target_index = i;
++            m_framebuffer_target = &layers[i];
++            break;
++        }
+     }
+-    m_framebuffer_target = &layers[m_framebuffer_target_index];
+ }
+ 
+ size_t skipped_layers_helper::first_skipped() const {
+@@ -139,13 +153,15 @@ void split_layer_names_helper::setup(waydroid_hwc_composer_device_1 *pdev, const
+ }
+ 
+ const std::string& layer_info::key() const {
++    static const std::string no_key;
+     if (type == LayerSplitType::TID) {
+         return tid;
+     } else if (type == LayerSplitType::RawName) {
+         return aid;
+-    } else {
+-        abort();
+     }
++    /* unreachable with the two LayerSplitType values; an empty key matches no layer */
++    ALOGE("layer_info::key(): unknown split type %d", (int)type);
++    return no_key;
+ }
+ 
+ layer_info &split_layer_names_helper::operator[](size_t i) {
+diff --git a/hwcomposer/modes/waydroid_mode_impl.h b/hwcomposer/modes/waydroid_mode_impl.h
+index 590d26c..f8d76c5 100644
+--- a/hwcomposer/modes/waydroid_mode_impl.h
++++ b/hwcomposer/modes/waydroid_mode_impl.h
+@@ -94,7 +94,15 @@ class compositing_window_mode : public virtual waydroid_mode {
+             if (!m_fbt_drawn && (in_run || i > skipped_layers.last_skipped())) {
+                 m_fbt_drawn = true;
+                 hwc_layer_1 *fbt = skipped_layers.framebuffer_target_layer();
+-                assert(fbt);
++                if (!fbt) {
++                    /* skipped layers but no client target in this set (see setup_set) */
++                    ALOGE("client-composed layers but no client target layer; frame dropped");
++                    if (!is_fbt && hwc_layer->acquireFenceFd != -1) {
++                        close(hwc_layer->acquireFenceFd);
++                        hwc_layer->acquireFenceFd = -1;
++                    }
++                    return -1;
++                }
+                 window *window = derived()->get_window(pdev);
+                 int res = apply_hwc_layer_to_window(pdev, fbt, skipped_layers.framebuffer_target_index(), window);
+                 if (in_run || is_fbt) {
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index 3ef68ae..0b3a3b9 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -862,8 +862,9 @@ BufferTransform hwc_transform_to_buffer_transform(uint32_t hwc_transform) {
+         case HWC_TRANSFORM_FLIP_V_ROT_90:
+             return BufferTransform::Flip_Rot_90;
+         default:
+-            ALOGE("Invalid hwc_transform: %" PRIu32, hwc_transform);
+-            abort();
++            /* unreachable for HWC1 transforms; draw untransformed rather than kill the composer */
++            ALOGE("Invalid hwc_transform: %" PRIu32 "; drawing the layer untransformed", hwc_transform);
++            return BufferTransform::Normal;
+     }
+ }
+ 
+@@ -1115,7 +1116,9 @@ window::create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, st
+         wl_shell_surface_add_listener(window->shell_surface, &shell_surface_listener, window.get());
+         wl_shell_surface_set_toplevel(window->shell_surface);
+     } else {
+-        abort();
++        /* unreachable: create_display() refuses a compositor without xdg_wm_base and wl_shell */
++        ALOGE("window::create: the compositor offers neither xdg_wm_base nor wl_shell");
++        return nullptr;
+     }
+ 
+     // Set title
+@@ -3858,6 +3861,12 @@ static bool wl_conn_open(struct wl_conn *conn) {
+     conn->registry = wl_display_get_registry(conn->display);
+     wl_registry_add_listener(conn->registry, &registry_listener, conn);
+     wl_display_roundtrip(conn->display);
++    if (!conn->wm_base && !conn->shell) {
++        ALOGE("Wayland compositor offers neither xdg_wm_base nor wl_shell");
++        wl_display_disconnect(conn->display);
++        sem_destroy(&conn->reconnect_resume);
++        return false;
++    }
+ 
+     if (conn->dpy->gtype == GrallocType::GRALLOC_ANDROID && !conn->android_wlegl)
+         ALOGE("GRALLOC_ANDROID requested, but the Wayland compositor did not advertise android_wlegl");
+-- 
+2.56.0
+

@@ -1,0 +1,9 @@
+FROM localhost/waydroid-a17-build:latest
+USER root
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-21-jdk-headless curl unzip zip libclang-dev pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 ANDROID_HOME=/opt/android-sdk ANDROID_NDK_HOME=/opt/android-sdk/ndk/29.0.14206865
+ENV PATH=/root/.cargo/bin:/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/build-tools/37.0.0:$PATH
+RUN mkdir -p /opt/android-sdk/cmdline-tools && curl -fL https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip -o /tmp/sdk.zip && unzip -q /tmp/sdk.zip -d /opt/android-sdk/cmdline-tools && mv /opt/android-sdk/cmdline-tools/cmdline-tools /opt/android-sdk/cmdline-tools/latest && rm /tmp/sdk.zip
+RUN yes | sdkmanager --licenses >/dev/null; sdkmanager 'platforms;android-37.0' 'build-tools;37.0.0' 'ndk;29.0.14206865' 'cmake;3.22.1'
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && rustup target add x86_64-linux-android
+WORKDIR /work/KernelSU

@@ -1,0 +1,76 @@
+From e63b1fbf6a5253ccf066cb86288cdaae910b9e39 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 09:30:09 +0800
+Subject: [PATCH 6/9] =?utf-8?q?install.sh=EF=BC=9A--native=20=E5=AE=89?=
+ =?utf-8?q?=E8=A3=85=E6=9C=AC=E5=9C=B0=20native=20bundle=20=E7=9B=AE?=
+ =?utf-8?q?=E5=BD=95=EF=BC=88=E7=94=B1=20install-native.sh=20=E6=8C=89?=
+ =?utf-8?q?=E5=85=B6=20BUILD-RECORD=20=E6=A0=A1=E9=AA=8C=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ packaging/install.sh | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/packaging/install.sh b/packaging/install.sh
+index 88ca7b4..bcac2bd 100755
+--- a/packaging/install.sh
++++ b/packaging/install.sh
+@@ -14,6 +14,8 @@
+ #   --source DIR  archive HEAD of a local checkout instead of downloading tag sources; the native bundle's
+ #                 release commit must be an ancestor. Uncommitted changes are not included.
+ #   --vendor DIR  install the single vendor zip/channel pair in DIR instead of the release vendor (needs --source)
++#   --native DIR  install the native bundle directory DIR (BUILD-RECORD.json, payload/, gate/) instead of the
++#                 release's; install-native.sh checks it against its own BUILD-RECORD.json (needs --source)
+ #   --destdir DIR stage the complete install and installed-files manifest only; no root, dependencies or host hooks
+ #   --check       download and verify only; install nothing
+ #   --no-deps     do not install distro packages (each required tool is still checked by name)
+@@ -47,13 +49,14 @@ PREFIX=/usr/lib/waydroid-nvidia
+ die()  { echo "install.sh: $*" >&2; exit 1; }
+ info() { echo "==> $*"; }
+ 
+-TAG="" FROM="" SOURCE="" VENDOR="" DESTDIR=${DESTDIR:-} CHECK=0 DEPS=1 UNINSTALL=0
++TAG="" FROM="" SOURCE="" VENDOR="" NATIVE="" DESTDIR=${DESTDIR:-} CHECK=0 DEPS=1 UNINSTALL=0
+ while [ $# -gt 0 ]; do
+     case "$1" in
+         --tag) TAG=${2:?--tag needs a value}; shift 2 ;;
+         --from) FROM=$(cd "${2:?--from needs a directory}" && pwd); shift 2 ;;
+         --source) SOURCE=$(cd "${2:?--source needs a directory}" && pwd); shift 2 ;;
+         --vendor) VENDOR=$(cd "${2:?--vendor needs a directory}" && pwd); shift 2 ;;
++        --native) NATIVE=$(cd "${2:?--native needs a directory}" && pwd); shift 2 ;;
+         --destdir) DESTDIR=${2:?--destdir needs a directory}; shift 2 ;;
+         --check) CHECK=1; shift ;;
+         --no-deps) DEPS=0; shift ;;
+@@ -63,6 +66,7 @@ while [ $# -gt 0 ]; do
+     esac
+ done
+ [ -z "$VENDOR" ] || [ -n "$SOURCE" ] || die "--vendor requires --source"
++[ -z "$NATIVE" ] || [ -n "$SOURCE" ] || die "--native requires --source"
+ if [ -n "$DESTDIR" ]; then
+     [ "$UNINSTALL" = 0 ] && [ "$CHECK" = 0 ] || die "--destdir cannot be combined with --uninstall or --check"
+     mkdir -p "$DESTDIR"
+@@ -248,6 +252,11 @@ for f in "${ASSETS[@]}"; do
+ done
+ (cd "$WORK" && sha256sum -c --strict --quiet verify) || die "SHA256 verification failed"
+ info "SHA256SUMS: ${#ASSETS[@]} assets verified"
++if [ -n "$NATIVE" ]; then
++    [ -f "$NATIVE/BUILD-RECORD.json" ] || die "$NATIVE has no BUILD-RECORD.json"
++    tar --zstd -cf "$WORK/waydroid-nvidia-native-x86_64-$TAG.tar.zst" -C "$NATIVE" .
++    info "native bundle from $NATIVE (BUILD-RECORD.json sha256 $(sha256sum "$NATIVE/BUILD-RECORD.json" | cut -d' ' -f1))"
++fi
+ # Build provenance. 1) cosign against the release's Sigstore bundles: no GitHub account needed; the signing
+ # certificate must name this repository's build.yml at this tag, issued for GitHub Actions. cosign before 2.4.3
+ # cannot read the bundle format GitHub writes (v0.3), so it does not count as a verifier.
+@@ -303,7 +312,7 @@ SRC_COMMIT=$(gzip -dc "$WORK/$SRC_TAR" 2>/dev/null | git get-tar-commit-id || tr
+ if [ -n "$SOURCE" ]; then
+     git -c safe.directory="$SOURCE" -C "$SOURCE" merge-base --is-ancestor "$RECORD_COMMIT" "$SRC_COMMIT" ||
+         die "local source $SRC_COMMIT does not descend from native bundle commit $RECORD_COMMIT"
+-    info "local source $SRC_COMMIT; release native bundle unchanged ($RECORD_COMMIT)"
++    info "local source $SRC_COMMIT; native bundle ${NATIVE:-of the release} built from $RECORD_COMMIT"
+ else
+     [ "$SRC_COMMIT" = "$RECORD_COMMIT" ] || die "source tarball is commit $SRC_COMMIT, the native bundle was built from $RECORD_COMMIT"
+     info "source $SRC_COMMIT = native bundle build commit"
+-- 
+2.56.0
+

@@ -1,0 +1,164 @@
+From db78568908ab552aadae9474c21d43d0b9c53187 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 09:08:14 +0800
+Subject: [PATCH 4/9] =?utf-8?q?=E5=AE=89=E8=A3=85=E5=99=A8=E6=94=AF?=
+ =?utf-8?q?=E6=8C=81=E6=9C=AC=E5=9C=B0=E6=BA=90=E7=A0=81=E3=80=81A17=20ven?=
+ =?utf-8?q?dor=20=E4=B8=8E=E6=97=A0=E7=89=B9=E6=9D=83=E6=9A=82=E5=AD=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ packaging/install.sh | 76 +++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 64 insertions(+), 12 deletions(-)
+
+diff --git a/packaging/install.sh b/packaging/install.sh
+index a5a0def..88ca7b4 100755
+--- a/packaging/install.sh
++++ b/packaging/install.sh
+@@ -8,10 +8,13 @@
+ #   sudo packaging/install.sh --uninstall
+ #
+ #   --tag TAG     release to install (default: the newest release, prereleases included)
+-#   --from DIR    use release assets already in DIR (the four tarballs, the vendor image zip and channel JSON, the
+-#                 SELinux module .pp, SHA256SUMS, and the source tarball waydroid-nvidia-<TAG>.tar.gz) instead of
+-#                 downloading them; their <asset>.sigstore.json bundles, when present in DIR, are verified with
+-#                 cosign
++#   --from DIR    use cached release assets and SHA256SUMS in DIR; missing binary assets are downloaded.
++#                 Without --source, DIR must also contain waydroid-nvidia-<TAG>.tar.gz.
++#                 Their <asset>.sigstore.json bundles, when present in DIR, are verified with cosign.
++#   --source DIR  archive HEAD of a local checkout instead of downloading tag sources; the native bundle's
++#                 release commit must be an ancestor. Uncommitted changes are not included.
++#   --vendor DIR  install the single vendor zip/channel pair in DIR instead of the release vendor (needs --source)
++#   --destdir DIR stage the complete install and installed-files manifest only; no root, dependencies or host hooks
+ #   --check       download and verify only; install nothing
+ #   --no-deps     do not install distro packages (each required tool is still checked by name)
+ #   --uninstall   put the official vendor image back (waydroid-nvidia-setup --restore-official-vendor), then
+@@ -44,11 +47,14 @@ PREFIX=/usr/lib/waydroid-nvidia
+ die()  { echo "install.sh: $*" >&2; exit 1; }
+ info() { echo "==> $*"; }
+ 
+-TAG="" FROM="" CHECK=0 DEPS=1 UNINSTALL=0
++TAG="" FROM="" SOURCE="" VENDOR="" DESTDIR=${DESTDIR:-} CHECK=0 DEPS=1 UNINSTALL=0
+ while [ $# -gt 0 ]; do
+     case "$1" in
+         --tag) TAG=${2:?--tag needs a value}; shift 2 ;;
+         --from) FROM=$(cd "${2:?--from needs a directory}" && pwd); shift 2 ;;
++        --source) SOURCE=$(cd "${2:?--source needs a directory}" && pwd); shift 2 ;;
++        --vendor) VENDOR=$(cd "${2:?--vendor needs a directory}" && pwd); shift 2 ;;
++        --destdir) DESTDIR=${2:?--destdir needs a directory}; shift 2 ;;
+         --check) CHECK=1; shift ;;
+         --no-deps) DEPS=0; shift ;;
+         --uninstall) UNINSTALL=1; shift ;;
+@@ -56,7 +62,16 @@ while [ $# -gt 0 ]; do
+         *) die "unknown argument: $1 (--help)" ;;
+     esac
+ done
+-[ "$(id -u)" = 0 ] || die "run as root (sudo)"
++[ -z "$VENDOR" ] || [ -n "$SOURCE" ] || die "--vendor requires --source"
++if [ -n "$DESTDIR" ]; then
++    [ "$UNINSTALL" = 0 ] && [ "$CHECK" = 0 ] || die "--destdir cannot be combined with --uninstall or --check"
++    mkdir -p "$DESTDIR"
++    DESTDIR=$(cd "$DESTDIR" && pwd)
++    [ "$DESTDIR" != / ] || die "--destdir must not be /"
++    DEPS=0
++else
++    [ "$(id -u)" = 0 ] || [ "$CHECK" = 1 ] || die "run as root (sudo)"
++fi
+ [ "$(uname -m)" = x86_64 ] || die "only x86_64 hosts are supported"
+ 
+ # ---------------------------------------------------------------- SELinux
+@@ -204,15 +219,26 @@ elif selinux_on && [ "$CHECK" = 0 ]; then
+ Install a newer release (--tag), or install on a host without SELinux"
+ fi
+ if [ -n "$FROM" ]; then
+-    for f in "${ASSETS[@]}" "$SRC_TAR"; do
+-        [ -f "$FROM/$f" ] || die "$FROM/$f missing"; cp -- "$FROM/$f" "$WORK/$f"
++    for f in "${ASSETS[@]}"; do
++        if [ -f "$FROM/$f" ]; then cp -- "$FROM/$f" "$WORK/$f"
++        else info "downloading uncached $f"; fetch "$base/$f" "$WORK/$f" || die "cannot download $base/$f"; fi
+     done
+     for f in "${ASSETS[@]}"; do [ ! -f "$FROM/$f.sigstore.json" ] || cp -- "$FROM/$f.sigstore.json" "$WORK/"; done
++    if [ -z "$SOURCE" ]; then
++        [ -f "$FROM/$SRC_TAR" ] || die "$FROM/$SRC_TAR missing"
++        cp -- "$FROM/$SRC_TAR" "$WORK/$SRC_TAR"
++    fi
+ else
+     for f in "${ASSETS[@]}"; do info "downloading $f"; fetch "$base/$f" "$WORK/$f" || die "cannot download $base/$f"; done
+     # Sigstore attestation bundles (releases from v0.2.0-rc2 on): a missing one only means cosign cannot be used
+     for f in "${ASSETS[@]}"; do fetch "$base/$f.sigstore.json" "$WORK/$f.sigstore.json" 2>/dev/null || rm -f "$WORK/$f.sigstore.json"; done
+-    fetch "https://github.com/$GH_REPO/archive/refs/tags/$TAG.tar.gz" "$WORK/$SRC_TAR" || die "cannot download the $TAG source"
++    if [ -z "$SOURCE" ]; then
++        fetch "https://github.com/$GH_REPO/archive/refs/tags/$TAG.tar.gz" "$WORK/$SRC_TAR" || die "cannot download the $TAG source"
++    fi
++fi
++if [ -n "$SOURCE" ]; then
++    git -c safe.directory="$SOURCE" -C "$SOURCE" archive --format=tar --prefix=waydroid-nvidia/ HEAD | gzip > "$WORK/$SRC_TAR"
++    info "local source HEAD from $SOURCE (committed files only)"
+ fi
+ # one line per asset (sha256sum -c --ignore-missing would pass a SHA256SUMS that omits an asset)
+ : > "$WORK/verify"
+@@ -274,8 +300,14 @@ RECORD_COMMIT=$(tar --zstd -xOf "$WORK/waydroid-nvidia-native-x86_64-$TAG.tar.zs
+ # git reads only the first header: gzip then dies of SIGPIPE, which pipefail would report
+ SRC_COMMIT=$(gzip -dc "$WORK/$SRC_TAR" 2>/dev/null | git get-tar-commit-id || true)
+ [[ "$SRC_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "$SRC_TAR carries no commit id (not a git archive of the release tag)"
+-[ "$SRC_COMMIT" = "$RECORD_COMMIT" ] || die "source tarball is commit $SRC_COMMIT, the native bundle was built from $RECORD_COMMIT"
+-info "source $SRC_COMMIT = native bundle build commit"
++if [ -n "$SOURCE" ]; then
++    git -c safe.directory="$SOURCE" -C "$SOURCE" merge-base --is-ancestor "$RECORD_COMMIT" "$SRC_COMMIT" ||
++        die "local source $SRC_COMMIT does not descend from native bundle commit $RECORD_COMMIT"
++    info "local source $SRC_COMMIT; release native bundle unchanged ($RECORD_COMMIT)"
++else
++    [ "$SRC_COMMIT" = "$RECORD_COMMIT" ] || die "source tarball is commit $SRC_COMMIT, the native bundle was built from $RECORD_COMMIT"
++    info "source $SRC_COMMIT = native bundle build commit"
++fi
+ if [ "$CHECK" = 1 ]; then info "--check: verified, nothing installed"; exit 0; fi
+ 
+ # ---------------------------------------------------------------- stage into a package root
+@@ -289,6 +321,9 @@ echo "$WAYDROID_TARBALL_SHA256  $WORK/waydroid.tar.gz" | sha256sum -c --quiet ||
+ mkdir -p "$WORK/waydroid" && tar -xzf "$WORK/waydroid.tar.gz" -C "$WORK/waydroid" --strip-components=1
+ patch -s -d "$WORK/waydroid" -p1 < "$SRC/patches/waydroid/0001-nvidia-integration.patch"
+ patch -s -d "$WORK/waydroid" -p1 < "$SRC/waydroid/0001-lxc-nvidia-native-mounts.patch"
++if [ -f "$SRC/waydroid/0002-seccomp-allow-kernelsu-supercall.patch" ]; then
++    patch -s -d "$WORK/waydroid" -p1 < "$SRC/waydroid/0002-seccomp-allow-kernelsu-supercall.patch"
++fi
+ cmp -s "$SRC/waydroid/nvidia_native.py" "$WORK/waydroid/tools/helpers/nvidia_native.py" || die "patched generator differs from the release's"
+ NFT=1; command -v nft >/dev/null 2>&1 || NFT=0
+ make -s -C "$WORK/waydroid" install DESTDIR="$ROOT" USE_NFTABLES=$NFT >/dev/null
+@@ -317,8 +352,18 @@ for rel in vendor/lib/hw/vulkan.virtio.so vendor/lib/egl/libEGL_angle.so vendor/
+     install -Dm644 "$WORK/guest/$rel" "$ROOT$PREFIX/guest/$rel"
+ done
+ install -Dm755 "$WORK/guest/system/bin/surfaceflinger" "$ROOT$PREFIX/guest/system/bin/surfaceflinger"
++VZIP=$WORK/waydroid-nvidia-vendor-x86_64-$TAG.zip
++VCHANNEL=$WORK/waydroid-nvidia-vendor-ota-$TAG.json
++if [ -n "$VENDOR" ]; then
++    shopt -s nullglob
++    vendor_zips=("$VENDOR"/waydroid-nvidia-vendor-x86_64-*.zip)
++    vendor_channels=("$VENDOR"/waydroid-nvidia-vendor-ota-*.json)
++    shopt -u nullglob
++    [ "${#vendor_zips[@]}" = 1 ] && [ "${#vendor_channels[@]}" = 1 ] || die "--vendor needs exactly one vendor zip/channel pair"
++    VZIP=${vendor_zips[0]} VCHANNEL=${vendor_channels[0]}
++fi
+ bash "$SRC/packaging/native/install-native.sh" "$SRC" "$WORK/waydroid-nvidia-native-x86_64-$TAG.tar.zst" \
+-    "$WORK/waydroid-nvidia-vendor-x86_64-$TAG.zip" "$WORK/waydroid-nvidia-vendor-ota-$TAG.json" "$ROOT" "$TAG"
++    "$VZIP" "$VCHANNEL" "$ROOT" "$TAG"
+ A=$SRC/packaging/aur/waydroid-nvidia-bin
+ install -Dm644 "$A/wd-venus.service" "$ROOT/usr/lib/systemd/user/wd-venus.service"
+ install -Dm644 "$A/waydroid-venus.tmpfiles" "$ROOT/usr/lib/tmpfiles.d/waydroid-venus.conf"
+@@ -329,6 +374,13 @@ install -Dm755 "$SRC/packaging/install.sh" "$ROOT$PREFIX/install.sh"     # for -
+ 
+ # ---------------------------------------------------------------- conflicts, copy, file list
+ (cd "$ROOT" && find . \( -type f -o -type l \) | sed 's#^\.##' | sort) > "$WORK/files"
++if [ -n "$DESTDIR" ]; then
++    tar -C "$ROOT" -cf - . | tar -C "$DESTDIR" -xpf - --no-overwrite-dir --no-same-owner
++    mkdir -p "$DESTDIR$STATE"
++    cp "$WORK/files" "$DESTDIR$LIST"
++    info "staged $(wc -l < "$WORK/files") files into $DESTDIR; no host changes or hooks"
++    exit 0
++fi
+ conflicts=()
+ while IFS= read -r f; do
+     if [ -e "$f" ] || [ -L "$f" ]; then
+-- 
+2.56.0
+

@@ -1,0 +1,59 @@
+From 152607a23884d5ab3940121745b03cfa368b3802 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 03:23:36 +0800
+Subject: [PATCH 7/8] =?utf-8?q?=E5=85=BC=E5=AE=B9=E5=86=85=E5=B5=8C=20wrap?=
+ =?utf-8?q?per=20=E5=B9=B6=E4=BF=AE=E6=AD=A3=E8=BD=BD=E4=BD=93=E5=AD=97?=
+ =?utf-8?q?=E8=8A=82=E6=AD=A5=E9=95=BF?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+可选扩展仅从动态 wrapper 查询，保留 ATV 内嵌实现的编译路径；普通载体也使用格式字节步长，确保未导出布局扩展时 P010 不会按半宽分配。
+
+(cherry picked from commit 2e89bdc6c8edf50f478258b1fdf11e531366b261)
+---
+ gbm_mesa_driver/gbm_mesa_internals.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/gbm_mesa_driver/gbm_mesa_internals.cpp b/gbm_mesa_driver/gbm_mesa_internals.cpp
+index 23d3479..814e9a5 100644
+--- a/gbm_mesa_driver/gbm_mesa_internals.cpp
++++ b/gbm_mesa_driver/gbm_mesa_internals.cpp
+@@ -57,8 +57,8 @@ extern "C" {
+ // PRIx64
+ #include <inttypes.h>
+ 
+-#ifndef EMBEDDED_GBM_WRAPPER
+ #define GBM_WRAPPER_NAME "libgbm_mesa_wrapper.so"
++#ifndef EMBEDDED_GBM_WRAPPER
+ #define GBM_GET_OPS_SYMBOL "get_gbm_ops"
+ #else
+ extern "C" {
+@@ -236,6 +236,7 @@ static std::shared_ptr<GbmMesaDriver> gbm_mesa_get_or_init_driver(struct driver
+ 			return nullptr;
+ 		}
+ 
++#ifndef EMBEDDED_GBM_WRAPPER
+ 		auto get_map_flags_ops = (const struct gbm_map_flags_ops *(*)(void))dlsym(
+ 		    gbm_mesa_drv->dl_handle, GBM_GET_MAP_FLAGS_OPS_SYMBOL);
+ 		if (get_map_flags_ops) {
+@@ -274,6 +275,7 @@ static std::shared_ptr<GbmMesaDriver> gbm_mesa_get_or_init_driver(struct driver
+ 			}
+ 			gbm_mesa_drv->alloc_flags_ops = af;
+ 		}
++#endif
+ 
+ 		gbm_mesa_drv->gbm_dev =
+ 		    gbm_mesa_drv->wrapper->dev_create(gbm_mesa_drv->gbm_node_fd.Get());
+@@ -417,7 +419,7 @@ int gbm_mesa_bo_create2(struct bo *bo, uint32_t width, uint32_t height, uint32_t
+ 
+ 	if (alloc_args.drm_format == 0) {
+ 		/* Always use linear for spoofed format allocations. */
+-		uint32_t spoof_stride = alloc_args.width;
++		uint32_t spoof_stride = drv_stride_from_format(format, alloc_args.width, 0);
+ 		uint32_t spoof_height = alloc_args.height;
+ 		if (drv->layout_ops && (format == DRM_FORMAT_NV12 || format == DRM_FORMAT_P010)) {
+ 			/* GPU copy pitch is in bytes, including two-byte P010 samples. */
+-- 
+2.56.0
+

@@ -1,0 +1,399 @@
+From a13623bfec16c26371c29b3e871e778abce917ae Mon Sep 17 00:00:00 2001
+From: Shiro836 <17294277+Shiro836@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 21:39:33 +0300
+Subject: [PATCH 17/24] hwcomposer: the Android display follows the window,
+ through a display reconnect sent from its own thread
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+With Waydroid's hwc2on1 "Handle primary hotplugs" patch, an HWC1
+hotplug(0, 1) makes SurfaceFlinger re-read the primary display's configs and
+recreate the display, which is how upstream 40c54a5 ("Call hotplug on display
+resize") lets Android's display size follow the window. Upstream sends it from
+hwc_set(); that is the SurfaceFlinger crash patch 0016 removed (the callback
+lands on SurfaceFlinger's main thread inside presentAndGetReleaseFences).
+
+Sent from any other thread, SurfaceFlinger queues the event and handles it at
+its next commit (onComposerHalHotplug -> commitTransactionsLocked ->
+processDisplayHotplugEventsLocked), but the stock composer 2.1 HAL is then not
+safe: the adapter takes its state mutex and the Display's mutex in the
+opposite order to validate()/present(), and ComposerClient frees the display's
+cached buffer handles while the old layers can still be presented. A vendor
+image whose composer HAL fixes both declares
+ro.vendor.composer.safe_primary_reconnect=true.
+
+With that property:
+- display-resize.cpp owns a resize thread. A configure that changes the size
+  publishes the new touch range at once and arms the thread; once the window
+  has not changed for persist.waydroid.resize_settle_ms (default 250, as
+  Waydroid's lineage-23.2 hwcomposer), the thread makes floor(window *
+  output scale) the display's only config and calls procs->hotplug(0, 1),
+  then invalidate. It holds no lock of this module while it calls out
+  (modes_mutex and resize_mutex are released first).
+- The display has one mode, the window's size; the aspect ladder and
+  set-user-preferred-display-mode are only used without the property.
+- Only the full-UI window (task "0") drives the display size; per-app
+  windows of the multi-window modes keep the old path.
+- A forced size left by an earlier session is cleared once, as on the
+  fullscreen path, so the logical display follows too.
+- A decorated window keeps its scaled view while the size settles and is
+  presented 1:1 again once the guest display has the window's size.
+Without the property nothing changes: no hotplug is sent and the display
+keeps its calibrated size and mode ladder. create_display() logs which of the
+two paths is active.
+
+modes, active_mode and phys_width/phys_height are now guarded by
+modes_mutex (a leaf lock): the resize thread replaces them while composer
+threads read them in getDisplayConfigs/getDisplayAttributes/setActiveConfig.
+
+The poison guard stays in hwcomposer.cpp and wayland-hwc.cpp, so no code in
+the present path or on the Wayland thread can call hotplug; the one caller in
+display-resize.cpp aborts unless it runs on the resize thread.
+
+复用 ATV 的窗口几何所有权和 250ms settle 语义，将已有 resize worker 移入 display-resize.cpp，避免两套线程；只有 ro.vendor.composer.safe_primary_reconnect=true 才发主显示重连。配置保持 ATV 单一 config，尺寸通过 modes_mutex 保护，在 settle 后更新；保留每连接窗口、task streams 与触摸范围即时更新，不引入 A13 模式阶梯或 cmd window size。Soong 同时编入 prime-copy.cpp 和 display-resize.cpp。
+
+(cherry picked from commit 7880ca3492a94bfb267c95954d19c94d8ccb5720)
+---
+ hwcomposer/Android.bp         |   1 +
+ hwcomposer/display-resize.cpp | 164 ++++++++++++++++++++++++++++++++++
+ hwcomposer/hwcomposer.cpp     |   8 +-
+ hwcomposer/wayland-hwc.cpp    |  62 +++----------
+ hwcomposer/wayland-hwc.h      |   7 ++
+ 5 files changed, 189 insertions(+), 53 deletions(-)
+ create mode 100644 hwcomposer/display-resize.cpp
+
+diff --git a/hwcomposer/Android.bp b/hwcomposer/Android.bp
+index 813b810..d3d6cc4 100644
+--- a/hwcomposer/Android.bp
++++ b/hwcomposer/Android.bp
+@@ -60,6 +60,7 @@ cc_library_shared {
+         "modes/multi-window.cpp",
+         "modes/single-window.cpp",
+         "prime-copy.cpp",
++        "display-resize.cpp",
+     ],
+     header_libs: [
+         "libsystem_headers",
+diff --git a/hwcomposer/display-resize.cpp b/hwcomposer/display-resize.cpp
+new file mode 100644
+index 0000000..6fd74ae
+--- /dev/null
++++ b/hwcomposer/display-resize.cpp
+@@ -0,0 +1,164 @@
++/*
++ * Copyright (C) 2026 The waydroid-nvidia authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* The Android display follows the host window.
++ *
++ * A settled window size becomes the primary display's only config, and an
++ * HWC1 hotplug(0, connected) makes SurfaceFlinger re-read it: Waydroid's
++ * hwc2on1 "Handle primary hotplugs" patch re-runs populateConfigs() and
++ * forwards a HWC2 re-connect, SurfaceFlinger reloads the display modes and
++ * recreates the display (processDisplayHotplugEventsLocked ->
++ * processDisplayChanged), and the framework follows with the new size.
++ *
++ * Where the hotplug is sent from decides whether that is safe:
++ *
++ *  - Never from inside hwc_set()/hwc_prepare(). Those run on the composer's
++ *    binder thread while SurfaceFlinger's main thread waits for the
++ *    presentDisplay/validateDisplay reply, so the callback is delivered to
++ *    that waiting main thread, which processes a main-thread hotplug at once
++ *    (onComposerHalHotplug) and erases the HWComposer DisplayData that
++ *    presentAndGetReleaseFences() is still using. hwcomposer.cpp and
++ *    wayland-hwc.cpp poison the identifier; this file is the only caller.
++ *
++ *  - From this file's own thread, SurfaceFlinger receives it on a binder
++ *    thread, queues it and handles it on its main thread at the next commit,
++ *    before that frame's composition. The composer side needs two things the
++ *    stock composer 2.1 HAL does not give: the adapter must not take its
++ *    state mutex and a Display's mutex in the opposite order to
++ *    validate()/present(), and the HAL must keep the display's cached buffer
++ *    handles until SurfaceFlinger has destroyed the old layers. A vendor
++ *    image whose composer HAL does both declares
++ *    ro.vendor.composer.safe_primary_reconnect=true; without it no hotplug is
++ *    ever sent and the display keeps its calibrated size.
++ *
++ * The resize thread holds none of this module's locks while it calls into
++ * the adapter or SurfaceFlinger (modes_mutex and resize_mutex are released
++ * first), so it cannot be part of a lock cycle with a composer thread that is
++ * inside hwc_set() holding the adapter's mutexes and windowsMutex.
++ */
++
++#include "wayland-hwc.h"
++
++#include <algorithm>
++#include <log/log.h>
++
++static constexpr const char *kCapabilityProperty = "ro.vendor.composer.safe_primary_reconnect";
++
++/* A window drag or an animated maximize walks through every intermediate size;
++ * only the size it settles on goes to Android (same default and property as
++ * Waydroid's hwcomposer on lineage-23.2, "Stop resizing the Android display so
++ * much"). 0 sends each size as soon as the thread runs. */
++static constexpr int32_t kResizeSettleDefaultMs = 250;
++
++static thread_local bool t_is_resize_thread = false;
++
++/* Resize thread only. */
++static void
++announce_display_size(struct display *display, int width, int height)
++{
++    LOG_ALWAYS_FATAL_IF(!t_is_resize_thread,
++                        "display hotplug requested outside the resize thread");
++    {
++        std::scoped_lock lock(display->modes_mutex);
++        if (display->phys_width == width && display->phys_height == height)
++            return;
++        display->phys_width = width;
++        display->phys_height = height;
++    }
++
++    const hwc_procs_t *procs = display->procs;
++    if (!procs || !procs->hotplug) {
++        ALOGE("display resize: no HWC callbacks registered; Android keeps its display size "
++              "until the next window resize");
++        return;
++    }
++    ALOGI("display resize: Android display -> %dx%d (display reconnect)", width, height);
++    procs->hotplug(procs, HWC_DISPLAY_PRIMARY, 1);
++    if (procs->invalidate)
++        procs->invalidate(procs);
++}
++
++static void
++resize_worker(struct display *display)
++{
++    t_is_resize_thread = true;
++    std::unique_lock<std::mutex> lock(display->resize_mutex);
++    while (!display->resize_quit) {
++        if (!display->resize_armed) {
++            display->resize_cond.wait(lock);
++            continue;
++        }
++        display->resize_cond.wait_until(lock, display->resize_deadline);
++        if (display->resize_quit)
++            break;
++        /* Re-armed by a newer configure while waiting. */
++        if (std::chrono::steady_clock::now() < display->resize_deadline)
++            continue;
++        display->resize_armed = false;
++        const int width = display->resize_width;
++        const int height = display->resize_height;
++        lock.unlock();
++        announce_display_size(display, width, height);
++        lock.lock();
++    }
++}
++
++void
++display_resize_start(struct display *display)
++{
++    display->resizeFollowsWindow = property_get_bool(kCapabilityProperty, false);
++    if (!display->resizeFollowsWindow) {
++        ALOGI("display resize: the Android display keeps the size it was calibrated with; "
++              "%s is not set, so this vendor image's composer HAL is not known to survive a "
++              "display reconnect while frames are in flight, and none is sent",
++              kCapabilityProperty);
++        return;
++    }
++    ALOGI("display resize: the Android display follows the window (%s; settled after "
++          "persist.waydroid.resize_settle_ms, default %d ms)",
++          kCapabilityProperty, kResizeSettleDefaultMs);
++    display->resize_armed = false;
++    display->resize_quit = false;
++    display->resize_thread = std::thread(resize_worker, display);
++}
++
++void
++display_resize_arm(struct display *display, int width, int height)
++{
++    if (!display->resizeFollowsWindow)
++        return;
++    const auto settle = std::chrono::milliseconds(std::max(0, property_get_int32(
++            "persist.waydroid.resize_settle_ms", kResizeSettleDefaultMs)));
++    std::scoped_lock lock(display->resize_mutex);
++    display->resize_width = width;
++    display->resize_height = height;
++    display->resize_deadline = std::chrono::steady_clock::now() + settle;
++    display->resize_armed = true;
++    display->resize_cond.notify_one();
++}
++
++void
++display_resize_stop(struct display *display)
++{
++    if (!display->resize_thread.joinable())
++        return;
++    {
++        std::scoped_lock lock(display->resize_mutex);
++        display->resize_quit = true;
++        display->resize_cond.notify_one();
++    }
++    display->resize_thread.join();
++}
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index d7d7175..f63c6f8 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -1076,8 +1076,12 @@ static int hwc_get_display_configs(struct hwc_composer_device_1* dev,
+ static int32_t hwc_attribute(struct waydroid_hwc_composer_device_1* pdev,
+                              const uint32_t attribute) {
+     char property[PROPERTY_VALUE_MAX];
+-    int width = floor(pdev->display->width * pdev->display->scale);
+-    int height = floor(pdev->display->height * pdev->display->scale);
++    int width, height;
++    {
++        std::scoped_lock lock(pdev->display->modes_mutex);
++        width = pdev->display->phys_width;
++        height = pdev->display->phys_height;
++    }
+     int density = 180;
+ 
+     switch(attribute) {
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index 54b82d7..c406721 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -317,6 +317,11 @@ finished_calibrating(struct display *d)
+     }
+ 
+     choose_width_height(d, d->req_width, d->req_height);
++    {
++        std::scoped_lock lock(d->modes_mutex);
++        d->phys_width = floor(d->width * d->scale);
++        d->phys_height = floor(d->height * d->scale);
++    }
+ }
+ 
+ /* A uinput FIFO is one Android input device for the whole HAL, not a property
+@@ -357,25 +362,14 @@ init_input_devices(struct display *display)
+     display->zoomSensitivity = property_get_int32("persist.waydroid.zoom_sensitivity", 96);
+ }
+ 
+-/* Grace before a settled host window size is pushed to Android. Every
+- * intermediate size of a drag would otherwise hotplug the display; see
+- * display::resize_mutex. 0 pushes it as soon as the worker can run. */
+-static constexpr int32_t kResizeSettleDefaultMs = 250;
++void do_hotplug(struct display *display);
+ 
+ static void
+ arm_resize_settle(struct display *display)
+ {
+-    auto settle = std::chrono::milliseconds(std::max(0, property_get_int32(
+-        "persist.waydroid.resize_settle_ms", kResizeSettleDefaultMs)));
+-    std::scoped_lock lock(display->resize_mutex);
+-    /* The size the caller just wrote. The worker hotplugs only if it still
+-     * stands, so it can never publish a width from one configure and a height
+-     * from the next. */
+-    display->resize_width = display->width;
+-    display->resize_height = display->height;
+-    display->resize_deadline = std::chrono::steady_clock::now() + settle;
+-    display->resize_armed = true;
+-    display->resize_cond.notify_one();
++    do_hotplug(display);
++    display_resize_arm(display, floor(display->width * display->scale),
++                        floor(display->height * display->scale));
+ }
+ 
+ /* invalidate takes the adapter's state mutex, and hwc_set runs with that mutex
+@@ -1643,33 +1637,6 @@ deactivate_worker(struct display *display)
+     }
+ }
+ 
+-/* Runs on resize_thread once the size has stopped moving. Sizing itself
+- * already happened in the configure handler, so this only tells Android. */
+-static void
+-resize_worker(struct display *display)
+-{
+-    std::unique_lock<std::mutex> lock(display->resize_mutex);
+-    while (!display->resize_quit) {
+-        if (!display->resize_armed) {
+-            display->resize_cond.wait(lock);
+-            continue;
+-        }
+-        display->resize_cond.wait_until(lock, display->resize_deadline);
+-        if (display->resize_quit)
+-            break;
+-        /* The deadline may have been pushed forward while we slept. */
+-        if (std::chrono::steady_clock::now() < display->resize_deadline)
+-            continue;
+-        display->resize_armed = false;
+-        bool settled = display->width == display->resize_width
+-                && display->height == display->resize_height;
+-        lock.unlock();
+-        /* A configure that landed after the deadline re-arms; leave it to it. */
+-        if (settled)
+-            do_hotplug(display);
+-        lock.lock();
+-    }
+-}
+ 
+ /* wl_buffer.release for a task-stream slot. Userdata is the connection, not
+  * the slot: a slot (and its window) can be destroyed while the compositor
+@@ -4406,7 +4373,7 @@ create_display(const char *gralloc)
+ 
+     display->task = IWaydroidTask::getService();
+     display->deactivate_thread = std::thread(deactivate_worker, display);
+-    display->resize_thread = std::thread(resize_worker, display);
++    display_resize_start(display);
+     display->conn_worker_thread = std::thread(conn_worker, display);
+     return display;
+ }
+@@ -4429,14 +4396,7 @@ destroy_display(struct display *display)
+         display->deactivate_thread.join();
+     }
+ 
+-    if (display->resize_thread.joinable()) {
+-        {
+-            std::scoped_lock lock(display->resize_mutex);
+-            display->resize_quit = true;
+-            display->resize_cond.notify_one();
+-        }
+-        display->resize_thread.join();
+-    }
++    display_resize_stop(display);
+ 
+     if (display->conn_worker_thread.joinable()) {
+         {
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index 0754c3d..0fa2f2f 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -816,6 +816,10 @@ struct display {
+      * not have yet. Coalesce instead -- the card is viewport-scaled while the
+      * drag is in flight, and one hotplug lands once the size settles.
+      * See arm_resize_settle. */
++    bool resizeFollowsWindow = false;
++    std::mutex modes_mutex;
++    int phys_width = 0;
++    int phys_height = 0;
+     std::mutex resize_mutex;
+     std::condition_variable resize_cond;
+     std::chrono::steady_clock::time_point resize_deadline;
+@@ -848,6 +852,9 @@ handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
+ 
+ void
+ snapshot_inactive_app_window(struct display *display, struct window *window);
++void display_resize_start(struct display *display);
++void display_resize_arm(struct display *display, int width, int height);
++void display_resize_stop(struct display *display);
+ 
+ 
+ struct display *
+-- 
+2.56.0
+

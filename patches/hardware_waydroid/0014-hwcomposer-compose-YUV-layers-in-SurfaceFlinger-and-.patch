@@ -1,0 +1,255 @@
+From 7b547a0809954f9d914c45d4335d7b5e561628e3 Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Wed, 14 Oct 2026 23:35:40 +0300
+Subject: [PATCH 14/24] hwcomposer: compose YUV layers in SurfaceFlinger and
+ pass every dma-buf plane
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+What:
+- create_dmabuf_wl_buffer() takes the buffer's planes (fd, offset, stride)
+  and adds each one to zwp_linux_buffer_params_v1 (plane index i); the
+  cros_gralloc path passes all num_planes planes of the handle, the gbm
+  path its single plane.
+- displayable_buffer_cros() admits a buffer only if the handle's
+  num_planes equals the format's plane count (NV12/P010/... 2, YUV420/...
+  3, everything else 1) and every plane fd is valid, and never admits a
+  YUV format: such layers are composed by SurfaceFlinger (logged once,
+  "YUV layer (fmt 0x..., N planes): composed by SurfaceFlinger").
+  displayable_buffer_gbm() refuses multi-planar and YUV formats (its handle
+  has one fd and no plane offsets).
+- create_shm_wl_buffer() returns nullptr (logged) for a format with no
+  wl_shm equivalent instead of creating a buffer with format 0xffffffea.
+- The "attach dmabuf" log prints every plane of a multi-planar buffer.
+
+Why: Chrome plays video through MediaCodec (our Codec2 decoder) into an
+AImageReader and puts the frames on a SurfaceControl child layer
+(ChromeChildSurface, NV12 3840x2160 LINEAR, usage 0x400900). SurfaceFlinger
+offers it as a device layer; KWin 6.7.5 advertises NV12 with modifier
+LINEAR, so compositor_supports() passed and the buffer was created with
+plane 0 only. KWin answered with zwp_linux_buffer_params_v1 error 7
+(invalid_wl_buffer, recorded in waydroid.hwc.wayland_lost: "protocol
+error: interface zwp_linux_buffer_params_v1 id 131 code 7") -> 0006 ends
+the composer with status 75 -> SurfaceFlinger aborts in
+HidlComposer::setLayerHandleInfo (DEAD_OBJECT) -> system_server restart
+(guest tombstone_36, 2026-10-14 23:18:28).
+Passing both planes is necessary but not sufficient: with the correct
+two-plane description (offsets 0/8294400, pitch 3840) KWin rejects the
+same import with the same fatal error (measured 2026-10-14 23:34, NVIDIA
+615.71.09). An advertised YUV format+modifier therefore does not prove
+the import works, and zwp_linux_buffer_params_v1.create_immed turns a
+failed import into a protocol error. Independently, hwc1 carries no
+dataspace (HWC2On1Adapter::Layer::setDataspace ignores it): Chrome tags
+this layer "BT2020 sRGB Limited range", the compositor would have to guess
+matrix, range and primaries. SurfaceFlinger knows the dataspace and
+samples the buffer through RenderEngine (ANGLE over the Vulkan HAL's YUV
+AHB import), so YUV goes there. The planes fix still matters for any
+multi-planar non-YUV buffer (e.g. a modifier with an aux plane: refused
+instead of sent incomplete). The wl_shm fix closes the same crash in
+multi-window mode, which has no client target to compose a YUV layer into.
+
+Verified: build/video-bench/run.sh (4K30 VP9 in Chrome, decoder
+c2.nvprolapse.vp9.decoder in Chrome's GPU process): video layer CLIENT in
+dumpsys SurfaceFlinger, screencap matches the reference frame converted per
+the layer's dataspace (BT.2020 limited -> sRGB: RMSE 5.3/255; AOSP
+ColorUtils defaults untagged >=4K streams to BT.2020), no hwc exit, no
+tombstone, 0 Xid; a real 4K VP9 YouTube stream in Chrome likewise.
+
+Source: ours. Licence: Apache-2.0 (as android_hardware_waydroid).
+
+将所有平面参数和 YUV 判定迁到 wl_conn 接口，保留 ATV 的 buffer.conn 与 shared_ptr 生命周期；cros 平面数组在构造前限制在 DRV_MAX_PLANES 范围。旧 blob 无法三路重建，以拒绝块适配后继续原 git am。
+
+(cherry picked from commit bf3beebdfdcc55010ba7f84aae019ff8e2670005)
+---
+ hwcomposer/gralloc_handler.cpp | 111 ++++++++++++++++++++++++++++++---
+ hwcomposer/gralloc_handler.h   |   9 ++-
+ 2 files changed, 108 insertions(+), 12 deletions(-)
+
+diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
+index f485c5a..4f55904 100644
+--- a/hwcomposer/gralloc_handler.cpp
++++ b/hwcomposer/gralloc_handler.cpp
+@@ -93,8 +93,15 @@ std::unique_ptr<buffer> create_shm_wl_buffer(wl_conn *conn, const buffer_metadat
+     buf->isShm = true;
+     buf->size = size;
+ 
+-    auto shm_format = ConvertHalFormatToShm(metadata.format);
+-    assert(shm_format >= 0);
++    /* ConvertHalFormatToShm() returns -EINVAL as uint32_t, so the old assert(shm_format >= 0)
++     * never fired and a YUV layer (multi-window mode has no client target to compose it into)
++     * became a wl_shm buffer with format 0xffffffea: invalid_format, a fatal protocol error.
++     * Such a layer is not shown instead (logged). */
++    const uint32_t shm_format = ConvertHalFormatToShm(metadata.format);
++    if (shm_format == (uint32_t)-EINVAL) {
++        ALOGE("layer format %u has no wl_shm equivalent; the layer is not shown", metadata.format);
++        return nullptr;
++    }
+ 
+     int fd = syscall(SYS_memfd_create, "buffer", MFD_ALLOW_SEALING);
+     ftruncate(fd, size);
+@@ -227,10 +234,10 @@ uint32_t drm_format_strip_alpha(uint32_t format) {
+ }
+ 
+ std::unique_ptr<buffer> create_dmabuf_wl_buffer(wl_conn *conn, const buffer_metadata& metadata,
+-                                                                int prime_fd, int drm_format, int byte_stride,
+-                                                                int offset, uint64_t modifier, buffer_handle_t handle)
++                                                                const dmabuf_plane *planes, unsigned num_planes,
++                                                                int drm_format, uint64_t modifier, buffer_handle_t handle)
+ {
+-    assert(prime_fd >= 0);
++    assert(num_planes >= 1 && planes[0].fd >= 0);
+ 
+     std::unique_ptr<buffer> buf { new buffer() };
+     buf->conn = conn;
+@@ -253,7 +260,9 @@ std::unique_ptr<buffer> create_dmabuf_wl_buffer(wl_conn *conn, const buffer_meta
+     }
+ 
+     zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params(conn->dmabuf);
+-    zwp_linux_buffer_params_v1_add(params, prime_fd, 0, offset, byte_stride, modifier >> 32, modifier & 0xffffffff);
++    for (unsigned i = 0; i < num_planes; i++)
++        zwp_linux_buffer_params_v1_add(params, planes[i].fd, i, planes[i].offset, planes[i].stride,
++                                      modifier >> 32, modifier & 0xffffffff);
+     zwp_linux_buffer_params_v1_add_listener(params, &params_listener, nullptr);
+ 
+     buf->wl_buffer = zwp_linux_buffer_params_v1_create_immed(params, buf->metadata.width, buf->metadata.height, drm_format, 0);
+@@ -408,11 +417,33 @@ std::unique_ptr<buffer> create_buffer_generic(wl_conn *conn, const buffer_metada
+ }
+ std::unique_ptr<buffer> create_buffer_gbm(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle) {
+     auto *drm_handle = reinterpret_cast<const gralloc_handle_t *>(handle);
+-    return create_dmabuf_wl_buffer(conn, metadata, drm_handle->prime_fd, -1 /* compute drm format */, drm_handle->stride, 0 /* offset */, drm_handle->modifier, handle);
++    const dmabuf_plane plane { drm_handle->prime_fd, 0, (uint32_t)drm_handle->stride };
++    return create_dmabuf_wl_buffer(conn, metadata, &plane, 1, -1, drm_handle->modifier, handle);
+ }
+ std::unique_ptr<buffer> create_buffer_cros(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle) {
+     auto *cros_handle = reinterpret_cast<const cros_gralloc_handle *>(handle);
+-    return create_dmabuf_wl_buffer(conn, metadata, cros_handle->fds[0], cros_handle->format, cros_handle->strides[0], cros_handle->offsets[0], cros_handle->format_modifier, handle);
++    /* displayable_buffer_cros() admitted it, so num_planes is the format's plane count and
++     * every plane has an fd */
++    const unsigned n = cros_handle->num_planes;
++    if (n < 1 || n > DRV_MAX_PLANES)
++        return nullptr;
++    dmabuf_plane planes[DRV_MAX_PLANES];
++    for (unsigned i = 0; i < n; i++)
++        planes[i] = { cros_handle->fds[i], cros_handle->offsets[i], cros_handle->strides[i] };
++    if (n == 1)
++        ALOGI("attach dmabuf: %ux%u fmt 0x%x stride %u mod 0x%llx usage 0x%x",
++              metadata.width, metadata.height, cros_handle->format,
++              cros_handle->strides[0],
++              (unsigned long long)cros_handle->format_modifier,
++              cros_handle->usage);
++    else
++        ALOGI("attach dmabuf: %ux%u fmt 0x%x planes %u (offset/stride %u/%u, %u/%u, %u/%u) "
++              "mod 0x%llx usage 0x%x",
++              metadata.width, metadata.height, cros_handle->format, n,
++              planes[0].offset, planes[0].stride, planes[1].offset, planes[1].stride,
++              n > 2 ? planes[2].offset : 0, n > 2 ? planes[2].stride : 0,
++              (unsigned long long)cros_handle->format_modifier, cros_handle->usage);
++    return create_dmabuf_wl_buffer(conn, metadata, planes, n, cros_handle->format, cros_handle->format_modifier, handle);
+ }
+ std::unique_ptr<buffer> create_buffer_android(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle) {
+     return create_android_wl_buffer(conn, metadata, handle);
+@@ -571,10 +602,68 @@ gralloc_handler::update_shm_buffer_func gralloc_handler::select_update_shm_buffe
+ }
+ 
+ namespace {
++/* Memory planes of a DRM format as zwp_linux_buffer_params_v1 needs them: planar YUV has 2 or
++ * 3, every packed YUV / RGB / single-channel format 1. */
++unsigned drm_format_planes(uint32_t format) {
++    switch (format) {
++        case DRM_FORMAT_NV12: case DRM_FORMAT_NV21: case DRM_FORMAT_NV16: case DRM_FORMAT_NV61:
++        case DRM_FORMAT_NV24: case DRM_FORMAT_NV42: case DRM_FORMAT_P010: case DRM_FORMAT_P012:
++        case DRM_FORMAT_P016: case DRM_FORMAT_P210:
++            return 2;
++        case DRM_FORMAT_YUV420: case DRM_FORMAT_YVU420: case DRM_FORMAT_YUV422:
++        case DRM_FORMAT_YVU422: case DRM_FORMAT_YUV444: case DRM_FORMAT_YVU444:
++            return 3;
++        default:
++            return 1;
++    }
++}
++
++bool is_yuv(uint32_t format) {
++    switch (format) {
++        case DRM_FORMAT_NV12: case DRM_FORMAT_NV21: case DRM_FORMAT_NV16: case DRM_FORMAT_NV61:
++        case DRM_FORMAT_NV24: case DRM_FORMAT_NV42: case DRM_FORMAT_P010: case DRM_FORMAT_P012:
++        case DRM_FORMAT_P016: case DRM_FORMAT_P210:
++        case DRM_FORMAT_YUV420: case DRM_FORMAT_YVU420: case DRM_FORMAT_YUV422:
++        case DRM_FORMAT_YVU422: case DRM_FORMAT_YUV444: case DRM_FORMAT_YVU444:
++        case DRM_FORMAT_YUYV: case DRM_FORMAT_YVYU: case DRM_FORMAT_UYVY: case DRM_FORMAT_VYUY:
++        case DRM_FORMAT_AYUV: case DRM_FORMAT_XYUV8888: case DRM_FORMAT_Y210:
++        case DRM_FORMAT_Y410:
++            return true;
++        default:
++            return false;
++    }
++}
+ bool displayable_buffer_cros(wl_conn *conn, buffer_handle_t handle) {
+     auto *cros_handle = reinterpret_cast<const cros_gralloc_handle *>(handle);
+-    return compositor_supports(conn, cros_handle->format,
+-                               cros_handle->format_modifier);
++    const uint32_t format = cros_handle->format;
++    const unsigned want = drm_format_planes(format);
++    const unsigned have = cros_handle->num_planes;
++    bool fds_ok = have >= 1 && have <= DRV_MAX_PLANES;
++    for (unsigned i = 0; fds_ok && i < have; i++)
++        fds_ok = cros_handle->fds[i] >= 0;
++    if (!fds_ok || have != want) {
++        static int logged = 0;
++        if ((logged++ % 500) == 0)
++            ALOGW("buffer fmt 0x%x has %u planes in its gralloc handle, the format needs %u (or a "
++                  "plane fd is missing); composed by SurfaceFlinger (%d times)", format, have, want,
++                  logged);
++        return false;
++    }
++    /* YUV layers are composed by SurfaceFlinger, never attached:
++     * - hwc1 carries no dataspace (HWC2On1Adapter drops setLayerDataspace), so a compositor
++     *   would have to guess matrix, range and primaries; SurfaceFlinger knows the layer's
++     *   dataspace and converts correctly;
++     * - KWin 6.7 on NVIDIA advertises NV12 + LINEAR but rejects exactly that import (NV12
++     *   3840x2160, 2 planes, offsets 0/8294400, pitch 3840: invalid_wl_buffer, fatal), so an
++     *   advertised YUV pair is no proof the import works. */
++    if (is_yuv(format)) {
++        static std::atomic<bool> logged{false};
++        if (!logged.exchange(true))
++            ALOGI("YUV layer (fmt 0x%x, %u planes): composed by SurfaceFlinger (hwc1 has no "
++                  "dataspace to give the compositor)", format, have);
++        return false;
++    }
++    return compositor_supports(conn, format, cros_handle->format_modifier);
+ }
+ 
+ bool displayable_buffer_gbm(wl_conn *conn, buffer_handle_t handle) {
+@@ -582,6 +671,8 @@ bool displayable_buffer_gbm(wl_conn *conn, buffer_handle_t handle) {
+     int drm_format = ConvertHalFormatToDrm(conn, drm_handle->format);
+     if (drm_format < 0)
+         return false;
++    if (drm_format_planes((uint32_t)drm_format) != 1 || is_yuv((uint32_t)drm_format))
++        return false;
+     return compositor_supports(conn, (uint32_t)drm_format, drm_handle->modifier);
+ }
+ 
+diff --git a/hwcomposer/gralloc_handler.h b/hwcomposer/gralloc_handler.h
+index 5aa8f1b..1ed3900 100644
+--- a/hwcomposer/gralloc_handler.h
++++ b/hwcomposer/gralloc_handler.h
+@@ -31,9 +31,14 @@
+ #include "wayland-hwc.h"
+ 
+ std::unique_ptr<buffer> create_shm_wl_buffer(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle);
++struct dmabuf_plane {
++    int fd;
++    uint32_t offset;
++    uint32_t stride;
++};
+ std::unique_ptr<buffer> create_dmabuf_wl_buffer(wl_conn *conn, const buffer_metadata& metadata,
+-                                                                int prime_fd, int format, int byte_stride,
+-                                                                int offset, uint64_t modifier, buffer_handle_t handle);
++                                                                const dmabuf_plane *planes, unsigned num_planes,
++                                                                int format, uint64_t modifier, buffer_handle_t handle);
+ std::unique_ptr<buffer> create_prime_wl_buffer(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle);
+ std::unique_ptr<buffer> create_android_wl_buffer(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t target,
+                                                  const wl_buffer_listener *listener = nullptr, void *listener_data = nullptr);
+-- 
+2.56.0
+

@@ -1,0 +1,149 @@
+From 83da1d6d2925b090a89471761bcddd47f8d10e25 Mon Sep 17 00:00:00 2001
+From: Shiro836 <17294277+Shiro836@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 21:36:27 +0300
+Subject: [PATCH] composer 2.1: a primary display re-connect is safe while
+ frames are in flight
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Waydroid's hwc2on1 "Handle primary hotplugs" patch turns an HWC1 hotplug
+for the primary display into a HWC2 re-connect (populateConfigs(), then the
+hotplug callback). Two things made that unsafe unless the HWC1 module sent
+it from inside its own set():
+
+1. HWC2On1Adapter::hwc1Hotplug() held mStateMutex while populateConfigs()
+   took the Display's mutex. Display::validate() and Display::present() take
+   the Display's mutex first and mStateMutex second (prepareAllDisplays(),
+   setAllDisplays()), so a hotplug from another thread could deadlock
+   against a frame in flight. populateConfigs() now runs with only the
+   Display's mutex held; mStateMutex is dropped around it.
+
+2. ComposerClient's HalEventCallback::onHotplug() freed every cached handle
+   of a re-connected display (cleanDisplayResources() + removeDisplay()).
+   SurfaceFlinger handles a hotplug from a binder thread at its next commit
+   (onComposerHalHotplug() queues it, commitTransactionsLocked() ->
+   processDisplayHotplugEventsLocked()), so until then it keeps validating
+   and presenting the display with layers whose buffers the HAL got from
+   those caches; its setLayerBuffer() for the old layer ids then fails with
+   BAD_LAYER, so the HAL keeps the freed handles and passes them on. The
+   caches now stay: a layer's handles are freed by destroyLayer() (HAL
+   first, cache second, as for any layer) when SurfaceFlinger destroys the
+   old display's layers, and the client target's by the new display's full
+   handles replacing them slot by slot (FramebufferSurface's new
+   HwcBufferCache). setClientTargetSlotCount() accepts the repeated request
+   of SurfaceFlinger's new HWC2::Display (setConnected()) with the same size.
+
+Only the 2.1 HAL is patched; Waydroid's vendor image runs
+android.hardware.graphics.composer@2.1-service.
+
+适配 ATV Android 17：2.1 的原有代码路径可直接应用；ATV 同时打包 2.4 服务，
+其 ComposerClient 独立覆盖热插拔回调，因此将重连时保留缓存的相同语义同步到
+2.4 回调，避免绕过 2.1 修复。客户端目标槽位处理沿用继承的 2.1 实现，
+保留 ATV 的服务选择及其余 2.4 回调行为。
+
+(cherry picked from commit 7cb84c3d160bada81ad5d5f30fa2d690b149d79c)
+---
+ .../include/composer-hal/2.1/ComposerClient.h | 27 ++++++++++++++-----
+ .../utils/hwc2on1adapter/HWC2On1Adapter.cpp   | 12 ++++++++-
+ .../include/composer-hal/2.4/ComposerClient.h | 14 +++++-----
+ 3 files changed, 37 insertions(+), 16 deletions(-)
+
+diff --git a/graphics/composer/2.1/utils/hal/include/composer-hal/2.1/ComposerClient.h b/graphics/composer/2.1/utils/hal/include/composer-hal/2.1/ComposerClient.h
+index 46f5d6e..2ff5ac7 100644
+--- a/graphics/composer/2.1/utils/hal/include/composer-hal/2.1/ComposerClient.h
++++ b/graphics/composer/2.1/utils/hal/include/composer-hal/2.1/ComposerClient.h
+@@ -94,14 +94,20 @@ class ComposerClientImpl : public Interface {
+          void onHotplug(Display display, IComposerCallback::Connection connected) {
+              if (connected == IComposerCallback::Connection::CONNECTED) {
+                  if (mResources->hasDisplay(display)) {
+-                     // This is a subsequent hotplug "connected" for a display. This signals a
+-                     // display change and thus the framework may want to reallocate buffers. We
+-                     // need to free all cached handles, since they are holding a strong reference
+-                     // to the underlying buffers.
+-                     cleanDisplayResources(display, mResources, mHal);
+-                     mResources->removeDisplay(display);
++                     // A subsequent hotplug "connected" for a display signals a display
++                     // change. The display's cached handles are NOT dropped here. The
++                     // framework handles the event on its main thread at its next commit
++                     // (SurfaceFlinger::processDisplayHotplugEventsLocked) and destroys the
++                     // display's layers there; until then it can still validate and present
++                     // the display, on another thread, with layers and a client target whose
++                     // buffers the HAL got from these caches. Freeing them now would leave
++                     // the HAL holding freed handles. Each cached handle is instead freed by
++                     // the regular path that first takes it out of the HAL: destroyLayer()
++                     // for a layer's buffers, and a newer buffer in the same slot for the
++                     // client target (the framework's new display sends full handles).
++                 } else {
++                     mResources->addPhysicalDisplay(display);
+                  }
+-                 mResources->addPhysicalDisplay(display);
+              } else if (connected == IComposerCallback::Connection::DISCONNECTED) {
+                  mResources->removeDisplay(display);
+              }
+@@ -284,6 +290,13 @@ class ComposerClientImpl : public Interface {
+ 
+     Return<Error> setClientTargetSlotCount(Display display,
+                                            uint32_t clientTargetSlotCount) override {
++        // A re-connected display keeps its client target cache (see onHotplug), and the
++        // framework's new display object asks for the same slot count again.
++        size_t cacheSize = 0;
++        if (mResources->getDisplayClientTargetCacheSize(display, &cacheSize) == Error::NONE &&
++            cacheSize != 0 && cacheSize == clientTargetSlotCount) {
++            return Error::NONE;
++        }
+         return mResources->setDisplayClientTargetCacheSize(display, clientTargetSlotCount);
+     }
+ 
+diff --git a/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp b/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
+index 375ae52..72f17af 100644
+--- a/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
++++ b/graphics/composer/2.1/utils/hwc2on1adapter/HWC2On1Adapter.cpp
+@@ -2645,7 +2645,17 @@ void HWC2On1Adapter::hwc1Hotplug(int hwc1DisplayId, int connected) {
+             mHwc1DisplayMap.erase(HWC_DISPLAY_EXTERNAL);
+             mDisplays.erase(displayId);
+         } else {
+-            mDisplays[displayId]->populateConfigs();
++            // A connect for the primary display means its configs changed: re-read them.
++            // Not under mStateMutex: Display::validate() and Display::present() hold the
++            // Display's mutex and then take mStateMutex (prepareAllDisplays(),
++            // setAllDisplays()), and the HWC1 module may call this from a thread of its
++            // own, so holding mStateMutex while populateConfigs() takes the Display's mutex
++            // would invert that order against a frame in flight. The primary display is
++            // never erased, and the shared_ptr keeps it alive regardless.
++            std::shared_ptr<Display> display = mDisplays[displayId];
++            lock.unlock();
++            display->populateConfigs();
++            lock.lock();
+         }
+     }
+ 
+diff --git a/graphics/composer/2.4/utils/hal/include/composer-hal/2.4/ComposerClient.h b/graphics/composer/2.4/utils/hal/include/composer-hal/2.4/ComposerClient.h
+index 3464342..fd9a36b 100644
+--- a/graphics/composer/2.4/utils/hal/include/composer-hal/2.4/ComposerClient.h
++++ b/graphics/composer/2.4/utils/hal/include/composer-hal/2.4/ComposerClient.h
+@@ -52,15 +52,13 @@ class ComposerClientImpl : public V2_3::hal::detail::ComposerClientImpl<Interfac
+         void onHotplug(Display display, IComposerCallback::Connection connected) override {
+             if (connected == IComposerCallback::Connection::CONNECTED) {
+                 if (mResources->hasDisplay(display)) {
+-                    // This is a subsequent hotplug "connected" for a display. This signals a
+-                    // display change and thus the framework may want to reallocate buffers. We
+-                    // need to free all cached handles, since they are holding a strong reference
+-                    // to the underlying buffers.
+-                    V2_1::hal::detail::ComposerClientImpl<Interface, Hal>::cleanDisplayResources(
+-                            display, mResources, mHal);
+-                    mResources->removeDisplay(display);
++                    // As in the 2.1 callback, keep the display's cached handles alive
++                    // until SurfaceFlinger processes the reconnect. In-flight frames
++                    // may still reference them; destroyLayer() and client target slot
++                    // replacement release them through the regular paths.
++                } else {
++                    mResources->addPhysicalDisplay(display);
+                 }
+-                mResources->addPhysicalDisplay(display);
+             } else if (connected == IComposerCallback::Connection::DISCONNECTED) {
+                 mResources->removeDisplay(display);
+             }
+-- 
+2.56.0
+

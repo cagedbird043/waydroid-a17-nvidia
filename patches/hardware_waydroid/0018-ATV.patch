@@ -1,0 +1,163 @@
+From fdd4b19bfab26562525cb0766af9abc6e61ad161 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 03:36:32 +0800
+Subject: [PATCH 18/24] =?utf-8?q?=E4=BF=AE=E6=AD=A3=20ATV=20=E4=BB=BB?=
+ =?utf-8?q?=E5=8A=A1=E6=B5=81=E7=BC=93=E5=86=B2=E9=87=8A=E6=94=BE=E4=B8=8E?=
+ =?utf-8?q?=E8=BF=9E=E6=8E=A5=E9=87=8D=E5=BB=BA=E7=9A=84=E7=94=9F=E5=91=BD?=
+ =?utf-8?q?=E5=91=A8=E6=9C=9F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+wl_buffer.release 使用生命周期稳定的 wl_conn 作为 userdata，再按连接和 wl_buffer 查找任务 slot，避免回调引用已被替换的 buffer；重连时清空格式广告集合持有各连接的互斥锁。清理配置查询的未使用局部变量及旧尺寸命令头文件，并处理首个输入序列号处于高半区的情况。
+
+(cherry picked from commit e01586a2c3ad79c8176aeeb3254af84277aa4a98)
+---
+ hwcomposer/gralloc_handler.cpp | 12 ++++++------
+ hwcomposer/hwcomposer.cpp      |  3 +--
+ hwcomposer/wayland-hwc.cpp     | 19 ++++++++-----------
+ hwcomposer/wayland-hwc.h       |  4 +---
+ 4 files changed, 16 insertions(+), 22 deletions(-)
+
+diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
+index 4f55904..e443571 100644
+--- a/hwcomposer/gralloc_handler.cpp
++++ b/hwcomposer/gralloc_handler.cpp
+@@ -73,9 +73,9 @@ namespace {
+ 
+     const wl_buffer_listener buffer_listener {
+         [](void *data, struct wl_buffer *wl_buffer) {
+-            auto *buf = static_cast<buffer *>(data);
+-            if (buf && buf->release_callback)
+-                buf->release_callback(buf->release_data, wl_buffer);
++            auto *conn = static_cast<wl_conn *>(data);
++            if (conn && conn->dpy->task_streams_active.load())
++                task_stream_buffer_release(conn, wl_buffer);
+         }
+     };
+ }
+@@ -113,7 +113,7 @@ std::unique_ptr<buffer> create_shm_wl_buffer(wl_conn *conn, const buffer_metadat
+     }
+     struct wl_shm_pool *pool = wl_shm_create_pool(conn->shm, fd, size);
+     buf->wl_buffer = wl_shm_pool_create_buffer(pool, 0, metadata.width, metadata.height, shm_stride, shm_format);
+-    wl_buffer_add_listener(buf->wl_buffer, &buffer_listener, buf.get());
++    wl_buffer_add_listener(buf->wl_buffer, &buffer_listener, conn);
+     wl_shm_pool_destroy(pool);
+     close(fd);
+ 
+@@ -267,7 +267,7 @@ std::unique_ptr<buffer> create_dmabuf_wl_buffer(wl_conn *conn, const buffer_meta
+ 
+     buf->wl_buffer = zwp_linux_buffer_params_v1_create_immed(params, buf->metadata.width, buf->metadata.height, drm_format, 0);
+     zwp_linux_buffer_params_v1_destroy(params);
+-    wl_buffer_add_listener(buf->wl_buffer, &buffer_listener, buf.get());
++    wl_buffer_add_listener(buf->wl_buffer, &buffer_listener, conn);
+ 
+     return buf;
+ }
+@@ -339,7 +339,7 @@ std::unique_ptr<buffer> create_android_wl_buffer(wl_conn *conn, const buffer_met
+     if (listener)
+         wl_buffer_add_listener(buf->wl_buffer, listener, listener_data);
+     else
+-        wl_buffer_add_listener(buf->wl_buffer, &buffer_listener, buf.get());
++        wl_buffer_add_listener(buf->wl_buffer, &buffer_listener, conn);
+ 
+     return buf;
+ }
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index f63c6f8..be832e1 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -1057,9 +1057,8 @@ static void hwc_register_procs(struct hwc_composer_device_1* dev,
+     pdev->display->procs = procs;
+ }
+ 
+-static int hwc_get_display_configs(struct hwc_composer_device_1* dev,
++static int hwc_get_display_configs(struct hwc_composer_device_1*,
+                                    int disp, uint32_t* configs, size_t* numConfigs) {
+-    auto *pdev = static_cast<waydroid_hwc_composer_device_1 *>(dev);
+     if (*numConfigs == 0) {
+         return 0;
+     }
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index c406721..718cc9f 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -42,8 +42,6 @@
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <sys/sysmacros.h>
+-#include <sys/wait.h>
+-#include <spawn.h>
+ #include <signal.h>
+ #include <time.h>
+ #include <fcntl.h>
+@@ -96,7 +94,7 @@ using ::android::hardware::hidl_string;
+ /* Input serials are local to each Wayland connection. */
+ static void note_input_serial(struct wl_conn *conn, uint32_t serial)
+ {
+-    if (static_cast<int32_t>(serial - conn->last_input_serial) > 0)
++    if (!conn->last_input_serial || static_cast<int32_t>(serial - conn->last_input_serial) > 0)
+         conn->last_input_serial = serial;
+ }
+ 
+@@ -1641,7 +1639,7 @@ deactivate_worker(struct display *display)
+ /* wl_buffer.release for a task-stream slot. Userdata is the connection, not
+  * the slot: a slot (and its window) can be destroyed while the compositor
+  * still holds the buffer, so we look the slot up by wl_buffer instead. */
+-static void
++void
+ task_stream_buffer_release(void *data, struct wl_buffer *wl_buf)
+ {
+     struct wl_conn *conn = (struct wl_conn *)data;
+@@ -1804,10 +1802,6 @@ int post_task_buffer(struct waydroid_hwc_composer_device_1 *pdev, uint32_t taskI
+         } else if (conn->dmabuf) {
+             buf = prime ? create_prime_wl_buffer(conn, md, handle)
+                         : pdev->gralloc_handler.create_buffer(conn, md, handle);
+-            if (buf && !prime) {
+-                buf->release_callback = task_stream_buffer_release;
+-                buf->release_data = conn;
+-            }
+         }
+         if (!buf)
+             return -EINVAL;
+@@ -3954,9 +3948,12 @@ static void wl_conn_reconnect(struct wl_conn *conn) {
+     /* Cached wl_buffers are keyed by gralloc handle, which Android reuses
+      * across the reconnect: a stale hit would attach a freed proxy. */
+     conn->buffer_map.clear();
+-    conn->formats.clear();
+-    conn->modifiers.clear();
+-    conn->nvidia_modifier_formats.clear();
++    {
++        std::lock_guard<std::mutex> lock(conn->formats_mutex);
++        conn->formats.clear();
++        conn->modifiers.clear();
++        conn->nvidia_modifier_formats.clear();
++    }
+     prime_destroy_copier(conn);
+     if (conn->feedback.table)
+         munmap(conn->feedback.table, conn->feedback.table_size);
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index 0fa2f2f..580de58 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -164,9 +164,6 @@ struct buffer {
+     int unused_frames = 0;
+     bool prime = false;
+     void *prime_source = nullptr;
+-    /* Optional task-stream release notification, invoked by the gralloc listener. */
+-    void (*release_callback)(void *, struct wl_buffer *) = nullptr;
+-    void *release_data = nullptr;
+ 
+     ~buffer();
+ };
+@@ -852,6 +849,7 @@ handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
+ 
+ void
+ snapshot_inactive_app_window(struct display *display, struct window *window);
++void task_stream_buffer_release(void *data, struct wl_buffer *wl_buf);
+ void display_resize_start(struct display *display);
+ void display_resize_arm(struct display *display, int width, int height);
+ void display_resize_stop(struct display *display);
+-- 
+2.56.0
+

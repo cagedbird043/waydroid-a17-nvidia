@@ -1,0 +1,58 @@
+From 7683df8fe9bf3684ddb4aae23c39683ff48c3a1e Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 05:53:20 +0800
+Subject: [PATCH 2/9] =?utf-8?q?=E9=97=A8=E7=A6=81=EF=BC=9ACodec2=20?=
+ =?utf-8?q?=E4=BE=9D=E8=B5=96=E9=97=AD=E5=8C=85=E6=94=AF=E6=8C=81=20EROFS?=
+ =?utf-8?q?=20=E7=B3=BB=E7=BB=9F=E9=95=9C=E5=83=8F=EF=BC=8CA16+=20?=
+ =?utf-8?q?=E6=97=A0=20VNDK=20APEX=20=E6=97=B6=E8=A7=86=E4=B8=BA=E7=A9=BA?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ packaging/native/release_gate.py | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/packaging/native/release_gate.py b/packaging/native/release_gate.py
+index a0e02f7..4c51d5f 100644
+--- a/packaging/native/release_gate.py
++++ b/packaging/native/release_gate.py
+@@ -254,6 +254,24 @@ def _dump(image, source, dest):
+     return bool(payload) and _dump_raw(payload, m.group(2), dest)
+ 
+ 
++def _system_ls(native, image, path, required=True):
++    """Names in one directory of the system image (ext4 or EROFS)."""
++    if not _is_erofs(image):
++        try:
++            return set(native.image_ls(str(image), path))
++        except OSError:
++            if required:
++                raise
++            return set()
++    out = subprocess.run(['dump.erofs', f'--path={path}', '--ls', str(image)], capture_output=True, text=True).stdout
++    lines = out.splitlines()
++    start = next((i + 1 for i, l in enumerate(lines) if l.split() == ['NID', 'TYPE', 'FILENAME']), None)
++    names = set() if start is None else {l.split(None, 2)[2] for l in lines[start:] if len(l.split(None, 2)) == 3} - {'.', '..'}
++    if required and not names:
++        raise OSError(f'NVIDIA native mode: {image} has no directory {path}')
++    return names
++
++
+ def extract_runtime(system_img, dest, sub, roots, provided):
+     """Copy the image's linker and the DT_NEEDED closure of `roots` (names) that `provided` (names the
+     payload ships) does not cover into dest. Returns {name: image path}."""
+@@ -524,8 +542,8 @@ def media_case_image(gate, native, vendor_img):
+     if native.XMLGEN_MARK not in xml.read_text():
+         raise RuntimeError(f'{xml} lacks the "{native.XMLGEN_MARK}" header')
+     service = gate.payload / native.MEDIA_SERVICE           # byte-identical to the image's (checked by the caller)
+-    vndk = set(native.image_ls(str(gate.system_img), VNDK_APEX))
+-    system = set(native.image_ls(str(gate.system_img), '/system/lib64'))
++    vndk = _system_ls(native, gate.system_img, VNDK_APEX, required=False)     # Android 16+ ships no VNDK APEX
++    system = _system_ls(native, gate.system_img, '/system/lib64')
+     vendor = set(native.image_ls(str(vendor_img), '/lib64'))
+     closure, missing = {}, []
+     for name in needed(service):
+-- 
+2.56.0
+

@@ -1,0 +1,67 @@
+From cf22f85982419d111c2c3ea6739a284967584f8a Mon Sep 17 00:00:00 2001
+From: nvidia-prolapse <nvidia-prolapse@localhost>
+Date: Fri, 16 Oct 2026 19:55:46 +0300
+Subject: [PATCH 1/8] gbm_mesa: CPU usage does not force LINEAR on GPU render
+ targets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Applies to https://github.com/waydroid/android_external_minigbm
+16844babfbd83d7c206ca22256257cbf26ca7de1 ("gralloc: Handle PixelFormat::R_8").
+
+gbm_mesa_bo_create() set force_linear for every buffer with BO_USE_SW_MASK.
+A buffer the GPU renders into (BO_USE_RENDERING / BO_USE_FRONT_RENDERING)
+that is also CPU-mapped then becomes LINEAR, which a GPU may not be able to
+render to (NVIDIA's EGL imports LINEAR dma-bufs external-only). Keep
+needs_map_stride for every CPU-mapped buffer, but force LINEAR only when the
+GPU does not render into it; the wrapper's map/unmap provide the linear CPU
+view of a tiled buffer and out_map_stride its pitch. Spoofed formats (the R8
+carrier) stay LINEAR as before.
+
+适配 ATV 的用量标志消耗与分配参数顺序：保留 scanout/cursor、相机及 RPI4/VAAPI 对齐逻辑，CPU 渲染目标使用暂存映射，并接受前缓冲渲染标志。
+
+(cherry picked from commit 233f85da2117df17b16a06e3bb418cf657a628fb)
+---
+ gbm_mesa_driver/gbm_mesa_internals.cpp | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/gbm_mesa_driver/gbm_mesa_internals.cpp b/gbm_mesa_driver/gbm_mesa_internals.cpp
+index 649bca7..34916b2 100644
+--- a/gbm_mesa_driver/gbm_mesa_internals.cpp
++++ b/gbm_mesa_driver/gbm_mesa_internals.cpp
+@@ -310,7 +310,9 @@ int gbm_mesa_bo_create2(struct bo *bo, uint32_t width, uint32_t height, uint32_t
+ 
+ 	auto wr = drv->wrapper;
+ 
+-	bool sw_mask = unmask64(&use_flags, BO_USE_SW_MASK);
++	/* CPU mappings of render targets use the wrapper's linear staging view. */
++	const bool sw_access = unmask64(&use_flags, BO_USE_SW_MASK);
++	const bool gpu_render = (use_flags & (BO_USE_RENDERING | BO_USE_FRONT_RENDERING)) != 0;
+ 
+ 	struct alloc_args alloc_args = {
+ 		.gbm = drv->gbm_dev,
+@@ -318,8 +320,8 @@ int gbm_mesa_bo_create2(struct bo *bo, uint32_t width, uint32_t height, uint32_t
+ 		.height = height,
+ 		.drm_format = wr->get_gbm_format(format) ? format : 0,
+ 		.use_scanout = unmask64(&use_flags, BO_USE_SCANOUT | BO_USE_CURSOR),
+-		.force_linear = sw_mask,
+-		.needs_map_stride = sw_mask,
++		.force_linear = sw_access && !gpu_render,
++		.needs_map_stride = sw_access,
+ 	};
+ 
+ 	/* Alignment for RPI4 CSI camera. Since we do not care about other cameras, keep this
+@@ -377,7 +379,8 @@ int gbm_mesa_bo_create2(struct bo *bo, uint32_t width, uint32_t height, uint32_t
+ 	}
+ 
+ 	/* GBM API will always return a buffer that can be used by the GPU */
+-	unmask64(&use_flags, BO_USE_CURSOR | BO_USE_TEXTURE | BO_USE_RENDERING);
++	unmask64(&use_flags, BO_USE_CURSOR | BO_USE_TEXTURE | BO_USE_RENDERING |
++			     BO_USE_FRONT_RENDERING);
+ 
+ 	if (use_flags != 0) {
+ 		char use_str[128] = { 0 };
+-- 
+2.56.0
+

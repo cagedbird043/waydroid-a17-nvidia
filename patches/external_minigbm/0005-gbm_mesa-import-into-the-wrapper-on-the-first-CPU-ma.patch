@@ -1,0 +1,100 @@
+From 3992306db5892ad2187f40b0486d0886669e1487 Mon Sep 17 00:00:00 2001
+From: nvidia-prolapse <nvidia-prolapse@localhost>
+Date: Fri, 16 Oct 2026 19:55:46 +0300
+Subject: [PATCH 5/8] gbm_mesa: import into the wrapper on the first CPU map,
+ whatever the allocation usage
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Applies to https://github.com/waydroid/android_external_minigbm
+16844babfbd83d7c206ca22256257cbf26ca7de1 ("gralloc: Handle PixelFormat::R_8"),
+after 0001..0004.
+
+gbm_mesa_bo_import() created the wrapper bo (the object every CPU map goes
+through) only when the handle's use_flags had a SW bit. Those flags are the
+usage the buffer was *allocated* with. A buffer allocated for GPU or codec use
+only, such as a hardware decoder's NV12/P010 output block (usage
+VIDEO_DECODER), therefore had no gbm_bo in an importing process, and the
+first CPU lock there aborted on assert(priv->gbm_bo != nullptr) in
+gbm_mesa_bo_map(). CCodec does exactly that in ByteBuffer mode: it copies each
+output GraphicBlock through C2AllocationGralloc::map -> lockYCbCr ->
+IMapper::lock.
+
+Gralloc does not tie a lock's CPU usage to the allocation usage (minigbm's
+cros_gralloc lock path has no such check either), so the import is now
+driven by the map itself: the first map of a bo in a process imports it,
+with the layout that drv_bo_import() recorded in bo->meta (the import-time
+path ran before drv_bo_import filled in strides and total_size, so the R8
+carrier was imported with width 0). drv_bo_map() holds drv->mappings_lock
+around bo_map, which serializes the lazy import. A process that never maps
+a buffer still never loads the wrapper for it. A failed driver setup or
+import is logged with the buffer's layout and returns MAP_FAILED (lock
+fails with an error) instead of an assert or a NULL dereference.
+
+ATV 已实现首次 CPU map 时导入，故复用现有 gbm_mesa_gbm_bo_import 与 4096 宽 R8 载体逻辑，不添加重复导入函数；移除分配 SW usage 对 map/unmap 的限制并保留当前无 plane 参数的接口及空驱动检查。
+
+(cherry picked from commit 48a7f69a3a0d4224d0ed94590aa10f7089e8cfee)
+---
+ gbm_mesa_driver/gbm_mesa_internals.cpp | 25 +++++++++++--------------
+ 1 file changed, 11 insertions(+), 14 deletions(-)
+
+diff --git a/gbm_mesa_driver/gbm_mesa_internals.cpp b/gbm_mesa_driver/gbm_mesa_internals.cpp
+index bce5e63..d578936 100644
+--- a/gbm_mesa_driver/gbm_mesa_internals.cpp
++++ b/gbm_mesa_driver/gbm_mesa_internals.cpp
+@@ -33,6 +33,7 @@ extern "C" {
+ #include <cutils/properties.h>
+ #include <dlfcn.h>
+ #include <errno.h>
++#include <inttypes.h>
+ #include <fcntl.h>
+ #include <functional>
+ #include <gbm.h>
+@@ -575,22 +576,22 @@ int gbm_mesa_bo_get_plane_fd(struct bo *bo, size_t plane)
+ 
+ void *gbm_mesa_bo_map(struct bo *bo, struct vma *vma, uint32_t map_flags)
+ {
+-	if (!(bo->meta.use_flags & BO_USE_SW_MASK)) {
+-		drv_loge("Can't map buffer without BO_USE_SW_MASK");
+-		return MAP_FAILED;
+-	}
+-
+-	auto priv = (GbmMesaBoPriv *)bo->priv;
+-	if (!priv->gbm_bo) {
+-		if (gbm_mesa_gbm_bo_import(bo) != 0)
+-			return MAP_FAILED;
+-	}
+ 
+ 	auto drv = gbm_mesa_get_or_init_driver(bo->drv, true);
++	if (drv == nullptr) {
++		drv_loge("Failed to init gbm driver: cannot map %.4s %ux%u",
++			 (const char *)&bo->meta.format, bo->meta.width, bo->meta.height);
++		return MAP_FAILED;
++	}
+ 	auto wr = drv->wrapper;
+ 
+ 	vma->length = bo->meta.total_size;
+ 
++	/* CPU lock access is independent of the usage recorded at allocation. */
++	auto priv = (GbmMesaBoPriv *)bo->priv;
++	if (!priv->gbm_bo && gbm_mesa_gbm_bo_import(bo) != 0)
++		return MAP_FAILED;
++
+ 	void *buf = MAP_FAILED;
+ 
+ 	uint32_t s_format = bo->meta.format;
+@@ -614,10 +615,6 @@ void *gbm_mesa_bo_map(struct bo *bo, struct vma *vma, uint32_t map_flags)
+ 
+ int gbm_mesa_bo_unmap(struct bo *bo, struct vma *vma)
+ {
+-	if (!(bo->meta.use_flags & BO_USE_SW_MASK)) {
+-		drv_loge("Can't unmap buffer without BO_USE_SW_MASK");
+-		return -EINVAL;
+-	}
+ 
+ 	auto drv = gbm_mesa_get_or_init_driver(bo->drv, true);
+ 	auto wr = drv->wrapper;
+-- 
+2.56.0
+

@@ -1,0 +1,241 @@
+From cdd0db86a470b1911b5a136ce8c98210a425ed88 Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Mon, 12 Oct 2026 00:54:33 +0300
+Subject: [PATCH 04/24] hwcomposer: keep the wl_buffer cache across geometry
+ changes and hotplug
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+What:
+- buffer_map is no longer cleared on HWC_GEOMETRY_CHANGED (compositing modes)
+  nor after a hotplug. prune_stale_cached_buffers() runs at the end of every
+  hwc_set() instead and destroys a cached wl_buffer once no layer has used it
+  for 8 consecutive frames (a window's last_layer_buffer is exempt).
+- buffer_metadata gains `ident`, the inode of the handle's first dma-buf fd
+  (cros and gbm grallocs), and the cache hit test compares it. Erasing a
+  cache entry also clears any window->last_layer_buffer pointing at it.
+
+Why: clearing the map destroyed every wl_buffer (and the compositor's import
+of it) and re-imported all of them with zwp_linux_buffer_params.create_immed
+on the next frame: on every geometry change, which SurfaceFlinger flags on
+window open/close/resize and splash->activity, and on every hotplug (window
+create/destroy in multi-window mode). The source ties these import bursts to
+NVIDIA Xid 69 (Class 0xC197, Offset 0x19D0) with a Venus guest: 4 Xid in 20
+app switches before, 0 in 3x20 after (their measurement, not reproduced here).
+The prune bounds memory: the cache holds at most the buffers used in the last
+9 frames plus one per window, so no dma-buf outlives its last use by more
+than 8 frames.
+Keeping entries longer makes the old key weakness matter: the map is keyed
+by the buffer_handle_t pointer, which the mapper reuses for a new buffer
+after freeing an old one, and the old check (size/stride/format, upstream
+FIXME) cannot tell two same-sized buffers apart. A dma-buf inode is unique
+for the kernel's lifetime, so a hit is now the same memory by construction.
+
+Source: QuinOvaX, quinovax/waydroid-nvidia
+  main f2c2f39 (prune_stale_cached_buffers, unused_frames, no clear on
+  HWC_GEOMETRY_CHANGED):
+  https://github.com/quinovax/waydroid-nvidia/commit/f2c2f3924451b84b4f23a0190121953322645dc7
+  dev ad04e0a (no clear on hotplug):
+  https://github.com/quinovax/waydroid-nvidia/commit/ad04e0a5c49e3bb48382fa535a6952aaff67b8a6
+Licence: Apache-2.0 (android_hardware_waydroid; the fork's patches/hwcomposer/
+inherit it).
+
+Deviations from the source:
+- `ident` (dma-buf inode) in the cache hit test and erase_cached_buffer()
+  are ours; the source kept the size/format-only check.
+- The hotplug path does not null every window's last_layer_buffer (the
+  source did so only because it used to destroy them right after).
+- The source's per-200 "new wl_buffer" info log is not taken.
+
+保留 ATV 的 shared_ptr 缓冲所有权、诊断与重连流程；仅在 ctl 的缓存中按帧老化，已附着或快照持有的缓冲继续保活，元数据追加 dma-buf inode 标识。
+
+(cherry picked from commit f4d0ff882275d5ae106d9b9e4023f0527b1c5ceb)
+---
+ hwcomposer/gralloc_handler.cpp | 22 +++++++++++++++--
+ hwcomposer/hwcomposer.cpp      | 44 ++++++++++++++++++++++++++++++----
+ hwcomposer/wayland-hwc.h       | 10 +++++++-
+ 3 files changed, 68 insertions(+), 8 deletions(-)
+
+diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
+index 54075b5..8743dd1 100644
+--- a/hwcomposer/gralloc_handler.cpp
++++ b/hwcomposer/gralloc_handler.cpp
+@@ -34,6 +34,7 @@
+ #include <string.h>
+ 
+ #include <linux/memfd.h>
++#include <sys/stat.h>
+ #include <sys/syscall.h>
+ #include <drm_fourcc.h>
+ #include <wayland-client.h>
+@@ -336,23 +337,40 @@ buffer_metadata get_buffer_metadata_generic(display *display, hwc_layer_1_t *lay
+ 
+     return {height, width, pixel_stride, format};
+ }
++/* inode of a dma-buf fd: unique per dma-buf for the kernel's lifetime (see buffer_metadata::ident) */
++uint64_t dmabuf_ident(int fd) {
++    struct stat st;
++    if (fd < 0 || fstat(fd, &st) != 0) {
++        static int failures = 0;
++        if ((failures++ % 500) == 0)
++            ALOGE("cannot identify buffer: fstat(dma-buf fd %d) failed: %s (%d times); its cached "
++                  "wl_buffer may be reused for another buffer", fd, fd < 0 ? "no fd" : strerror(errno),
++                  failures);
++        return 0;
++    }
++    return (uint64_t)st.st_ino;
++}
+ buffer_metadata get_buffer_metadata_gbm(display *, hwc_layer_1_t *layer, size_t) {
+     auto handle = reinterpret_cast<const gralloc_handle_t *>(layer->handle);
+-    return {
++    buffer_metadata m {
+             handle->height,
+             handle->width,
+             handle->stride,
+             handle->format
+     };
++    m.ident = dmabuf_ident(handle->prime_fd);
++    return m;
+ }
+ buffer_metadata get_buffer_metadata_cros(display *, hwc_layer_1_t *layer, size_t) {
+     auto handle = reinterpret_cast<const cros_gralloc_handle *>(layer->handle);
+-    return {
++    buffer_metadata m {
+             handle->height,
+             handle->width,
+             handle->pixel_stride,
+             static_cast<uint32_t>(handle->droid_format)
+     };
++    m.ident = dmabuf_ident(handle->fds[0]);
++    return m;
+ }
+ 
+ std::unique_ptr<buffer> create_buffer_generic(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle) {
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index a7cb167..28b3f3c 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -91,9 +91,7 @@ namespace {
+     std::shared_ptr<buffer> find_cached_buffer(waydroid_hwc_composer_device_1 *pdev, const buffer_metadata &metadata, buffer_handle_t handle) {
+         auto it = pdev->display->ctl->buffer_map.find(handle);
+         if (it != pdev->display->ctl->buffer_map.end()) {
+-            /* FIXME We can't be sure that our cached buffer actually refers to the buffer corresponding to the given handle
+-             * It's possible that a new buffer got the same handle after the old one was destroyed
+-             * At least check for the metadata to match. This way this situation is hopefully unlikely */
++            /* Metadata includes dma-buf inode identity to detect reused handles. */
+             if (it->second->metadata != metadata) {
+                 pdev->display->ctl->buffer_map.erase(it);
+             } else {
+@@ -156,6 +154,7 @@ namespace {
+                       creates, pdev->display->ctl->buffer_map.size());
+         }
+ 
++        buf->unused_frames = 0;
+         if (buf->isShm)
+             gralloc_handler.update_shm_buffer(pdev->display, buf.get());
+         return buf;
+@@ -793,6 +792,39 @@ static bool frame_has_content(waydroid_hwc_composer_device_1 *pdev, hwc_display_
+     return false;
+ }
+ 
++/* Bounds the wl_buffer cache without flushing it: a buffer no layer has used for
++ * kMaxUnusedFrames consecutive hwc_set() calls is destroyed (its compositor-side import with
++ * it). An app's BufferQueue ring (2-3 buffers, all seen within a few frames) stays cached; a
++ * closed app's or a resized surface's buffers go after kMaxUnusedFrames frames. A window's
++ * last_layer_buffer is kept (snapshot_inactive_app_window). So the cache never holds more than
++ * the buffers used in the last kMaxUnusedFrames+1 frames plus one per window. Called with
++ * display->windowsMutex held. */
++static void prune_stale_cached_buffers(waydroid_hwc_composer_device_1 *pdev,
++                                       hwc_display_contents_1_t *contents) {
++    auto &map = pdev->display->ctl->buffer_map;
++    for (auto &kv : map)
++        kv.second->unused_frames++;
++    for (size_t l = 0; l < contents->numHwLayers; l++) {
++        auto *h = contents->hwLayers[l].handle;
++        if (!h)
++            continue;
++        auto it = map.find(h);
++        if (it != map.end())
++            it->second->unused_frames = 0;
++    }
++    for (auto &[id, window] : pdev->display->windows) {
++        if (window->last_layer_buffer)
++            window->last_layer_buffer->unused_frames = 0;
++    }
++    constexpr int kMaxUnusedFrames = 8;
++    for (auto it = map.begin(); it != map.end(); ) {
++        if (it->second->unused_frames > kMaxUnusedFrames)
++            it = map.erase(it);
++        else
++            ++it;
++    }
++}
++
+ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+                    hwc_display_contents_1_t** displays) {
+     if (HWC_DISPLAY_PRIMARY >= numDisplays || !displays)
+@@ -882,7 +914,7 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+             ALOGI("geometry changed #%u with same layer set: %s (map=%zu)",
+                   geom_count, names.c_str(), pdev->display->ctl->buffer_map.size());
+         }
+-        pdev->display->ctl->buffer_map.clear();
++
+     }
+ 
+     auto& mode = pdev->selected_mode;
+@@ -921,6 +953,7 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+     }
+ 
+     mode->post_processing(pdev, contents);
++    prune_stale_cached_buffers(pdev, contents);
+ 
+     for (auto& [key, window] : pdev->display->windows) {
+         if (window->input_region) {
+@@ -937,7 +970,8 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+ 
+     if (pdev->display->needHotplug && pdev->procs && pdev->procs->hotplug) {
+         pdev->procs->hotplug(pdev->procs, 0, 1);
+-        pdev->display->ctl->buffer_map.clear();
++        /* No buffer_map.clear(): the buffers stay valid across a hotplug, and
++         * prune_stale_cached_buffers() drops the ones that stop being used. */
+         pdev->display->needHotplug = false;
+     }
+     return 0;
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index 99641c3..9c97a4b 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -129,13 +129,20 @@ struct buffer_metadata {
+      * (opaque app windows routinely carry undefined alpha, e.g. games
+      * leave the sky at a=0 — SF ignores it, the compositor must too). */
+     bool opaque{false};
++    /* Identity of the memory behind the handle: the inode of its first dma-buf fd (dma-buf
++     * inode numbers are unique and never reused while the kernel runs), 0 where the gralloc
++     * has no dma-buf. buffer_map is keyed by the buffer_handle_t pointer, which the mapper
++     * reuses for a new buffer after freeing an old one; without this a new buffer of the same
++     * size and format would be shown through the old buffer's cached wl_buffer. */
++    uint64_t ident{0};
+ };
+ constexpr bool operator==(const buffer_metadata &lhs, const buffer_metadata &rhs) {
+     return lhs.height == rhs.height
+            && lhs.width == rhs.width
+            && lhs.pixel_stride == rhs.pixel_stride
+            && lhs.format == rhs.format
+-           && lhs.opaque == rhs.opaque;
++           && lhs.opaque == rhs.opaque
++           && lhs.ident == rhs.ident;
+ }
+ constexpr bool operator!=(const buffer_metadata &lhs, const buffer_metadata &rhs) {
+     return !(lhs == rhs);
+@@ -154,6 +161,7 @@ struct buffer {
+     bool isShm = false;
+     void *shm_data = nullptr;
+     int size = 0;
++    int unused_frames = 0;
+ 
+     ~buffer();
+ };
+-- 
+2.56.0
+

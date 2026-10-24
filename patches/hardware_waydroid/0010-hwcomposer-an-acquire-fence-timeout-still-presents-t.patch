@@ -1,0 +1,95 @@
+From 2202a50165b34dc7d90c3234a489509d4087925e Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Mon, 12 Oct 2026 01:00:25 +0300
+Subject: [PATCH 10/24] hwcomposer: an acquire-fence timeout still presents the
+ layer completely
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+What: apply_hwc_layer_to_surface_context() waits up to 1000 ms (was 100 ms)
+for a layer's acquire fence before wl_surface_commit(). On a timeout or a
+wait error it logs at error level and returns success, so the caller still
+positions the surface and requests wp_presentation feedback. The fence fd is
+set to -1 after it is closed.
+
+Why: on a timeout the old code committed the buffer anyway but returned -1,
+so apply_hwc_layer_to_window() skipped set_position() and the presentation
+feedback for a buffer that was already on screen: the source saw
+WindowManager stay in DRAW_PENDING (black window) when a new client's first
+frame took more than 100 ms. 100 ms is also shorter than legitimate first
+frames (shader compiles). The commit must still wait: NVIDIA takes no part in
+dma-buf implicit sync, so the compositor would otherwise sample unfinished
+content.
+
+Source: QuinOvaX, quinovax/waydroid-nvidia main f2c2f39
+  https://github.com/quinovax/waydroid-nvidia/commit/f2c2f3924451b84b4f23a0190121953322645dc7
+Licence: Apache-2.0 (android_hardware_waydroid; the fork's patches/hwcomposer/
+inherit it).
+Deviation: the wait stays where it was (after the surface state, before the
+commit, which is what matters); the source moved it before attach together
+with its crop/dest clipping rework (prepare_layer_geom, multi-window frame
+origins), which is not taken.
+
+函数保留 ATV 的 shared_ptr 缓冲参数，移植 1 秒 fence 等待与超时后仍完成呈现的语义。
+
+(cherry picked from commit 7a3d13f4840ef37b4687a6f04e36bac64fa614f6)
+---
+ hwcomposer/hwcomposer.cpp | 25 +++++++++++++++++--------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index 230d9ca..02e3456 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -539,7 +539,7 @@ static void apply_surface_damage(hwc_layer_1 *hwc_layer, surface_context &surfac
+ }
+ 
+ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t hwc_layer_index, surface_context &surface_context, std::shared_ptr<buffer> buf = nullptr) {
+-    constexpr int acquireWarningMS = 100;
++    constexpr int acquireTimeoutMS = 1000;
+     int res = -1;
+ 
+     if (!buf) {
+@@ -584,22 +584,31 @@ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pd
+         surface_context.set_buffer_scale(pdev->display->scale);
+     }
+ 
+-    // TODO: Implement explicit synchronization
++    /* The compositor does not wait for the producer (NVIDIA takes no part in dma-buf implicit
++     * sync), so the commit must wait for the acquire fence. A fence that has not signalled after
++     * acquireTimeoutMS (a GPU hang or a pathological frame) is reported at error level and the
++     * frame is presented anyway: blocking the composer longer would freeze the whole display,
++     * and failing the layer used to skip set_position() and the wp_presentation feedback of an
++     * already committed buffer (window stuck in DRAW_PENDING). */
+     if (hwc_layer->acquireFenceFd != -1) {
+-        res = sync_wait(hwc_layer->acquireFenceFd, acquireWarningMS);
+-        if (res < 0 && errno == ETIME) {
+-            ALOGE("hwcomposer waited on fence %d for %d ms", hwc_layer->acquireFenceFd,
+-                  acquireWarningMS);
++        if (sync_wait(hwc_layer->acquireFenceFd, acquireTimeoutMS) < 0) {
++            if (errno == ETIME)
++                ALOGE("acquire fence %d of layer %zu not signalled after %d ms; presenting "
++                      "the frame anyway", hwc_layer->acquireFenceFd, hwc_layer_index,
++                      acquireTimeoutMS);
++            else
++                ALOGE("waiting on acquire fence %d of layer %zu failed: %s; presenting the frame",
++                      hwc_layer->acquireFenceFd, hwc_layer_index, strerror(errno));
+         }
+-    } else {
+-        res = 0;
+     }
++    res = 0;
+ 
+     wl_surface_commit(surface_context.surface);
+ 
+ out:
+     if (hwc_layer->acquireFenceFd != -1) {
+         close(hwc_layer->acquireFenceFd);
++        hwc_layer->acquireFenceFd = -1;
+     }
+     return res;
+ }
+-- 
+2.56.0
+

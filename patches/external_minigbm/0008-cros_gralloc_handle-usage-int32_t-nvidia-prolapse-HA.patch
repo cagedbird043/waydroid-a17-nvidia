@@ -1,0 +1,34 @@
+From 02cce4657d94c0751898d4b14a2910b4f16a025b Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 06:04:07 +0800
+Subject: [PATCH 8/8] =?utf-8?q?cros=5Fgralloc=5Fhandle=EF=BC=9Ausage=20?=
+ =?utf-8?q?=E6=81=A2=E5=A4=8D=E4=B8=BA=20int32=5Ft=EF=BC=8C=E4=BF=9D?=
+ =?utf-8?q?=E6=8C=81=20nvidia-prolapse=20HAL=20=E5=9B=BA=E5=AE=9A=E7=9A=84?=
+ =?utf-8?q?=2035=20int=20=E5=8F=A5=E6=9F=84=E5=B8=83=E5=B1=80?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+ATV 的 A17 版本把 usage 加宽为 int64_t，句柄变成 36 个 int，预编译的 vulkan.nvidia
+拒绝导入（numInts 34 + 2 fds != 35），surfaceflinger 因此无法创建纹理而中止。
+句柄中的 usage 只用于判断低位的 SW 读写掩码。
+---
+ cros_gralloc/cros_gralloc_handle.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/cros_gralloc/cros_gralloc_handle.h b/cros_gralloc/cros_gralloc_handle.h
+index 167972e..d009521 100644
+--- a/cros_gralloc/cros_gralloc_handle.h
++++ b/cros_gralloc/cros_gralloc_handle.h
+@@ -36,7 +36,7 @@ struct cros_gralloc_handle : public native_handle_t {
+ 	uint32_t magic;
+ 	uint32_t pixel_stride;
+ 	int32_t droid_format;
+-	int64_t usage; /* Android usage. */
++	int32_t usage; /* Android usage; 32 bits keeps the 35-int handle layout the nvidia-prolapse HAL pins. */
+ 	uint32_t num_planes;
+ 	uint64_t reserved_region_size;
+ 	uint64_t total_size; /* Total allocation size */
+-- 
+2.56.0
+

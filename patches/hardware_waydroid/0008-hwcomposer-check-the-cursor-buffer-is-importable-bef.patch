@@ -1,0 +1,62 @@
+From 561a0b97ecaca8059185fdf07fbdb1c5a491e6a0 Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Mon, 12 Oct 2026 00:58:18 +0300
+Subject: [PATCH 08/24] hwcomposer: check the cursor buffer is importable
+ before attaching it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+What: cursor_handler::create_buffer() runs displayable_buffer() and copies an
+unimportable cursor buffer into wl_shm (the path persist.waydroid.
+cursor_force_shm already uses) instead of attaching its dma-buf.
+
+Why: get_wl_buffer() skips its displayable_buffer() gate for
+HWC_IS_CURSOR_LAYER and hands cursor layers to the cursor handler, which
+attached the dma-buf unconditionally. Android's pointer buffers are small and
+CPU-written; when one is LINEAR and the compositor imports that format through
+NVIDIA's EGL, the attach is a fatal zwp_linux_buffer_params error (source:
+"attach dmabuf: 25x32 ... mod 0x0", then wl_display error 7). With the LINEAR
+gate (earlier patch) this check is what keeps the cursor path consistent with
+every other layer.
+
+Source: QuinOvaX, quinovax/waydroid-nvidia dev ad04e0a
+  https://github.com/quinovax/waydroid-nvidia/commit/ad04e0a5c49e3bb48382fa535a6952aaff67b8a6
+Licence: Apache-2.0 (android_hardware_waydroid; the fork's patches/hwcomposer/
+inherit it).
+
+Deviation from the source: none in behaviour; the fake_touch/mouse_as_touch
+cursor hunks of the same commit are input features and not taken.
+
+游标导入检查和 wl_shm 回退使用 ctl 连接；保留 ATV 已有的游标 fence 处理。
+
+(cherry picked from commit d4ed688aff667febd326c75b83f93e4672a058eb)
+---
+ hwcomposer/hwcomposer.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index 951801e..c1a32b2 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -1345,6 +1345,17 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
+ }
+ 
+ std::unique_ptr<buffer> cursor_handler::create_buffer(waydroid_hwc_composer_device_1 *pdev, const buffer_metadata& metadata, hwc_layer_1 *hwc_layer) {
++    /* get_wl_buffer() sends cursor layers here without its displayable_buffer() gate, so the
++     * same admission check is made here: a cursor buffer the compositor cannot import (LINEAR on
++     * an NVIDIA-EGL compositor) would be a fatal zwp_linux_buffer_params error. It is copied
++     * into wl_shm instead, the path cursor_force_shm already uses. */
++    if (hwc_layer->handle
++        && !pdev->gralloc_handler.displayable_buffer(pdev->display->ctl.get(), hwc_layer->handle)) {
++        static int count = 0;
++        if ((count++ % 500) == 0)
++            ALOGW("cursor buffer not importable by the compositor; using wl_shm (%d times)", count);
++        return create_shm_wl_buffer(pdev->display->ctl.get(), metadata, hwc_layer->handle);
++    }
+     return pdev->gralloc_handler.create_buffer(pdev->display->ctl.get(), metadata, hwc_layer->handle);
+ };
+ 
+-- 
+2.56.0
+

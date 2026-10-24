@@ -1,0 +1,44 @@
+From bfe5acbeb0fae6ea6b0a4d5aaa53f618ee4ee5b8 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 05:41:47 +0800
+Subject: [PATCH 19/24] =?utf-8?q?hwcomposer=EF=BC=9AA17=20=E7=9A=84=20cros?=
+ =?utf-8?q?=5Fgralloc=5Fhandle=20usage=20=E4=B8=BA=20int64=EF=BC=8C?=
+ =?utf-8?q?=E6=97=A5=E5=BF=97=E6=A0=BC=E5=BC=8F=E6=94=B9=E7=94=A8=20%llx?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hwcomposer/gralloc_handler.cpp | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
+index e443571..220e79f 100644
+--- a/hwcomposer/gralloc_handler.cpp
++++ b/hwcomposer/gralloc_handler.cpp
+@@ -431,18 +431,18 @@ std::unique_ptr<buffer> create_buffer_cros(wl_conn *conn, const buffer_metadata&
+     for (unsigned i = 0; i < n; i++)
+         planes[i] = { cros_handle->fds[i], cros_handle->offsets[i], cros_handle->strides[i] };
+     if (n == 1)
+-        ALOGI("attach dmabuf: %ux%u fmt 0x%x stride %u mod 0x%llx usage 0x%x",
++        ALOGI("attach dmabuf: %ux%u fmt 0x%x stride %u mod 0x%llx usage 0x%llx",
+               metadata.width, metadata.height, cros_handle->format,
+               cros_handle->strides[0],
+               (unsigned long long)cros_handle->format_modifier,
+-              cros_handle->usage);
++              (unsigned long long)cros_handle->usage);
+     else
+         ALOGI("attach dmabuf: %ux%u fmt 0x%x planes %u (offset/stride %u/%u, %u/%u, %u/%u) "
+-              "mod 0x%llx usage 0x%x",
++              "mod 0x%llx usage 0x%llx",
+               metadata.width, metadata.height, cros_handle->format, n,
+               planes[0].offset, planes[0].stride, planes[1].offset, planes[1].stride,
+               n > 2 ? planes[2].offset : 0, n > 2 ? planes[2].stride : 0,
+-              (unsigned long long)cros_handle->format_modifier, cros_handle->usage);
++              (unsigned long long)cros_handle->format_modifier, (unsigned long long)cros_handle->usage);
+     return create_dmabuf_wl_buffer(conn, metadata, planes, n, cros_handle->format, cros_handle->format_modifier, handle);
+ }
+ std::unique_ptr<buffer> create_buffer_android(wl_conn *conn, const buffer_metadata& metadata, buffer_handle_t handle) {
+-- 
+2.56.0
+

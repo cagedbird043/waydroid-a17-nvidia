@@ -1,0 +1,308 @@
+From 379ec63f522fe9bb58186b42c64c364f3b2ff422 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 14:55:23 +0800
+Subject: [PATCH 23/24] =?utf-8?q?hwcomposer=EF=BC=9A=E5=A4=9A=E7=AA=97?=
+ =?utf-8?q?=E5=8F=A3=E4=B8=8B=20show-full-ui=20=E6=89=93=E5=BC=80=E5=B8=A6?=
+ =?utf-8?q?=20KDE=20=E8=BE=B9=E6=A1=86=E7=9A=84=20Android=20=E6=A1=8C?=
+ =?utf-8?q?=E9=9D=A2?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+- 桌面窗口请求服务端装饰，按 KDE 给的尺寸调整 Android 显示，可拖动、缩放、最大化
+- 桌面打开时所有任务都在桌面里，从主机启动的应用也留在桌面并把桌面提到前面
+- 关闭桌面不再清空最近任务：应用各自回到卡片，大小和位置恢复到打开桌面前
+- 显示尺寸切换未生效前不采样任务内容区，避免卡片按旧布局放置
+- 有 "Task=<id>" 图层的任务视为可见，桌面中非焦点任务的画面不再丢失
+---
+ hwcomposer/hwcomposer.cpp          | 16 ++++++
+ hwcomposer/modes/multi-window.cpp  | 14 ++++++
+ hwcomposer/modes/waydroid_mode.cpp | 21 +++++---
+ hwcomposer/wayland-hwc.cpp         | 78 ++++++++++++++++++++++++++----
+ hwcomposer/wayland-hwc.h           |  8 +++
+ 5 files changed, 121 insertions(+), 16 deletions(-)
+
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index e101723..92b21ea 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -258,6 +258,22 @@ namespace {
+             }
+         }
+ 
++        /* While the desktop is open an app the host launches belongs in it:
++         * the system service switched to that app's card, so switch back and
++         * bring the desktop up instead. Closing the desktop drops its window
++         * before naming an app, so that switch is left alone. */
++        if (pdev->multi_windows && pdev->display->freeform
++                && active_apps != "none" && active_apps != "Waydroid") {
++            std::scoped_lock lock(pdev->display->windowsMutex);
++            auto desktop = pdev->display->windows.find("Waydroid");
++            if (desktop != pdev->display->windows.end()) {
++                ALOGI("desktop open: %s stays in it", active_apps.c_str());
++                property_set("waydroid.active_apps", "Waydroid");
++                request_window_activation(desktop->second.get());
++                active_apps = "Waydroid";
++            }
++        }
++
+         /*
+          * In prop "persist.waydroid.multi_windows" we detect HWC let SF render layers
+          * And just show the target client layer (single windows mode) or
+diff --git a/hwcomposer/modes/multi-window.cpp b/hwcomposer/modes/multi-window.cpp
+index e33953d..4337d89 100644
+--- a/hwcomposer/modes/multi-window.cpp
++++ b/hwcomposer/modes/multi-window.cpp
+@@ -128,8 +128,22 @@ void multi_window_mode::observe_freeform(waydroid_hwc_composer_device_1 *pdev,
+                                          hwc_display_contents_1_t *contents) {
+     auto *display = pdev->display;
+     static const std::string kCaption = "Caption of Task=";
++    const int32_t disp_w = floor(display->width * display->scale);
+     const int32_t disp_h = floor(display->height * display->scale);
+     std::map<std::string, hwc_rect_t> captions, extents;
++    /* Right after a display size change (the desktop closing) SurfaceFlinger
++     * still lays tasks out for the old size, and WM moves them all once the
++     * reconnect lands: an area read now, and a card placed after it, would be
++     * undone at once. The client target spans the display it renders for. */
++    task_content.clear();
++    for (size_t i = 0; i < contents->numHwLayers; ++i) {
++        const hwc_rect_t &f = contents->hwLayers[i].displayFrame;
++        if (contents->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET
++                && (f.right - f.left != disp_w || f.bottom - f.top != disp_h)) {
++            display->want_frame.store(true);
++            return;
++        }
++    }
+     for (size_t i = 0; i < contents->numHwLayers; ++i) {
+         const hwc_layer_1 &layer = contents->hwLayers[i];
+         if (layer.compositionType == HWC_FRAMEBUFFER_TARGET)
+diff --git a/hwcomposer/modes/waydroid_mode.cpp b/hwcomposer/modes/waydroid_mode.cpp
+index f7ebce4..b0f1fed 100644
+--- a/hwcomposer/modes/waydroid_mode.cpp
++++ b/hwcomposer/modes/waydroid_mode.cpp
+@@ -177,8 +177,10 @@ std::string component_class(const std::string &component, const std::string &pkg
+  * neither of which names its task. Recover the task from the WMS task events.
+  * Popups an app opens without its component in the title (is_app_popup_title)
+  * are drawn by the app in front, so they go to the focused task.
++ * on_screen holds the tasks this frame has a "Task=<id>" layer of.
+  * Called with display->windowsMutex held. */
+-void resolve_task(const struct display &disp, layer_info &info) {
++void resolve_task(const struct display &disp, const std::set<std::string> &on_screen,
++                  layer_info &info) {
+     std::string title = info.aid;
+     const bool vri = title.rfind("VRI-", 0) == 0;
+     if (vri) {
+@@ -201,10 +203,11 @@ void resolve_task(const struct display &disp, layer_info &info) {
+             if (task.appID != pkg)
+                 continue;
+             /* WMS also reports the recent tasks a previous boot left behind.
+-             * Those draw nothing: a frame of the package comes from the task
+-             * in front, one already on a card, or one being closed (its exit
+-             * animation, which must stay off the stale ones). */
+-            if (!task.focused && !task.closing && !disp.windows.contains(entry.first))
++             * Those draw nothing: a frame of the package comes from a task on
++             * screen, the one in front, one already on a card, or one being
++             * closed (its exit animation, which must stay off the stale ones). */
++            if (!task.focused && !task.closing && !on_screen.count(entry.first)
++                    && !disp.windows.contains(entry.first))
+                 continue;
+             int score = (!task.closing ? 4 : 0)
+                     + (component_class(task.component, pkg) == activity ? 2 : 0)
+@@ -254,9 +257,15 @@ void split_layer_names_helper::setup(waydroid_hwc_composer_device_1 *pdev, const
+     std::scoped_lock lock(disp->windowsMutex);
+     if (!disp->task_events_seen)
+         return;
++    /* WMShell puts every visible task under a container layer named after it. */
++    static const std::string kTaskLayer = "Task=";
++    std::set<std::string> on_screen;
++    for (const auto &info : layer_infos)
++        if (info.type == LayerSplitType::RawName && info.aid.rfind(kTaskLayer, 0) == 0)
++            on_screen.insert(info.aid.substr(kTaskLayer.size()));
+     for (auto &info : layer_infos)
+         if (info.type == LayerSplitType::RawName)
+-            resolve_task(*disp, info);
++            resolve_task(*disp, on_screen, info);
+ 
+     /* A child surface created without a name (the floating text toolbar
+      * draws on one over its PopupWindow) belongs to whatever it is stacked
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index 2cb6759..80a1149 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -453,6 +453,12 @@ window::is_freeform_card() const
+     return conn->dpy->freeform && conn->is_ctl && taskID != "0" && taskID != "none";
+ }
+ 
++bool
++window::is_freeform_desktop() const
++{
++    return conn->dpy->freeform && conn->is_ctl && taskID == "0";
++}
++
+ static int32_t
+ rect_width(const hwc_rect_t &r)
+ {
+@@ -495,8 +501,29 @@ freeform_set_content(struct window *window, const hwc_rect_t &content)
+     struct display *display = window->conn->dpy;
+     window->content = content;
+ 
+-    int32_t width = std::max(1, (int32_t)ceil(rect_width(content) / display->scale));
+-    int32_t height = std::max(1, (int32_t)ceil(rect_height(content) / display->scale));
++    /* Only a task nobody has sized yet takes its bounds from the frames: a
++     * resize in flight passes through sizes that must not claim space. A
++     * card coming back from the desktop takes the bounds it had before. */
++    bool restored = false;
++    if (rect_width(window->target) <= 0) {
++        auto saved = display->card_targets.find(window->taskID);
++        if (saved != display->card_targets.end()) {
++            window->target = saved->second;
++            restored = true;
++        } else {
++            window->target = { content.left, content.top - display->caption_height,
++                               content.right, content.bottom };
++            display->card_targets[window->taskID] = window->target;
++        }
++    }
++
++    /* A restored card opens at its saved size, not at whatever the desktop
++     * left the task at (maximized, say): the host would take that size and
++     * hand it straight back as a configure. */
++    const hwc_rect_t &sized = restored ? window->target : content;
++    const int32_t sized_h = rect_height(sized) - (restored ? display->caption_height : 0);
++    int32_t width = std::max(1, (int32_t)ceil(rect_width(sized) / display->scale));
++    int32_t height = std::max(1, (int32_t)ceil(sized_h / display->scale));
+     /* The task took the size the host configured, up to rounding: keep the
+      * host's exact size so the compositor sees no size change. Otherwise the
+      * task was clamped or resized from the Android side, and the card follows
+@@ -509,11 +536,6 @@ freeform_set_content(struct window *window, const hwc_rect_t &content)
+         window->host_width = window->host_height = 0;
+     }
+     freeform_set_window_size(window, width, height);
+-    /* Only a task nobody has sized yet takes its bounds from the frames: a
+-     * resize in flight passes through sizes that must not claim space. */
+-    if (rect_width(window->target) <= 0)
+-        window->target = { content.left, content.top - display->caption_height, content.right,
+-                           content.bottom };
+     /* Input on the toplevel itself (not a layer) is surface-local too. */
+     window->conn->layers[window->surface] = { .x = content.left, .y = content.top };
+     ALOGI("freeform: card %s#%s shows [%d,%d %dx%d] as %dx%d", window->appID.c_str(),
+@@ -584,7 +606,8 @@ freeform_place_card(struct window *window)
+     window->placed = true;
+     struct display *display = window->conn->dpy;
+     const hwc_rect_t &c = window->content;
+-    const hwc_rect_t b = freeform_bounds(window, rect_width(c), rect_height(c) + display->caption_height);
++    const hwc_rect_t b = freeform_bounds(window, rect_width(window->target),
++                                         rect_height(window->target));
+     if (b.left == c.left && b.top == c.top - display->caption_height
+             && rect_width(b) == rect_width(c)
+             && rect_height(b) == rect_height(c) + display->caption_height)
+@@ -592,6 +615,7 @@ freeform_place_card(struct window *window)
+     ALOGI("freeform: placing task %s at [%d,%d %dx%d]", window->taskID.c_str(), b.left, b.top,
+           rect_width(b), rect_height(b));
+     window->target = b;
++    display->card_targets[window->taskID] = b;
+     display->task_ctl->resize(stoi(window->taskID), b);
+ }
+ 
+@@ -650,6 +674,7 @@ freeform_request_size(struct window *window, int32_t width, int32_t height)
+     ALOGI("freeform: host sized task %s to %dx%d -> bounds [%d,%d %dx%d]",
+           window->taskID.c_str(), width, height, b.left, b.top, rect_width(b), rect_height(b));
+     window->target = b;
++    display->card_targets[window->taskID] = b;
+     display->task_ctl->resize(stoi(window->taskID), b);
+ }
+ 
+@@ -963,6 +988,12 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
+                 && (display->width != width || display->height != height))
+             xdg_surface_set_window_geometry(window->xdg_surface, 0, 0,
+                                             display->width, display->height);
++        /* The desktop is a normal KWin window: it was created with the
++         * freeform display's geometry, taller than the screen, and KWin
++         * places a window by the geometry it commits. Take the configured
++         * size right away, as the display is about to. */
++        else if (window->is_freeform_desktop() && window->conn->wm_base)
++            xdg_surface_set_window_geometry(window->xdg_surface, 0, 0, width, height);
+         /* Only a real size change warrants a hotplug. Every window creation
+          * lands here with the unchanged display size, and hotplugging then is
+          * not just wasted work: hwc1Invalidate takes the adapter mutex, which
+@@ -996,6 +1027,31 @@ xdg_toplevel_handle_close(void *data, struct xdg_toplevel *)
+     send_key_event(window->conn->dpy, 0, WL_KEYBOARD_KEY_STATE_PRESSED);
+     send_key_event(window->conn->dpy, 0, WL_KEYBOARD_KEY_STATE_RELEASED);
+ 
++    /* Closing the desktop leaves the apps running: each goes back to a card
++     * of its own. Per-app mode is any active_apps but "none" and "Waydroid";
++     * name an app actually open, so the system service starts from a real
++     * foreground and Android is not put to sleep with apps on screen. */
++    if (window->is_freeform_desktop()) {
++        std::string apps = "none";
++        {
++            std::scoped_lock lock(display->windowsMutex);
++            auto is_app = [](const task_info &task) {
++                return !task.closing && !task.appID.empty()
++                        && task.appID != "com.android.launcher3"
++                        && task.appID != "com.android.systemui";
++            };
++            for (const auto &[tid, task] : display->tasks)
++                if (is_app(task) && (task.focused || apps == "none"))
++                    apps = task.appID;
++            /* window dies here: nothing below may touch it. */
++            display->windows.erase("Waydroid");
++        }
++        ALOGI("desktop closed: apps back on cards (active_apps=%s)", apps.c_str());
++        property_set("waydroid.active_apps", apps.c_str());
++        display->want_frame.store(true);
++        return;
++    }
++
+     if (window->taskID != "none") {
+         if (window->taskID == "0") {
+             property_set("waydroid.active_apps", "none");
+@@ -1380,8 +1436,9 @@ window::create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, st
+         assert(window->xdg_toplevel);
+         xdg_toplevel_add_listener(window->xdg_toplevel, &xdg_toplevel_listener, window.get());
+         /* A freeform card is moved and resized like any host window, which
+-         * takes the host's title bar. */
+-        if ((display->wantDecorations || window->is_freeform_card()) && conn->decoration_manager) {
++         * takes the host's title bar; so is the desktop showing them all. */
++        if ((display->wantDecorations || window->is_freeform_card() || window->is_freeform_desktop())
++                && conn->decoration_manager) {
+             window->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
+                     conn->decoration_manager, window->xdg_toplevel);
+             zxdg_toplevel_decoration_v1_add_listener(window->decoration,
+@@ -3992,6 +4049,7 @@ void display::expire_closing_marks() {
+  * Returns whether a card was closed, so the caller can flush wayland once. */
+ bool display::forget_task(const std::string &tid) {
+     tasks.erase(tid);
++    card_targets.erase(tid);
+ 
+     /* task_streams is keyed by the numeric ID; entries self-healed from a
+      * layer name are decimal too, but parse defensively. */
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index 18c2dfe..508dbba 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -423,6 +423,9 @@ struct window {
+     bool placed = false;
+     bool desk_requested = false;
+     bool is_freeform_card() const;
++    /* The full-ui window over a freeform display: the Android desktop, in a
++     * host-decorated window whose size is the display's. */
++    bool is_freeform_desktop() const;
+ 
+     /* Last time engagement on this window re-asserted its Android task focus
+      * (see reassert_task_focus); bounds how often a stream of touches can
+@@ -903,6 +906,11 @@ struct display {
+     /* Task whose card Android brought to front before the card existed.
+      * Guarded by windowsMutex; see note_pending_raise. */
+     std::string pending_raise_tid;
++    /* Last bounds of each freeform task, kept across the desktop: while it is
++     * open the cards are gone and the display is resized, which makes WM
++     * move the tasks; a card coming back puts its task where it was.
++     * Guarded by windowsMutex. */
++    std::map<std::string, hwc_rect_t> card_targets;
+ };
+ 
+ /* persist.waydroid.clipboard_debug — traces the host<->guest clipboard
+-- 
+2.56.0
+

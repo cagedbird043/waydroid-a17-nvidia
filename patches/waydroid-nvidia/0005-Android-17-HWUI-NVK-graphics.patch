@@ -1,0 +1,278 @@
+From eec39aa15836f460bc4903dddb7e98da4c637fac Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 09:21:33 +0800
+Subject: [PATCH 5/9] =?utf-8?q?=E4=B8=BA=20Android=2017=20HWUI=20=E6=9A=B4?=
+ =?utf-8?q?=E9=9C=B2=E4=B8=A4=E6=9D=A1=E7=8B=AC=E7=AB=8B=20NVK=20graphics?=
+ =?utf-8?q?=20=E9=98=9F=E5=88=97?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../driver-source/native/mesa/README.md       |  13 ++
+ .../driver-source/native/mesa/build.py        |   2 +
+ .../mesa/nvk-rm-graphics-multiqueue.patch     |  27 +++
+ tools/native-vulkan-multiqueue.c              | 167 ++++++++++++++++++
+ tools/native_rust_profile.py                  |   1 +
+ 5 files changed, 210 insertions(+)
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nvk-rm-graphics-multiqueue.patch
+ create mode 100644 tools/native-vulkan-multiqueue.c
+
+diff --git a/nvidia-prolapse/driver-source/native/mesa/README.md b/nvidia-prolapse/driver-source/native/mesa/README.md
+index f9845e1..fedc0c8 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/README.md
++++ b/nvidia-prolapse/driver-source/native/mesa/README.md
+@@ -138,6 +138,19 @@ Mesa's GLSL frontend keeps float min/max NaN-preserving and NVIDIA FMNMX/stock r
+ non-NaN operand. GTA SA's vehicle specular `max(pow(x<0, 10.0), 0.0)` rendered car paint black
+ under ANGLE on 26.2 (`tests/vk-nan-minmax.c`, live A/B 2026-10-16).
+ 
++`nvk-rm-graphics-multiqueue.patch`: the graphics family exposes two queues for
++Android 17 HWUI's RenderThread and GrallocUploadThread. NVK already creates a
++separate exec context, push stream and initial graphics state per VkQueue;
++`rm_ctx_create` creates a new Rust Queue with its own TSG, context-share,
++channel, GPFIFO/USERD, tail and completion surface. The Rust device mutex
++protects shared memory/sync bookkeeping while different API threads submit;
++the queues do not alias one ring. Build the independent public Vulkan
++regression with `cc -std=c11 -Wall -Wextra -Werror
++tools/native-vulkan-multiqueue.c -ldl -pthread -o PROBE` (use the NDK API33
++compiler for each Android ABI), then run `PROBE /absolute/path/to/ICD.so`.
++It checks the first graphics family's count, creates both queues and verifies
++512 simultaneous-thread buffer-fill submissions by CPU readback.
++
+ Mesa util patches for the shader disk cache, applied to the NVK and the GL tree (upstream-style messages in each file):
+ `mesa-disk-cache-create-with-path.patch` (`disk_cache_create_with_path()`: a cache at an absolute,
+ per-application directory, enabled on every platform, driver_flags kept),
+diff --git a/nvidia-prolapse/driver-source/native/mesa/build.py b/nvidia-prolapse/driver-source/native/mesa/build.py
+index 2457de6..09aadba 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/build.py
++++ b/nvidia-prolapse/driver-source/native/mesa/build.py
+@@ -194,6 +194,8 @@ NVK_PATCH_LIST = [
+     # VRAM (BAR1) memory type, as the proprietary driver offers none; BAR1
+     # does not return the modifier's byte layout there.
+     HERE / "nvk-prevolta-modifier-memory-types.patch",
++    # RM creates an independent channel group and ring for every VkQueue.
++    HERE / "nvk-rm-graphics-multiqueue.patch",
+ ]
+ 
+ def prepared_stamp(source, inputs):
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-rm-graphics-multiqueue.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-rm-graphics-multiqueue.patch
+new file mode 100644
+index 0000000..d8b1a1b
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-rm-graphics-multiqueue.patch
+@@ -0,0 +1,27 @@
++From: local <local@localhost>
++Subject: [PATCH] nvk: expose two independent graphics queues on the RM transport
++
++Android HWUI uses separate RenderThread and GrallocUploadThread queues from
++one graphics family. NVK already allocates an exec_ctx, push stream and
++context state for each VkQueue. The RM adapter creates a fresh Rust Queue
++for each exec_ctx; that owns a separate channel group, context share,
++channel, GPFIFO, USERD, completion surface and retirement state. Its device
++mutex protects shared allocation/sync bookkeeping, not shared GPU rings.
++
++Expose the two graphics queues supported by that transport. No extra
++queue aliasing or submission serialization is needed in the frontend.
++
++--- a/src/nouveau/vulkan/nvk_physical_device.c
+++++ b/src/nouveau/vulkan/nvk_physical_device.c
++@@ -1700,7 +1700,10 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
++                      VK_QUEUE_COMPUTE_BIT |
++                      VK_QUEUE_TRANSFER_BIT |
++                      (nvkmd->kmd_info.has_sparse ? VK_QUEUE_SPARSE_BINDING_BIT : 0),
++-      .queue_count = 1,
+++      /* Each RM exec context owns its channel group and submission ring.
+++       * HWUI uses queue 0 for rendering and queue 1 for AHB uploads.
+++       */
+++      .queue_count = 2,
++    };
++    if (pdev->info.has_transfer_queue) {
++       pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
+diff --git a/tools/native-vulkan-multiqueue.c b/tools/native-vulkan-multiqueue.c
+new file mode 100644
+index 0000000..fc0b7e7
+--- /dev/null
++++ b/tools/native-vulkan-multiqueue.c
+@@ -0,0 +1,167 @@
++/* Public Vulkan regression for two independently submitted graphics queues.
++ * Each thread owns its queue, command pool, buffer and fence. The CPU start
++ * barrier deliberately races submissions; every completed GPU fill is checked.
++ * No Waydroid lifecycle or private RM API is used. */
++#define _GNU_SOURCE
++#include <dlfcn.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <vulkan/vulkan.h>
++
++#define REQUIRE(c) do { if (!(c)) { fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
++#define CHECK(c) do { VkResult r = (c); if (r != VK_SUCCESS) { fprintf(stderr, "FAIL: %s = %d\n", #c, r); exit(1); } } while (0)
++#define FUNCTIONS(X) X(GetDeviceQueue) X(DestroyDevice) X(CreateBuffer) X(DestroyBuffer) \
++ X(GetBufferMemoryRequirements) X(AllocateMemory) X(FreeMemory) X(BindBufferMemory) \
++ X(MapMemory) X(UnmapMemory) X(CreateCommandPool) X(DestroyCommandPool) \
++ X(AllocateCommandBuffers) X(ResetCommandPool) X(BeginCommandBuffer) X(EndCommandBuffer) \
++ X(CmdFillBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(ResetFences) \
++ X(QueueSubmit) X(WaitForFences)
++struct Api {
++#define DECL(n) PFN_vk##n n;
++ FUNCTIONS(DECL)
++#undef DECL
++};
++struct Worker {
++ struct Api *api;
++ VkDevice device;
++ VkQueue queue;
++ VkBuffer buffer;
++ VkDeviceMemory memory;
++ VkCommandPool pool;
++ VkCommandBuffer command;
++ VkFence fence;
++ uint32_t *mapped;
++ unsigned index;
++ pthread_barrier_t *start;
++};
++static void *run(void *data) {
++ struct Worker *w = data;
++ struct Api *a = w->api;
++ for (unsigned round = 0; round < 256; round++) {
++  CHECK(a->ResetCommandPool(w->device, w->pool, 0));
++  VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  CHECK(a->BeginCommandBuffer(w->command, &begin));
++  uint32_t pattern = 0xa1700000u | (w->index << 16) | round;
++  a->CmdFillBuffer(w->command, w->buffer, 0, 4096, pattern);
++  VkMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++   .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
++  a->CmdPipelineBarrier(w->command, VK_PIPELINE_STAGE_TRANSFER_BIT,
++   VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
++  CHECK(a->EndCommandBuffer(w->command));
++  VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++   .commandBufferCount = 1, .pCommandBuffers = &w->command};
++  int ret = pthread_barrier_wait(w->start);
++  REQUIRE(ret == 0 || ret == PTHREAD_BARRIER_SERIAL_THREAD);
++  CHECK(a->QueueSubmit(w->queue, 1, &submit, w->fence));
++  CHECK(a->WaitForFences(w->device, 1, &w->fence, VK_TRUE, 10000000000ull));
++  for (unsigned i = 0; i < 1024; i++) REQUIRE(w->mapped[i] == pattern);
++  CHECK(a->ResetFences(w->device, 1, &w->fence));
++ }
++ return NULL;
++}
++int main(int argc, char **argv) {
++ REQUIRE(argc == 2 && argv[1][0] == '/');
++ void *lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
++ if (!lib) fprintf(stderr, "%s\n", dlerror());
++ REQUIRE(lib);
++ PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vk_icdGetInstanceProcAddr");
++ REQUIRE(gipa);
++ PFN_vkCreateInstance create = (PFN_vkCreateInstance)gipa(VK_NULL_HANDLE, "vkCreateInstance");
++ VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2};
++ VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
++ VkInstance instance;
++ CHECK(create(&ici, NULL, &instance));
++#define GI(n) PFN_vk##n n = (PFN_vk##n)gipa(instance, "vk" #n); REQUIRE(n)
++ GI(EnumeratePhysicalDevices); GI(GetPhysicalDeviceProperties2);
++ GI(GetPhysicalDeviceQueueFamilyProperties); GI(GetPhysicalDeviceMemoryProperties);
++ GI(CreateDevice); GI(GetDeviceProcAddr); GI(DestroyInstance);
++ uint32_t count = 0;
++ CHECK(EnumeratePhysicalDevices(instance, &count, NULL));
++ REQUIRE(count && count <= 16);
++ VkPhysicalDevice devices[16], physical = VK_NULL_HANDLE;
++ CHECK(EnumeratePhysicalDevices(instance, &count, devices));
++ for (uint32_t i = 0; i < count; i++) {
++  VkPhysicalDeviceDriverProperties driver = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
++  VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &driver};
++  GetPhysicalDeviceProperties2(devices[i], &props);
++  if (props.properties.vendorID == 0x10de && driver.driverID == VK_DRIVER_ID_MESA_NVK) {
++   physical = devices[i];
++   printf("device=%s driver=%s %s\n", props.properties.deviceName, driver.driverName, driver.driverInfo);
++   break;
++  }
++ }
++ REQUIRE(physical);
++ uint32_t families = 0;
++ GetPhysicalDeviceQueueFamilyProperties(physical, &families, NULL);
++ REQUIRE(families && families <= 16);
++ VkQueueFamilyProperties qp[16];
++ GetPhysicalDeviceQueueFamilyProperties(physical, &families, qp);
++ uint32_t family = 0;
++ while (family < families && !(qp[family].queueFlags & VK_QUEUE_GRAPHICS_BIT)) family++;
++ REQUIRE(family < families);
++ printf("graphics_family=%u queueCount=%u\n", family, qp[family].queueCount);
++ fflush(stdout);
++ REQUIRE(qp[family].queueCount >= 2);
++ float priorities[2] = {0, 0};
++ VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++  .queueFamilyIndex = family, .queueCount = 2, .pQueuePriorities = priorities};
++ VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++  .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci};
++ VkDevice device;
++ CHECK(CreateDevice(physical, &dci, NULL, &device));
++ struct Api api;
++#define LOAD(n) api.n = (PFN_vk##n)GetDeviceProcAddr(device, "vk" #n); REQUIRE(api.n);
++ FUNCTIONS(LOAD)
++#undef LOAD
++ VkPhysicalDeviceMemoryProperties mp;
++ GetPhysicalDeviceMemoryProperties(physical, &mp);
++ pthread_barrier_t start;
++ REQUIRE(!pthread_barrier_init(&start, NULL, 2));
++ struct Worker workers[2] = {0};
++ pthread_t threads[2];
++ for (unsigned i = 0; i < 2; i++) {
++  struct Worker *w = &workers[i];
++  w->api = &api; w->device = device; w->index = i; w->start = &start;
++  api.GetDeviceQueue(device, family, i, &w->queue);
++  VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++   .size = 4096, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
++  CHECK(api.CreateBuffer(device, &bci, NULL, &w->buffer));
++  VkMemoryRequirements req;
++  api.GetBufferMemoryRequirements(device, w->buffer, &req);
++  uint32_t type = 0;
++  VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++  while (type < mp.memoryTypeCount && (!(req.memoryTypeBits & (1u << type)) ||
++    (mp.memoryTypes[type].propertyFlags & want) != want)) type++;
++  REQUIRE(type < mp.memoryTypeCount);
++  VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++   .allocationSize = req.size, .memoryTypeIndex = type};
++  CHECK(api.AllocateMemory(device, &mai, NULL, &w->memory));
++  CHECK(api.BindBufferMemory(device, w->buffer, w->memory, 0));
++  CHECK(api.MapMemory(device, w->memory, 0, VK_WHOLE_SIZE, 0, (void **)&w->mapped));
++  VkCommandPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = family};
++  CHECK(api.CreateCommandPool(device, &pci, NULL, &w->pool));
++  VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++   .commandPool = w->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
++  CHECK(api.AllocateCommandBuffers(device, &cai, &w->command));
++  VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++  CHECK(api.CreateFence(device, &fci, NULL, &w->fence));
++ }
++ REQUIRE(workers[0].queue && workers[1].queue && workers[0].queue != workers[1].queue);
++ for (unsigned i = 0; i < 2; i++) REQUIRE(!pthread_create(&threads[i], NULL, run, &workers[i]));
++ for (unsigned i = 0; i < 2; i++) REQUIRE(!pthread_join(threads[i], NULL));
++ for (unsigned i = 0; i < 2; i++) {
++  struct Worker *w = &workers[i];
++  api.DestroyFence(device, w->fence, NULL);
++  api.DestroyCommandPool(device, w->pool, NULL);
++  api.UnmapMemory(device, w->memory);
++  api.DestroyBuffer(device, w->buffer, NULL);
++  api.FreeMemory(device, w->memory, NULL);
++ }
++ REQUIRE(!pthread_barrier_destroy(&start));
++ api.DestroyDevice(device, NULL);
++ DestroyInstance(instance, NULL);
++ puts("PASS: two concurrent graphics queues, 512 submissions, 524288 words checked");
++ return 0;
++}
+diff --git a/tools/native_rust_profile.py b/tools/native_rust_profile.py
+index 63d9a46..fe8e78d 100644
+--- a/tools/native_rust_profile.py
++++ b/tools/native_rust_profile.py
+@@ -37,6 +37,7 @@ def source_snapshot(root):
+     paths += [native / 'Cargo.toml', native / 'Cargo.lock', native / 'mesa/nv_rm.h',
+               native / 'mesa/nvkmd_rm.h', native / 'mesa/nvkmd_rm.c', native / 'mesa/build.py',
+               native / 'mesa/build-compat.patch', native / 'mesa/rm-integration.patch',
++              native / 'mesa/nvk-rm-graphics-multiqueue.patch',
+               root / 'tools/native_rust_profile.py']
+     if not any(path.suffix == '.rs' for path in paths):
+         raise RuntimeError(f'missing Rust source inputs under {native / "src"}')
+-- 
+2.56.0
+

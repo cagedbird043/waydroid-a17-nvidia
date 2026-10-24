@@ -1,0 +1,6 @@
+{
+  "path": "nvidia/build/native-multiqueue",
+  "build_record_sha256": "684a32a51133fe326904a67bc2a905e95cce52c0da5949dbd5bbeff0992c3565",
+  "release": "v0.2.0-rc10-a17-multiqueue",
+  "nvk_commit": "eec39aa15836f460bc4903dddb7e98da4c637fac"
+}

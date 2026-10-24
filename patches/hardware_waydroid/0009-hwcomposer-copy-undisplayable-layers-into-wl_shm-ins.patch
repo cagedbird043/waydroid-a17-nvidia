@@ -1,0 +1,75 @@
+From 90da9ea149056dff45c2148d2c387aeea1ffc9d3 Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Mon, 12 Oct 2026 01:00:25 +0300
+Subject: [PATCH 09/24] hwcomposer: copy undisplayable layers into wl_shm
+ instead of dropping them
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+What: get_wl_buffer()'s set-time backstop no longer returns nullptr for a
+layer whose buffer the compositor cannot import; it creates a wl_shm buffer
+(create_shm_wl_buffer(), refreshed every frame by update_shm_buffer() through
+the gralloc mapper) and uses that.
+
+Why: the compositing modes already route such layers to SurfaceFlinger at
+prepare time (waydroid_mode_impl.h), so there the backstop is never reached.
+Multi-window mode has no client target: the layer was dropped, the app
+window had no buffer and showed black. With the per-format LINEAR gate,
+LINEAR buffers of formats the compositor imports through NVIDIA EGL are
+exactly such layers.
+
+Source: QuinOvaX, quinovax/waydroid-nvidia main f2c2f39 (get_wl_buffer hunk)
+  https://github.com/quinovax/waydroid-nvidia/commit/f2c2f3924451b84b4f23a0190121953322645dc7
+Licence: Apache-2.0 (android_hardware_waydroid; the fork's patches/hwcomposer/
+inherit it).
+Deviation: none in behaviour; log text says how often it happened.
+
+按 ATV 的 ctl 连接创建回退 wl_shm 缓冲，保持 shared_ptr 缓存所有权。
+
+(cherry picked from commit 2d3525cb0dd3cd3fbc9678d74a0217a6f30e4f55)
+---
+ hwcomposer/hwcomposer.cpp | 22 +++++++++++++---------
+ 1 file changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index c1a32b2..230d9ca 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -126,20 +126,24 @@ namespace {
+              * whose buffer the compositor cannot import must never reach
+              * create_immed — INVALID_WL_BUFFER is a fatal protocol error that
+              * kills the wayland connection (seen with LINEAR CPU buffers on
+-             * NVIDIA/KWin). prepare() will route it through SF next frame. */
+-            if (layer->compositionType != HWC_FRAMEBUFFER_TARGET
++             * NVIDIA/KWin). The compositing modes route such a layer through
++             * SurfaceFlinger at prepare time; multi-window mode has no client
++             * target, so the buffer is copied into wl_shm instead of leaving
++             * the window without a buffer (black). */
++            const bool undisplayable = layer->compositionType != HWC_FRAMEBUFFER_TARGET
+                 && !(layer->flags & HWC_IS_CURSOR_LAYER)
+                 && layer->handle
+-                && !gralloc_handler.displayable_buffer(pdev->display->ctl.get(), layer->handle)) {
+-                static int undisp_count = 0;
+-                if ((undisp_count++ % 500) == 0)
+-                    ALOGW("layer buffer not importable by compositor (fmt/mod not advertised), skipping direct attach");
+-                return nullptr;
+-            }
++                && !gralloc_handler.displayable_buffer(pdev->display->ctl.get(), layer->handle);
+             std::unique_ptr<buffer> result;
+             if (layer->flags & HWC_IS_CURSOR_LAYER)
+                 result = pdev->display->cursor_handler->create_buffer(pdev, metadata, layer);
+-            else
++            else if (undisplayable) {
++                static int undisp_count = 0;
++                if ((undisp_count++ % 500) == 0)
++                    ALOGW("layer buffer not importable by the compositor (format/modifier not "
++                          "advertised); using wl_shm (%d times)", undisp_count);
++                result = create_shm_wl_buffer(pdev->display->ctl.get(), metadata, layer->handle);
++            } else
+                 result = gralloc_handler.create_buffer(pdev->display->ctl.get(), metadata, layer->handle);
+             if (!result) {
+                 ALOGE("failed to create a wayland buffer");
+-- 
+2.56.0
+

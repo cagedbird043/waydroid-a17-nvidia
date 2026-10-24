@@ -1,0 +1,112 @@
+From c5bde16b45ab5c4000904af677fdb7513ae94ee9 Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Mon, 12 Oct 2026 01:01:26 +0300
+Subject: [PATCH 12/24] hwcomposer: clamp the viewport source rectangle to the
+ buffer
+
+What: surface_context::set_crop() takes the buffer bounds and clamps the
+crop to them. An empty, non-finite or wholly outside crop unsets the
+viewport source (whole buffer shown) with a rate-limited warning. The caller
+passes the buffer size swapped for 90/270-degree layers.
+
+Why: a source rectangle outside the buffer is the fatal protocol error
+wp_viewport.out_of_buffer, which ends the Wayland connection (and with it the
+composer, see the connection-lost patch). An empty sourceCropf became a 1x1
+texel through fmax(1, 0) and was stretched over the whole display frame
+(source report: a warped overlay during an AnTuTu 3D scene).
+
+Source: QuinOvaX, quinovax/waydroid-nvidia main f2c2f39 (set_crop)
+  https://github.com/quinovax/waydroid-nvidia/commit/f2c2f3924451b84b4f23a0190121953322645dc7
+Licence: Apache-2.0 (android_hardware_waydroid; the fork's patches/hwcomposer/
+inherit it).
+Deviations: bounds swapped for rotated layers (wp_viewport source
+coordinates are post-buffer_transform, and rect_apply_transform() already
+swaps the crop; the source compared against the unrotated size); the
+crop/destination co-clipping (prepare_layer_geom) and multi-window frame
+origins of the same commit are not taken.
+
+(cherry picked from commit b5c925f667f7d9396f98ee29d321c768345b065e)
+---
+ hwcomposer/hwcomposer.cpp  |  7 ++++++-
+ hwcomposer/wayland-hwc.cpp | 30 +++++++++++++++++++++++++-----
+ hwcomposer/wayland-hwc.h   |  3 ++-
+ 3 files changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index 89c01ee..442d729 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -592,7 +592,12 @@ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pd
+     }
+     // Scaling can only be supported correctly with wp_viewport
+     if (surface_context.viewport) {
+-        surface_context.set_crop(rect_apply_transform(hwc_layer->sourceCropf, hwc_layer->transform));
++        /* the viewport source is in post-buffer_transform space, like the transformed crop */
++        uint32_t bound_w = buf->metadata.width, bound_h = buf->metadata.height;
++        if (hwc_layer->transform & HWC_TRANSFORM_ROT_90)
++            std::swap(bound_w, bound_h);
++        surface_context.set_crop(rect_apply_transform(hwc_layer->sourceCropf, hwc_layer->transform),
++                                 bound_w, bound_h);
+         surface_context.set_display_frame(hwc_layer->displayFrame, pdev->display->scale);
+     } else {
+         surface_context.set_buffer_scale(pdev->display->scale);
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index a40f66c..1fff119 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -891,13 +891,33 @@ void surface_context::set_buffer_scale(double d_scale) {
+     wl_surface_set_buffer_scale(surface, scale);
+ }
+ 
+-void surface_context::set_crop(hwc_frect_t crop) {
++void surface_context::set_crop(hwc_frect_t crop, uint32_t bound_w, uint32_t bound_h) {
+     assert(viewport);
+ 
+-    float x = fmax(0, crop.left);
+-    float y = fmax(0, crop.top);
+-    float width = fmax(1, crop.right - crop.left);
+-    float height = fmax(1, crop.bottom - crop.top);
++    /* A source rectangle reaching outside the buffer is the fatal protocol error
++     * wp_viewport.out_of_buffer, so the crop is clamped to the buffer. An empty or non-finite
++     * crop (it used to become a 1x1 texel stretched over the frame) and one entirely outside
++     * the buffer unset the source: the whole buffer is shown. */
++    const bool finite = std::isfinite(crop.left) && std::isfinite(crop.top)
++                        && std::isfinite(crop.right) && std::isfinite(crop.bottom);
++    float x = finite ? fmax(0.f, crop.left) : 0.f;
++    float y = finite ? fmax(0.f, crop.top) : 0.f;
++    float width = finite ? crop.right - x : 0.f;
++    float height = finite ? crop.bottom - y : 0.f;
++    if (bound_w > 0 && bound_h > 0) {
++        width = fmin(width, (float)bound_w - x);
++        height = fmin(height, (float)bound_h - y);
++    }
++    if (!(width > 0.f) || !(height > 0.f)) {
++        static int count = 0;
++        if ((count++ % 120) == 0)
++            ALOGW("layer crop (%g,%g)-(%g,%g) is empty or outside the %ux%u buffer; showing the "
++                  "whole buffer (%d times)", crop.left, crop.top, crop.right, crop.bottom,
++                  bound_w, bound_h, count);
++        wp_viewport_set_source(viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
++                               wl_fixed_from_int(-1), wl_fixed_from_int(-1));
++        return;
++    }
+ 
+     wp_viewport_set_source(viewport,
+                            wl_fixed_from_double(x),
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index be157b3..c096ade 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -199,7 +199,8 @@ struct surface_context {
+     void set_buffer_transform(BufferTransform transform);
+     void set_buffer_scale(double scale);
+     // Requires the transformed rectangle
+-    void set_crop(hwc_frect_t crop);
++    // Clamped to the bounds (bound_w x bound_h, in the same post-transform space; 0 = unknown).
++    void set_crop(hwc_frect_t crop, uint32_t bound_w, uint32_t bound_h);
+     // TODO: This should not require scale. Scaling handling is broken
+     void set_display_frame(hwc_rect_t rect, double scale);
+ };
+-- 
+2.56.0
+

@@ -1,0 +1,97 @@
+From 09bed2aaf2212045ef88eca48b80ba4088ee9121 Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Mon, 12 Oct 2026 00:57:16 +0300
+Subject: [PATCH 06/24] hwcomposer: a lost Wayland connection ends the composer
+ with a named cause
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+What: when wl_display_dispatch() fails for good, hwc_wayland_thread() logs
+the cause (protocol error interface/id/code, or the errno of the
+disconnect), stores it in the property waydroid.hwc.wayland_lost and exits
+the process with status 75 (HWC_EXIT_WAYLAND_LOST) via _exit(), instead of
+abort().
+
+Why: after the compositor connection is gone nothing the HAL draws can reach
+the screen. The source (quinovax ad04e0a) removed this abort() by flagging
+the display dead and returning, which leaves a composer that keeps answering
+SurfaceFlinger while nothing is shown: a silent hang (principle 5). Here the
+end is deliberate and observable: an error line with the cause, the
+property, and init's restart of vendor.hwcomposer-2-1, after which every
+start attempt that cannot reach the compositor logs "Couldn't open Wayland
+display" / "failed to open hwcomposer device: No such device" every 5 s.
+abort() ended the process the same way but as a crash (tombstone), with the
+cause only in logcat. _exit() runs no user-space code (no destructors, no
+atexit handlers).
+
+Measured 2026-10-12 (nested cage compositor, stopped under the running
+guest): "Wayland connection lost (disconnected: Broken pipe); hwcomposer
+exits with status 75", waydroid.hwc.wayland_lost = "disconnected: Broken
+pipe", no tombstone, init restarting the composer every 5 s.
+Limits measured in the same run, independent of this patch:
+- The session bind-mounts the compositor's socket file
+  (config_session: /run/user/1000/wayland-N -> run/xdg/wayland-0), so a
+  compositor that recreates its socket (new inode) cannot be reached again;
+  a compositor that keeps serving the same socket (KWin's wrapper across
+  KWin restarts) should be, not tested.
+- init's onrestart of surfaceflinger does not take effect in the Waydroid
+  container: "Sending signal 9 to service 'surfaceflinger' process group ...
+  Successfully killed", yet the process stays alive and init.svc.surfaceflinger
+  stays "stopping". So recovery needs a session restart; the host session
+  could watch waydroid.hwc.wayland_lost to do it (not implemented).
+
+Source: ours (principle 5), replacing the frozen-HAL hunk of QuinOvaX
+  quinovax/waydroid-nvidia dev ad04e0a (hwc_wayland_thread / wayland_dead).
+Licence: Apache-2.0 (android_hardware_waydroid).
+
+保留 ATV 已实现的 ctl 重连和 task 连接独立回收，不使用退出 75 重启整个 HAL；移植命名错误原因、协议对象诊断与 waydroid.hwc.wayland_lost 属性，避免一个任务连接掉线终止所有任务。
+
+(cherry picked from commit 62ffee8c086c200d0ce75ad1857d353defdadec3)
+---
+ hwcomposer/wayland-hwc.cpp | 16 ++++++++++++++++
+ hwcomposer/wayland-hwc.h   |  1 +
+ 2 files changed, 17 insertions(+)
+
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index 0b3a3b9..e1298e8 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -3824,6 +3824,22 @@ static void* wl_conn_thread(void* data) {
+             continue;
+ 
+         conn->wl_alive = false;
++        if (!conn->stopping) {
++            char cause[PROPERTY_VALUE_MAX];
++            int err = wl_display_get_error(conn->display);
++            if (err == EPROTO) {
++                const struct wl_interface *iface = nullptr;
++                uint32_t id = 0;
++                uint32_t code = wl_display_get_protocol_error(conn->display, &iface, &id);
++                snprintf(cause, sizeof(cause), "protocol error: interface %s id %u code %u",
++                         iface ? iface->name : "?", id, code);
++            } else {
++                snprintf(cause, sizeof(cause), "disconnected: %s", strerror(err));
++            }
++            ALOGE("Wayland connection lost (ctl=%d task=%u): %s",
++                  conn->is_ctl, conn->task_id, cause);
++            property_set("waydroid.hwc.wayland_lost", cause);
++        }
+ 
+         /* Torn down on purpose, or a task connection whose session is simply
+          * gone: exit and let the joiner clean up. Only ctl is reconnected. */
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index 9c97a4b..9160969 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -831,6 +831,7 @@ handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
+ void
+ snapshot_inactive_app_window(struct display *display, struct window *window);
+ 
++
+ struct display *
+ create_display(const char* gralloc);
+ void
+-- 
+2.56.0
+

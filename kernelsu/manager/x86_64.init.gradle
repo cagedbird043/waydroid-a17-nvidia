@@ -1,0 +1,8 @@
+allprojects {
+    plugins.withId('com.android.application') {
+        androidComponents.finalizeDsl { extension ->
+            extension.defaultConfig.ndk.abiFilters.clear()
+            extension.defaultConfig.ndk.abiFilters.add('x86_64')
+        }
+    }
+}

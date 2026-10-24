@@ -1,0 +1,26 @@
+# LineageOS 24.0 (WayDroid-ATV) vendor image build environment.
+# The Android build replaces PATH for its actions, so host tools the tree expects (meson + mako for Mesa,
+# glslang, ncurses 5 for LLVM host tools) must live in system paths: hence a container instead of the Arch host.
+FROM docker.io/library/ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
+RUN sed -i 's@//.*archive.ubuntu.com@//mirrors.tuna.tsinghua.edu.cn@g; s@//security.ubuntu.com@//mirrors.tuna.tsinghua.edu.cn@g' /etc/apt/sources.list \
+    && apt-get update -q && apt-get install -yq --no-install-recommends \
+        bc bison build-essential ca-certificates curl flex g++-multilib gcc-multilib git git-lfs gnupg gperf \
+        imagemagick lib32ncurses5-dev lib32readline-dev lib32z1-dev libelf-dev liblz4-tool lz4 libncurses5 \
+        libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush python3 python3-pip \
+        python3-mako python3-yaml python3-packaging python-is-python3 rsync schedtool squashfs-tools xsltproc \
+        zip unzip zlib1g-dev pkg-config ninja-build procps cmake ccache e2fsprogs file \
+    && rm -rf /var/lib/apt/lists/*
+# Mesa 26.x needs a newer meson than jammy's 0.61.
+RUN python3 -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple meson==1.9.1 && meson --version
+# Mesa's radv BVH shaders need glslang >= 12.2; jammy ships 11.8.
+ARG GLSLANG_TAG=15.0.0
+RUN git clone -q --depth 1 --branch "$GLSLANG_TAG" https://github.com/KhronosGroup/glslang /tmp/glslang \
+    && cmake -S /tmp/glslang -B /tmp/glslang/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_OPT=OFF \
+         -DGLSLANG_TESTS=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && ninja -C /tmp/glslang/build install && rm -rf /tmp/glslang && glslangValidator --version | head -1
+# Mesa's cross rule writes an ld.lld wrapper that execs `ld.lld` from PATH, and runs ninja with
+# PATH=/usr/bin:/bin:/sbin:<Soong PATH>; Soong's interposer forbids ld.lld, so it must be found in /usr/bin.
+# Use the tree's own prebuilt lld (the tree is bind-mounted at the same path inside the container).
+RUN ln -s /home/cagedbird/Projects/waydroid-a17/src/prebuilts/clang/host/linux-x86/clang-r596125/bin/ld.lld /usr/bin/ld.lld

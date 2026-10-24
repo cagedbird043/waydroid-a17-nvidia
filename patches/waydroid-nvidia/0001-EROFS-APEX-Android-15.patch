@@ -1,0 +1,93 @@
+From c051625b43a6fd37813702bcd848e5080388e7c8 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 05:51:53 +0800
+Subject: [PATCH 1/9] =?utf-8?q?=E9=97=A8=E7=A6=81=EF=BC=9A=E6=94=AF?=
+ =?utf-8?q?=E6=8C=81=20EROFS=20=E7=B3=BB=E7=BB=9F=E9=95=9C=E5=83=8F?=
+ =?utf-8?q?=E5=92=8C=E6=89=93=E5=8C=85=E7=9A=84=20APEX=EF=BC=88Android=201?=
+ =?utf-8?q?5+=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ packaging/native/release_gate.py | 62 ++++++++++++++++++++++++++++++--
+ 1 file changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/packaging/native/release_gate.py b/packaging/native/release_gate.py
+index 77f9fb1..a0e02f7 100644
+--- a/packaging/native/release_gate.py
++++ b/packaging/native/release_gate.py
+@@ -190,10 +190,68 @@ def needed(path, leaf_ok=False, remedy=REMEDY_BUNDLE):
+     return names
+ 
+ 
++EROFS_MAGIC = 0xE0F5E1E2
++
++
++def _is_erofs(image):
++    with open(image, 'rb') as f:
++        f.seek(1024)
++        return int.from_bytes(f.read(4), 'little') == EROFS_MAGIC
++
++
++def _dump_raw(image, source, dest):
++    """One file out of an ext4 (debugfs) or EROFS (dump.erofs) image; Android 15+ system images are EROFS."""
++    if _is_erofs(image):
++        with open(dest, 'wb') as out:
++            subprocess.run(['dump.erofs', f'--path={source}', '--cat', str(image)], stdout=out,
++                           stderr=subprocess.DEVNULL, check=False)
++    else:
++        subprocess.run(['debugfs', '-R', f'dump {source} {dest}', str(image)], capture_output=True, check=True)
++    return dest.is_file() and dest.stat().st_size > 0
++
++
++_APEX_PAYLOADS = {}
++
++
++def _apex_payload(image, apex, scratch):
++    """apex_payload.img of the packed /system/apex/<apex>.apex (or .capex) in `image`, extracted once into
++    scratch. Android 14+ images ship the runtime and other APEXes packed instead of flattened."""
++    key = (str(image), apex)
++    if key in _APEX_PAYLOADS:
++        return _APEX_PAYLOADS[key]
++    import zipfile
++    payload = None
++    for suffix in ('.apex', '.capex'):
++        packed = scratch / f'{apex}{suffix}'
++        if not _dump_raw(image, f'/system/apex/{apex}{suffix}', packed):
++            packed.unlink(missing_ok=True)
++            continue
++        with zipfile.ZipFile(packed) as z:
++            if suffix == '.capex':
++                inner = scratch / f'{apex}.apex'
++                inner.write_bytes(z.read('original_apex'))
++                packed.unlink()
++                packed = inner
++        with zipfile.ZipFile(packed) as z:
++            payload = scratch / f'{apex}.payload.img'
++            payload.write_bytes(z.read('apex_payload.img'))
++        packed.unlink()
++        break
++    _APEX_PAYLOADS[key] = payload
++    return payload
++
++
+ def _dump(image, source, dest):
+     dest.unlink(missing_ok=True)
+-    subprocess.run(['debugfs', '-R', f'dump {source} {dest}', str(image)], capture_output=True, check=True)
+-    return dest.is_file() and dest.stat().st_size > 0
++    if _dump_raw(image, source, dest):
++        return True
++    m = re.match(r'^/system/apex/([^/]+)(/.+)$', source)
++    if not m:
++        return False
++    scratch = Path(os.environ.get('TMPDIR', '/tmp')) / f'gate-apex-payloads-{os.getpid()}'
++    scratch.mkdir(exist_ok=True)
++    payload = _apex_payload(image, m.group(1), scratch)
++    return bool(payload) and _dump_raw(payload, m.group(2), dest)
+ 
+ 
+ def extract_runtime(system_img, dest, sub, roots, provided):
+-- 
+2.56.0
+

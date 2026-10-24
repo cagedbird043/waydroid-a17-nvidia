@@ -1,0 +1,85 @@
+From 597f6e5787b3f76c5d2c167b73cc5b772098406a Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 05:57:44 +0800
+Subject: [PATCH 1/2] =?utf-8?q?waydroid-init=EF=BC=9A=E8=AF=86=E5=88=AB=20?=
+ =?utf-8?q?nvidia-prolapse=20vendor=20=E6=A8=A1=E5=9D=97=EF=BC=8CNVIDIA=20?=
+ =?utf-8?q?=E4=B8=8B=E4=BD=BF=E7=94=A8=20minigbm=5Fgbm=5Fmesa=20=E4=B8=8E?=
+ =?utf-8?q?=20vulkan.nvidia?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+ATV 的 waydroid-init 把 NVIDIA 内核驱动视为不支持并回退到软件渲染（gralloc=default），
+在 A17 上 gralloc.default 没有可用的 mapper，surfaceflinger 与 hwcomposer 均以
+"gralloc-mapper is missing" 中止。vendor 镜像带有 vulkan.nvidia.so 时改用 NVIDIA 配置，
+GLES 保留主机写入的选择（ANGLE 或 nvrm）。
+---
+ waydroid-init/gpu_utils.cpp | 7 +++++++
+ waydroid-init/gpu_utils.h   | 5 +++++
+ waydroid-init/main.cpp      | 6 ++++--
+ 3 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/waydroid-init/gpu_utils.cpp b/waydroid-init/gpu_utils.cpp
+index 0cc58e7..28cc84c 100644
+--- a/waydroid-init/gpu_utils.cpp
++++ b/waydroid-init/gpu_utils.cpp
+@@ -99,6 +99,13 @@ GpuUtils::GpuUtils(const std::string &renderNode, bool swRendering) {
+ 
+     getKernelDriver();
+ 
++    if (gpuKernelDriverName == "nvidia" && std::filesystem::exists("/vendor/lib64/hw/vulkan.nvidia.so")) {
++        Log::info("NVIDIA kernel driver with the nvidia-prolapse vendor modules");
++        this->driverInfo     = nvidiaProlapseInfo;
++        this->nvidiaProlapse = true;
++        return;
++    }
++
+     gpuGeneration = gpuKernelDriverName == "i915" ? getIntelGpuGeneration() : 0;
+ 
+     for (const auto &e : driverInfoList) {
+diff --git a/waydroid-init/gpu_utils.h b/waydroid-init/gpu_utils.h
+index 0c648b9..13baa74 100644
+--- a/waydroid-init/gpu_utils.h
++++ b/waydroid-init/gpu_utils.h
+@@ -48,12 +48,17 @@ class GpuUtils {
+             { "default",     0, "angle", "pastel",       "default",         },
+         }};
+ 
++        // NVIDIA through waydroid-nvidia's nvidia-prolapse vendor modules (NVK on NVIDIA's kernel module);
++        // only when the vendor image ships them
++        const GpuDriverInfo nvidiaProlapseInfo = { "nvidia", 0, "angle", "nvidia", "minigbm_gbm_mesa" };
++
+         void getKernelDriver();
+         float getIntelGpuGeneration() const;
+ 
+     public:
+         std::string   gpuKernelDriverName = "unknown";
+         GpuDriverInfo driverInfo = driverInfoList.back();
++        bool          nvidiaProlapse = false;
+ 
+         GpuUtils(const std::string &renderNode, bool swRendering);
+         std::string getGralloc() const;
+diff --git a/waydroid-init/main.cpp b/waydroid-init/main.cpp
+index 14f86c4..5a7caff 100644
+--- a/waydroid-init/main.cpp
++++ b/waydroid-init/main.cpp
+@@ -68,12 +68,14 @@ int main(int argc, char **argv) {
+ 
+     GpuUtils gpuUtils(renderNode, swRendering);
+ 
+-    if (gpuUtils.gpuKernelDriverName.starts_with("nvidia")) {
++    if (gpuUtils.gpuKernelDriverName.starts_with("nvidia") && !gpuUtils.nvidiaProlapse) {
+         Log::warn("Unsupported NVIDIA kernel driver detected");
+         settings.updateSetting("ro.waydroid.unsupported_nvidia_kmd", "1");
+     }
+ 
+-    settings.updateSetting("ro.hardware.egl",     gpuUtils.driverInfo.eglImpl);
++    // nvidia-prolapse: the host picks GLES (ANGLE, or the nvrm driver with nvidia_native_gl = on)
++    if (!gpuUtils.nvidiaProlapse || settings.getSetting("ro.hardware.egl").empty())
++        settings.updateSetting("ro.hardware.egl", gpuUtils.driverInfo.eglImpl);
+     settings.updateSetting("ro.hardware.gralloc", gpuUtils.getGralloc());
+ 
+     if (gpuUtils.driverInfo.vkDriverName.has_value()) {
+-- 
+2.56.0
+

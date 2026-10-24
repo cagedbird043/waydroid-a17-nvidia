@@ -1,0 +1,75 @@
+From d1d1b18b58ab27e6176a91865be5e1b591890386 Mon Sep 17 00:00:00 2001
+From: nvidia-prolapse <nvidia-prolapse@localhost>
+Date: Fri, 16 Oct 2026 19:55:46 +0300
+Subject: [PATCH 3/8] gbm_mesa: FP16 and 1010102 render targets from the
+ wrapper
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Applies to https://github.com/waydroid/android_external_minigbm
+16844babfbd83d7c206ca22256257cbf26ca7de1 ("gralloc: Handle PixelFormat::R_8"),
+after 0001 and 0002.
+
+gbm_mesa_driver_init() registers render/scanout combinations only for the
+8888 formats and RGB565, so HAL_PIXEL_FORMAT_RGBA_FP16 (DRM ABGR16161616F)
+and RGBA_1010102 (ABGR2101010), which cros_gralloc_convert_format() maps,
+fail every allocation with "Unsupported combination". An EGL driver that
+offers EGL_EXT_pixel_format_float window configs then cannot get window
+buffers (dEQP-EGL.functional.wide_color.window_fp16_*: the Android loader
+sets RGBA_FP16 on the window, gralloc refuses usage 0xb00, eglCreateWindowSurface
+fails with EGL_BAD_NATIVE_WINDOW).
+
+Register both as render/scanout formats. They are GPU render targets only
+when the wrapper allocates them itself (get_gbm_format != 0); with a wrapper
+that does not, allocation fails loudly instead of falling back to minigbm's
+R8 carrier layout, which no GPU renders into.
+
+ATV 已用 gbm_mesa_bo_create2 的探测路径替代静态组合表，因此将 FP16/1010102 加入现有支持格式列表，并保留 wrapper 必须直接支持该格式的检查；不恢复旧组合表。
+
+(cherry picked from commit 01f1576a3c845498dfcaa1e35857046d1169f607)
+---
+ gbm_mesa_driver/gbm_mesa_internals.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/gbm_mesa_driver/gbm_mesa_internals.cpp b/gbm_mesa_driver/gbm_mesa_internals.cpp
+index 46bf1f4..cc3ed2d 100644
+--- a/gbm_mesa_driver/gbm_mesa_internals.cpp
++++ b/gbm_mesa_driver/gbm_mesa_internals.cpp
+@@ -88,6 +88,11 @@ void gbm_mesa_resolve_format_and_use_flags(struct driver *drv, uint32_t format,
+ 	}
+ }
+ 
++static bool is_wrapper_render_format(uint32_t format)
++{
++	return format == DRM_FORMAT_ABGR16161616F || format == DRM_FORMAT_ABGR2101010;
++}
++
+ int gbm_mesa_driver_init(struct driver *drv)
+ {
+ 	return 0;
+@@ -289,7 +294,7 @@ static bool unmask64(uint64_t *value, uint64_t mask)
+ static const uint32_t supported_formats[] = {
+ 	DRM_FORMAT_ARGB8888,	   DRM_FORMAT_XRGB8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_XBGR8888,
+ 	DRM_FORMAT_RGB565,	   DRM_FORMAT_BGR888,	DRM_FORMAT_NV12,     DRM_FORMAT_YVU420,
+-	DRM_FORMAT_YVU420_ANDROID, DRM_FORMAT_R8,
++	DRM_FORMAT_YVU420_ANDROID, DRM_FORMAT_R8, DRM_FORMAT_ABGR16161616F, DRM_FORMAT_ABGR2101010,
+ };
+ 
+ static bool is_format_supported(uint32_t format)
+@@ -326,6 +331,12 @@ int gbm_mesa_bo_create2(struct bo *bo, uint32_t width, uint32_t height, uint32_t
+ 
+ 	auto wr = drv->wrapper;
+ 
++	if (is_wrapper_render_format(format) && wr->get_gbm_format(format) == 0) {
++		drv_loge("format %.4s requires wrapper allocation; refusing an R8-carrier layout",
++			 (const char *)&format);
++		return -EINVAL;
++	}
++
+ 	/* CPU mappings of render targets use the wrapper's linear staging view. */
+ 	const bool sw_access = unmask64(&use_flags, BO_USE_SW_MASK);
+ 	const bool gpu_render = (use_flags & (BO_USE_RENDERING | BO_USE_FRONT_RENDERING)) != 0;
+-- 
+2.56.0
+

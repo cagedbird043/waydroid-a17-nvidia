@@ -1,0 +1,77 @@
+From f6763855b8d88ec6c44e0c3a45c2d6cd1ca7ad30 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 10:38:04 +0800
+Subject: [PATCH 20/24] =?utf-8?q?hwcomposer=EF=BC=9Awaydroid.active=5Fapps?=
+ =?utf-8?q?=20=E4=B8=80=E5=8F=98=E5=B0=B1=E8=AF=B7=E6=B1=82=E5=90=88?=
+ =?utf-8?q?=E6=88=90=EF=BC=8C=E9=9D=99=E6=AD=A2=E7=94=BB=E9=9D=A2=E4=B8=8B?=
+ =?utf-8?q?=20show-full-ui=20=E7=AB=8B=E5=8D=B3=E5=87=BA=E7=AA=97=E5=8F=A3?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+显示什么（none / Waydroid / 应用）只在 hwc_set 里决定，而 SurfaceFlinger 仅在有新帧时才调用它。
+画面静止（开机向导、空闲桌面）时，主机的 show-full-ui 或启动应用要等到下一次无关的重绘才生效；
+上游 waydroid 用展开再收起状态栏的 hack 逼出一帧，开机向导期间状态栏被禁用，这招无效。
+vsync 线程按属性序列号无锁检测变化，经 want_frame 交给已有的 invalidate 路径。
+---
+ hwcomposer/hwcomposer.cpp | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index be832e1..29066c3 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -24,6 +24,7 @@
+ #include <stdlib.h>
+ #include <sys/time.h>
+ #include <sys/resource.h>
++#include <sys/system_properties.h>
+ #include <unistd.h>
+ #include <wayland-client.h>
+ #include <sys/socket.h>
+@@ -374,6 +375,28 @@ static long time_to_sleep_to_next_vsync(struct timespec *rt, uint64_t last_vsync
+     return next_vsync - now;
+ }
+ 
++/* What is shown (waydroid.active_apps: none / Waydroid / a package) is decided in
++ * hwc_set, which SurfaceFlinger only calls when it composites. A host switch
++ * (`waydroid show-full-ui`, launching an app) over a static screen -- the setup
++ * wizard, an idle launcher -- would otherwise wait for the next unrelated frame.
++ * Returns true once per change of the property, read lock-free by its serial. */
++static bool active_apps_changed() {
++    static const prop_info *pi = nullptr;
++    static uint32_t serial = 0;
++    if (!pi) {
++        pi = __system_property_find("waydroid.active_apps");
++        if (!pi)
++            return false;
++        serial = __system_property_serial(pi);
++        return true;    /* first set since boot */
++    }
++    uint32_t now = __system_property_serial(pi);
++    if (now == serial)
++        return false;
++    serial = now;
++    return true;
++}
++
+ static void* hwc_vsync_thread(void* data) {
+     auto *pdev = static_cast<waydroid_hwc_composer_device_1 *>(data);
+     setpriority(PRIO_PROCESS, 0, HAL_PRIORITY_URGENT_DISPLAY);
+@@ -406,8 +429,11 @@ static void* hwc_vsync_thread(void* data) {
+         if (++tick % 60 == 0)
+             nudge_stale_task_streams_mode(pdev);
+ 
+-        /* A reactivated card asked for a composition (see display::want_frame).
+-         * Doing it here keeps procs->invalidate off the wayland thread. */
++        /* A reactivated card asked for a composition (see display::want_frame),
++         * or the host changed what is shown (active_apps_changed). Doing it here
++         * keeps procs->invalidate off the wayland thread. */
++        if (active_apps_changed())
++            pdev->display->want_frame.store(true);
+         if (pdev->procs && pdev->procs->invalidate
+                 && pdev->display->want_frame.exchange(false))
+             pdev->procs->invalidate(pdev->procs);
+-- 
+2.56.0
+

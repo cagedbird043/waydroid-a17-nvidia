@@ -1,0 +1,41 @@
+From 75b297888e20feae6833a5fcc9f28c6dff0d8c81 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 09:26:31 +0800
+Subject: [PATCH 2/2] =?utf-8?q?waydroid-init=EF=BC=9Anvidia-prolapse=20?=
+ =?utf-8?q?=E4=B8=8B=E8=A7=86=E9=A2=91=E8=A7=A3=E7=A0=81=E4=BA=A4=E7=BB=99?=
+ =?utf-8?q?=20c2.nvprolapse=EF=BC=8Cc2.ffmpeg=20=E5=85=B3=E9=97=AD=20DRM?=
+ =?utf-8?q?=20=E7=A1=AC=E4=BB=B6=E5=8A=A0=E9=80=9F=E5=B9=B6=E9=99=8D?=
+ =?utf-8?q?=E4=B8=BA=E5=85=B6=E5=90=8E=E7=9A=84=E8=BD=AF=E8=A7=A3?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+ATV 的 c2.ffmpeg 视频 rank 为 0，排在 NVDEC 服务 c2.nvprolapse（0x10）之前；它的 DRM hwaccel
+在 NVIDIA 栈上初始化时调用 eventfd，被 ffmpeg 服务的 seccomp 终止，播放器报解码失败。
+---
+ waydroid-init/main.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/waydroid-init/main.cpp b/waydroid-init/main.cpp
+index 5a7caff..b65ffea 100644
+--- a/waydroid-init/main.cpp
++++ b/waydroid-init/main.cpp
+@@ -94,7 +94,14 @@ int main(int argc, char **argv) {
+         settings.updateSetting("ro.hardware.gralloc", "default");
+     } else {
+         // Configure c2.ffmpeg
+-        if (gpuUtils.driverInfo.driverName == "vmwgfx") {
++        if (gpuUtils.nvidiaProlapse) {
++            // Video decode belongs to the vendor's NVDEC service c2.nvprolapse.* (rank 0x10); c2.ffmpeg's
++            // DRM hwaccel cannot run on the NVIDIA stack, so it stays the software fallback behind NVDEC.
++            settings.updateSetting("media.sf.hwaccel", "0");
++            settings.updateSetting("debug.ffmpeg-codec2.hwaccel.drm", "0");
++            settings.updateSetting("debug.ffmpeg-codec2.pixel_format", "RGBX_8888");
++            settings.updateSetting("debug.ffmpeg-codec2.rank.video", "32");
++        } else if (gpuUtils.driverInfo.driverName == "vmwgfx") {
+             settings.updateSetting("media.sf.hwaccel", "0");
+             settings.updateSetting("debug.ffmpeg-codec2.hwaccel.drm", "0");
+             settings.updateSetting("debug.ffmpeg-codec2.pixel_format", "RGB_565");
+-- 
+2.56.0
+

@@ -1,0 +1,48 @@
+From f35479782380405837919fb7c0cf09533427149d Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia project <ci@waydroid-nvidia>
+Date: Fri, 16 Oct 2026 19:59:25 +0300
+Subject: [PATCH 16/24] hwcomposer: build prime-copy.cpp in the tree
+ (Android.bp)
+
+prime-copy.cpp (cross-GPU present, the patch before the last) loads libvulkan
+with dlopen, so it only needs the Vulkan headers: add it to srcs and
+vulkan_headers to header_libs. The tree's -Werror set includes
+-Wmissing-field-initializers, which the Vulkan create-info structs and the
+Wayland listener tables (leading fields only, rest zero) trip; turn it off
+for this module.
+
+(cherry picked from commit 7a311d968e85da6fb1cb1e30785f5e444c9fa50b)
+---
+ hwcomposer/Android.bp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/hwcomposer/Android.bp b/hwcomposer/Android.bp
+index 0e60820..813b810 100644
+--- a/hwcomposer/Android.bp
++++ b/hwcomposer/Android.bp
+@@ -59,10 +59,12 @@ cc_library_shared {
+         "modes/full-ui.cpp",
+         "modes/multi-window.cpp",
+         "modes/single-window.cpp",
++        "prime-copy.cpp",
+     ],
+     header_libs: [
+         "libsystem_headers",
+         "minigbm_headers",
++        "vulkan_headers",
+     ],
+     include_dirs: [
+         "system/core",
+@@ -73,6 +75,9 @@ cc_library_shared {
+         "-DLOG_TAG=\"hwcomposer\"",
+         "-Wall",
+         "-Werror",
++        // Vulkan create-info structs and Wayland listeners are initialised with their leading
++        // fields only; the rest are zero by the language (same code as the standalone build)
++        "-Wno-missing-field-initializers",
+     ],
+     generated_sources: ["wayland_android_client_protocol_sources"],
+     generated_headers: ["wayland_android_client_protocol_headers"],
+-- 
+2.56.0
+

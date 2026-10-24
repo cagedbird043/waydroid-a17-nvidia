@@ -1,0 +1,37 @@
+From b1a3597eeb0287ec6ab24087dab3549919d35ec5 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 12:13:08 +0800
+Subject: [PATCH 8/9] =?utf-8?q?install.sh=EF=BC=9A=E5=86=85=E5=AE=B9?=
+ =?utf-8?q?=E6=9C=AA=E5=8F=98=E7=9A=84=E5=9B=BE=E6=A0=87/desktop=20?=
+ =?utf-8?q?=E6=96=87=E4=BB=B6=E4=B8=8D=E5=86=8D=E9=87=8D=E5=86=99=EF=BC=8C?=
+ =?utf-8?q?=E9=81=BF=E5=85=8D=E8=BF=90=E8=A1=8C=E4=B8=AD=E7=9A=84=20plasma?=
+ =?utf-8?q?shell=20=E4=B8=A2=E6=8E=89=20hicolor=20=E5=9B=BE=E6=A0=87?=
+ =?utf-8?q?=E7=BC=93=E5=AD=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ packaging/install.sh | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/packaging/install.sh b/packaging/install.sh
+index efc1ce9..e71b7d7 100755
+--- a/packaging/install.sh
++++ b/packaging/install.sh
+@@ -402,6 +402,12 @@ done < "$WORK/files"
+ if [ -f "$LIST" ]; then   # upgrade: drop files the previous release had and this one does not
+     comm -23 <(sort "$LIST") "$WORK/files" | while IFS= read -r f; do rm -f -- "$f"; done
+ fi
++# Unchanged desktop-integration files stay untouched: rewriting one bumps its directory's mtime past
++# icon-theme.cache, and a running Qt (plasmashell) then drops the cached theme for good -- every
++# hicolor icon renders blank until the shell restarts, whatever the cache refresh below does.
++(cd "$ROOT" && find usr/share/icons usr/share/applications etc/xdg -type f 2>/dev/null) | while IFS= read -r f; do
++    if cmp -s "$ROOT/$f" "/$f"; then rm -f -- "$ROOT/$f"; fi
++done
+ # existing directories keep their owner, mode and times (--no-overwrite-dir)
+ tar -C "$ROOT" -cf - . | tar -C / -xpf - --no-overwrite-dir --no-same-owner
+ mkdir -p "$STATE" && cp "$WORK/files" "$LIST"
+-- 
+2.56.0
+

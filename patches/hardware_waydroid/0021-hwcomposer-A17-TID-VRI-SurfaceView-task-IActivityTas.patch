@@ -1,0 +1,203 @@
+From a122fa310366f562104e916dd11ff3c51cbe3771 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 12:13:08 +0800
+Subject: [PATCH 21/24] =?utf-8?q?hwcomposer=EF=BC=9AA17=20=E5=9B=BE?=
+ =?utf-8?q?=E5=B1=82=E4=B8=8D=E5=86=8D=E5=B8=A6=20TID=20=E5=89=8D=E7=BC=80?=
+ =?utf-8?q?=EF=BC=8C=E6=8C=89=E4=BB=BB=E5=8A=A1=E4=BA=8B=E4=BB=B6=E6=8A=8A?=
+ =?utf-8?q?=20VRI/SurfaceView=20=E5=9B=BE=E5=B1=82=E6=98=A0=E5=B0=84?=
+ =?utf-8?q?=E5=88=B0=E4=BB=BB=E5=8A=A1=EF=BC=9Btask=20=E6=9C=8D=E5=8A=A1?=
+ =?utf-8?q?=E7=9A=84=20IActivityTaskManager=20=E4=BA=8B=E5=8A=A1=E5=8F=B7?=
+ =?utf-8?q?=E6=94=B9=E4=B8=BA=20A17=20=E9=A1=BA=E5=BA=8F=EF=BC=88=E6=97=A7?=
+ =?utf-8?q?=E5=8F=B7=E6=8A=8A=20setFocusedTask=20=E5=8F=98=E6=88=90?=
+ =?utf-8?q?=E4=BA=86=20removeTask=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hwcomposer/modes/waydroid_mode.cpp            | 100 ++++++++++++++++++
+ .../IActivityTaskManager.cpp                  |  15 +--
+ 2 files changed, 109 insertions(+), 6 deletions(-)
+
+diff --git a/hwcomposer/modes/waydroid_mode.cpp b/hwcomposer/modes/waydroid_mode.cpp
+index cf15ec7..212af4b 100644
+--- a/hwcomposer/modes/waydroid_mode.cpp
++++ b/hwcomposer/modes/waydroid_mode.cpp
+@@ -136,6 +136,98 @@ layer_info split_layer_names_helper::split_layer_name(const std::string &layer_n
+     }
+ }
+ 
++namespace {
++
++/* SystemUI and shell windows drawn through ViewRootImpl. They belong to no app
++ * task, so they must not fall back to the focused task's card. */
++bool is_system_window_title(const std::string &title) {
++    static const char *const prefixes[] = {
++        "StatusBar", "NotificationShade", "NavigationBar", "Taskbar", "ScreenDecorOverlay",
++        "InputMethod", "ShellDropTarget", "VolumeDialog", "Wallpaper",
++    };
++    for (const char *prefix : prefixes)
++        if (title.rfind(prefix, 0) == 0)
++            return true;
++    return false;
++}
++
++/* "<pkg>/<activity>" as WM titles an activity window; false for anything else. */
++bool split_component_title(const std::string &title, std::string &pkg, std::string &activity) {
++    const auto slash = title.find('/');
++    if (slash == std::string::npos || slash == 0 || slash + 1 == title.size())
++        return false;
++    pkg = title.substr(0, slash);
++    if (pkg.find('.') == std::string::npos || pkg.find(' ') != std::string::npos)
++        return false;
++    activity = title.substr(slash + 1);
++    return true;
++}
++
++/* Activity class of a WMS component ("pkg/.Cls" or "pkg/pkg.Cls"), fully qualified. */
++std::string component_class(const std::string &component, const std::string &pkg) {
++    const auto slash = component.find('/');
++    std::string cls = slash == std::string::npos ? component : component.substr(slash + 1);
++    return !cls.empty() && cls[0] == '.' ? pkg + cls : cls;
++}
++
++/* The platform patch prefixes "TID:<id>#" to the WindowStateAnimator surface,
++ * which A17 no longer creates: the buffer is posted on ViewRootImpl's BLAST
++ * child ("VRI-<pkg>/<activity>") or a SurfaceView ("SurfaceView[<pkg>/<activity>]"),
++ * neither of which names its task. Recover the task from the WMS task events.
++ * Windows titled without a package (PopupWindow:<hash>, dialogs, toasts) are
++ * drawn by the app in front, so they go to the focused task.
++ * Called with display->windowsMutex held. */
++void resolve_task(const struct display &disp, layer_info &info) {
++    std::string title = info.aid;
++    const bool vri = title.rfind("VRI-", 0) == 0;
++    if (vri) {
++        title.erase(0, 4);
++        info.aid = title;
++    }
++    const auto surface_view = title.find("SurfaceView[");
++    if (surface_view != std::string::npos) {
++        const auto open = surface_view + 12;
++        const auto close = title.find(']', open);
++        title = title.substr(open, close == std::string::npos ? std::string::npos : close - open);
++    }
++
++    const std::pair<const std::string, task_info> *best = nullptr;
++    std::string pkg, activity;
++    if (split_component_title(title, pkg, activity)) {
++        int best_score = -1;
++        for (const auto &entry : disp.tasks) {
++            const auto &task = entry.second;
++            if (task.appID != pkg)
++                continue;
++            int score = (!task.closing ? 4 : 0)
++                    + (component_class(task.component, pkg) == activity ? 2 : 0)
++                    + (task.focused ? 1 : 0);
++            if (score > best_score
++                    || (score == best_score && std::stoul(entry.first) > std::stoul(best->first))) {
++                best = &entry;
++                best_score = score;
++            }
++        }
++    } else if (vri && !is_system_window_title(title)) {
++        for (const auto &entry : disp.tasks) {
++            if (entry.second.focused && !entry.second.closing && !entry.second.appID.empty()) {
++                best = &entry;
++                break;
++            }
++        }
++        if (best)
++            pkg = best->second.appID;
++    }
++    if (!best)
++        return;
++    info.type = LayerSplitType::TID;
++    info.tid = best->first;
++    info.aid = pkg;
++    info.component = activity;
++}
++
++}  // namespace
++
+ void split_layer_names_helper::setup(waydroid_hwc_composer_device_1 *pdev, const hwc_layer_1 *layers, size_t count_of_layers) {
+     layer_infos.reserve(count_of_layers);
+     for (size_t l = 0; l < count_of_layers; l++) {
+@@ -150,6 +242,14 @@ void split_layer_names_helper::setup(waydroid_hwc_composer_device_1 *pdev, const
+         }();
+         layer_infos.push_back(split_layer_name(name));
+     }
++
++    auto *disp = pdev->display;
++    std::scoped_lock lock(disp->windowsMutex);
++    if (!disp->task_events_seen)
++        return;
++    for (auto &info : layer_infos)
++        if (info.type == LayerSplitType::RawName)
++            resolve_task(*disp, info);
+ }
+ 
+ const std::string& layer_info::key() const {
+diff --git a/interfaces/task/1.0/default/binder-interfaces/IActivityTaskManager.cpp b/interfaces/task/1.0/default/binder-interfaces/IActivityTaskManager.cpp
+index a6c2c82..4697b05 100644
+--- a/interfaces/task/1.0/default/binder-interfaces/IActivityTaskManager.cpp
++++ b/interfaces/task/1.0/default/binder-interfaces/IActivityTaskManager.cpp
+@@ -51,7 +51,10 @@ BpActivityTaskManager::BpActivityTaskManager(const ::android::sp<::android::IBin
+   if (((_aidl_ret_status) != (::android::OK))) {
+     goto _aidl_error;
+   }
+-  _aidl_ret_status = remote()->transact(::android::IBinder::FIRST_CALL_TRANSACTION + 20 /* setFocusedTask */, _aidl_data, &_aidl_reply);
++  /* Transaction codes follow the method order of frameworks/base IActivityTaskManager.aidl
++   * (Android 17: setFocusedTask 18, removeTask 20, removeAllVisibleRecentTasks 21). A stale
++   * order turns setFocusedTask into removeTask: focusing a host window closed its task. */
++  _aidl_ret_status = remote()->transact(::android::IBinder::FIRST_CALL_TRANSACTION + 18 /* setFocusedTask */, _aidl_data, &_aidl_reply);
+   if (((_aidl_ret_status) != (::android::OK))) {
+     goto _aidl_error;
+   }
+@@ -80,7 +83,7 @@ BpActivityTaskManager::BpActivityTaskManager(const ::android::sp<::android::IBin
+   if (((_aidl_ret_status) != (::android::OK))) {
+     goto _aidl_error;
+   }
+-  _aidl_ret_status = remote()->transact(::android::IBinder::FIRST_CALL_TRANSACTION + 22 /* removeTask */, _aidl_data, &_aidl_reply);
++  _aidl_ret_status = remote()->transact(::android::IBinder::FIRST_CALL_TRANSACTION + 20 /* removeTask */, _aidl_data, &_aidl_reply);
+   if (((_aidl_ret_status) != (::android::OK))) {
+     goto _aidl_error;
+   }
+@@ -109,7 +112,7 @@ BpActivityTaskManager::BpActivityTaskManager(const ::android::sp<::android::IBin
+   if (((_aidl_ret_status) != (::android::OK))) {
+     goto _aidl_error;
+   }
+-  _aidl_ret_status = remote()->transact(::android::IBinder::FIRST_CALL_TRANSACTION + 23 /* removeAllVisibleRecentTasks */, _aidl_data, &_aidl_reply);
++  _aidl_ret_status = remote()->transact(::android::IBinder::FIRST_CALL_TRANSACTION + 21 /* removeAllVisibleRecentTasks */, _aidl_data, &_aidl_reply);
+   if (((_aidl_ret_status) != (::android::OK))) {
+     goto _aidl_error;
+   }
+@@ -138,7 +141,7 @@ namespace app {
+ ::android::status_t BnActivityTaskManager::onTransact(uint32_t _aidl_code, const ::android::Parcel& _aidl_data, ::android::Parcel* _aidl_reply, uint32_t _aidl_flags) {
+   ::android::status_t _aidl_ret_status = ::android::OK;
+   switch (_aidl_code) {
+-  case ::android::IBinder::FIRST_CALL_TRANSACTION + 20 /* setFocusedTask */:
++  case ::android::IBinder::FIRST_CALL_TRANSACTION + 18 /* setFocusedTask */:
+   {
+     int32_t in_taskId;
+     if (!(_aidl_data.checkInterface(this))) {
+@@ -159,7 +162,7 @@ namespace app {
+     }
+   }
+   break;
+-  case ::android::IBinder::FIRST_CALL_TRANSACTION + 22 /* removeTask */:
++  case ::android::IBinder::FIRST_CALL_TRANSACTION + 20 /* removeTask */:
+   {
+     int32_t in_taskId;
+     bool _aidl_return;
+@@ -185,7 +188,7 @@ namespace app {
+     }
+   }
+   break;
+-  case ::android::IBinder::FIRST_CALL_TRANSACTION + 23 /* removeAllVisibleRecentTasks */:
++  case ::android::IBinder::FIRST_CALL_TRANSACTION + 21 /* removeAllVisibleRecentTasks */:
+   {
+     if (!(_aidl_data.checkInterface(this))) {
+       _aidl_ret_status = ::android::BAD_TYPE;
+-- 
+2.56.0
+

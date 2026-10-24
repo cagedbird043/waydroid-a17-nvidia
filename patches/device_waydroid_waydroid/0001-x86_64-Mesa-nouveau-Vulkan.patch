@@ -1,0 +1,47 @@
+From 08b8b298ddd5dae00ab8ed507cc8ee23941eb66b Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 04:58:22 +0800
+Subject: [PATCH 1/2] =?utf-8?q?=E6=9E=84=E5=BB=BA=E7=8E=AF=E5=A2=83?=
+ =?utf-8?q?=EF=BC=9Ax86=5F64=20=E4=B8=8D=E7=BC=96=20Mesa=20=E7=9A=84=20nou?=
+ =?utf-8?q?veau=20Vulkan=20=E9=A9=B1=E5=8A=A8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+NVK 的 Rust 部分需要在配置阶段联网下载 crates，并依赖宿主机 bindgen 和带 Android 目标的 rustc；
+离线编译容器里没有这些。NVIDIA 方案使用 waydroid-nvidia 的预编译 NVK，不需要 Mesa 自带的 vulkan.nouveau。
+---
+ device.mk                      | 3 +--
+ waydroid_x86_64/BoardConfig.mk | 2 +-
+ 2 files changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/device.mk b/device.mk
+index 7b97253..8080a32 100644
+--- a/device.mk
++++ b/device.mk
+@@ -127,8 +127,7 @@ ifneq ($(filter %_x86 %_x86_64,$(TARGET_PRODUCT)),)
+ PRODUCT_PACKAGES += \
+     vulkan.intel \
+     vulkan.intel_hasvk \
+-    vulkan.radeon \
+-    vulkan.nouveau
++    vulkan.radeon
+ else
+ PRODUCT_PACKAGES += \
+     vulkan.freedreno \
+diff --git a/waydroid_x86_64/BoardConfig.mk b/waydroid_x86_64/BoardConfig.mk
+index 02f677e..7d29663 100644
+--- a/waydroid_x86_64/BoardConfig.mk
++++ b/waydroid_x86_64/BoardConfig.mk
+@@ -33,7 +33,7 @@ TARGET_NATIVE_BRIDGE_CPU_VARIANT := generic
+ 
+ ifneq ($(TARGET_USE_MESA),false)
+ BOARD_MESA3D_GALLIUM_DRIVERS += i915 iris crocus
+-BOARD_MESA3D_VULKAN_DRIVERS += intel intel_hasvk nouveau
++BOARD_MESA3D_VULKAN_DRIVERS += intel intel_hasvk
+ BOARD_MESA3D_GALLIUM_VA := enabled
+ BOARD_MESA3D_VIDEO_CODECS := all
+ endif
+-- 
+2.56.0
+

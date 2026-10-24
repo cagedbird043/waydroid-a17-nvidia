@@ -1,0 +1,105 @@
+From 3c9a7244ccab5e028490d68c548728276283323d Mon Sep 17 00:00:00 2001
+From: waydroid-nvidia-prolapse <build@local>
+Date: Fri, 16 Oct 2026 18:12:50 +0300
+Subject: [PATCH 15/24] hwcomposer: never send a display hotplug from the
+ present path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+hwc_set() called procs->hotplug(0, 1) whenever an xdg_toplevel configure
+(resize, or a state change such as activation) had set needHotplug. Older
+HWC2On1Adapters dropped display-0 hotplugs, so this was a no-op. The
+lineage-20.0 20260927 vendor image carries Waydroid's "hwc2on1: Handle
+primary hotplugs" patch, which forwards it as CONNECTED. IComposerCallback
+onHotplug is synchronous, so the callback is a nested binder call that
+runs on SurfaceFlinger's main thread, which is inside
+HWComposer::presentAndGetReleaseFences. SurfaceFlinger handles a
+main-thread hotplug at once (processDisplayHotplugEventsLocked ->
+processDisplayChangesLocked -> Display::disconnect ->
+HWComposer::disconnectDisplay -> mDisplayData.erase), then dereferences
+the erased DisplayData for getReleaseFences(): SEGV at
+presentAndGetReleaseFences+807 (core of 2026-10-16 17:15:45: the frame's
+DisplayData node is freed and zeroed, mDisplayData holds a new node for
+the same display). The composer also purged that display's buffer cache
+(ComposerClient cleanDisplayResources) in the middle of its own present.
+
+The display's configs are fixed at calibration (build_display_modes runs
+once), so the hotplug carried no information. Drop it and needHotplug;
+do_hotplug() keeps its touch-pipe/property work and the invalidate nudge.
+
+Regression guard: #pragma GCC poison hotplug in hwcomposer.cpp and
+wayland-hwc.cpp (the two files that hold hwc_procs_t) makes any new
+procs->hotplug call a build error.
+
+移除 ATV 仍在 hwc_set 中发送的主显示 hotplug 和 needHotplug，保留输入管道更新、request_frame 及 ATV 延迟 resize 线程；禁止 present 路径再次引用 hotplug。后续安全主显示重连由独立 resize 模块承接。
+
+(cherry picked from commit 87f1d0f508b38bc7bdcd4651fd9efe27897d514d)
+---
+ hwcomposer/hwcomposer.cpp  | 8 ++------
+ hwcomposer/wayland-hwc.cpp | 3 ++-
+ hwcomposer/wayland-hwc.h   | 1 -
+ 3 files changed, 4 insertions(+), 8 deletions(-)
+
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index acc2cf3..d7d7175 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -57,6 +57,8 @@
+ #include "modes/closed.h"
+ #include "modes/full-ui.h"
+ #include "modes/multi-window.h"
++/* Primary reconnect callbacks must run outside presentDisplay. */
++#pragma GCC poison hotplug
+ #include "modes/single-window.h"
+ 
+ using ::android::hardware::joinRpcThreadpool;
+@@ -999,12 +1001,6 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
+     sw_sync_timeline_inc(pdev->timeline_fd, 1);
+     contents->retireFenceFd = sw_sync_fence_create(pdev->timeline_fd, "hwc_contents_release", ++pdev->next_sync_point);
+ 
+-    if (pdev->display->needHotplug && pdev->procs && pdev->procs->hotplug) {
+-        pdev->procs->hotplug(pdev->procs, 0, 1);
+-        /* No buffer_map.clear(): the buffers stay valid across a hotplug, and
+-         * prune_stale_cached_buffers() drops the ones that stop being used. */
+-        pdev->display->needHotplug = false;
+-    }
+     return 0;
+ }
+ 
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index 0c0ff59..54b82d7 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -87,6 +87,8 @@
+ #include "idle-inhibit-unstable-v1-client-protocol.h"
+ #include "fractional-scale-v1-client-protocol.h"
+ #include "xdg-activation-v1-client-protocol.h"
++/* Primary reconnect callbacks live on the resize worker, outside this file. */
++#pragma GCC poison hotplug
+ #include "xdg-decoration-unstable-v1-client-protocol.h"
+ 
+ using ::android::hardware::hidl_string;
+@@ -410,7 +412,6 @@ do_hotplug(struct display *display) {
+ 
+         reset_input_pipe(display, INPUT_TOUCH);
+     }
+-    display->needHotplug = true;
+     request_frame(display);
+ }
+ 
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index 139b65f..0754c3d 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -790,7 +790,6 @@ struct display {
+     sp<IWaydroidTask> task;
+ 
+     const hwc_procs_t *procs;
+-    bool needHotplug;
+ 
+     /* Desired Android screen state, tracked so we only inject a sleep/wake
+      * key on an actual on<->off transition driven by host visibility. */
+-- 
+2.56.0
+
