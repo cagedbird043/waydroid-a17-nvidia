@@ -7,7 +7,7 @@
 PRODUCT_PACKAGES += \
     nvprolapse_vulkan.nvidia \
     nvprolapse_libvulkan_nouveau \
-    nvprolapse_libnv_bionic_native \
+    libnv_bionic_native \
     nvprolapse_libdrm.so.2
 
 # GLES: ANGLE (default) and our gallium driver nvrm (ro.hardware.egl=nvrm), both in /vendor/<lib>/egl

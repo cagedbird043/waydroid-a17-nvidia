@@ -9,7 +9,8 @@ if [ -f "$PIN" ]; then
     NB=$ROOT/$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$PIN")
 fi
 ANGLE=$ROOT/nvidia/release/guest-prebuilts
-MEDIA=$ROOT/nvidia/waydroid-nvidia/nvidia-prolapse/media/odm/etc
+WN=$ROOT/nvidia/waydroid-nvidia/nvidia-prolapse
+MEDIA=$WN/media/odm/etc
 
 python3 -I - "$NB" "$PIN" <<'PY'
 import hashlib, json, os, sys
@@ -30,7 +31,8 @@ PY
 
 for d in device/nvidia-prolapse vendor/nvidia-prolapse; do
     mkdir -p "$TREE/$d"
-    rsync -rlp --checksum --delete --exclude=/identity.mk --exclude=/prebuilts "$ROOT/nvidia/product/$d/" "$TREE/$d/"
+    rsync -rlp --checksum --delete --exclude=/identity.mk --exclude=/prebuilts --exclude=/media-src \
+        "$ROOT/nvidia/product/$d/" "$TREE/$d/"
 done
 
 rec_sha=$(sha256sum "$NB/BUILD-RECORD.json" | cut -d' ' -f1)
@@ -46,4 +48,10 @@ rsync -rlp --checksum --delete "$NB/payload/" "$pre/native/payload/"
 rsync -rlp --checksum "$NB/BUILD-RECORD.json" "$pre/native/"
 rsync -rlp --checksum --delete "$MEDIA/" "$pre/media/odm/etc/"
 rsync -rlp --checksum --delete --include='*/' --include='lib*_angle.so' --exclude='*' "$ANGLE/vendor/" "$pre/angle/vendor/"
+# Codec2 service sources for Android.bp (built in this tree, see there)
+src=$TREE/vendor/nvidia-prolapse/media-src
+mkdir -p "$src/core" "$src/c2" "$src/video"
+rsync -rlp --checksum --delete "$WN/media/core/" "$src/core/"
+rsync -rlp --checksum --delete "$WN/media/c2/" "$src/c2/"
+rsync -rlp --checksum --delete "$WN/driver-source/native/video/nv_video.h" "$src/video/"
 echo "product layer staged: $version build_record=$rec_sha"

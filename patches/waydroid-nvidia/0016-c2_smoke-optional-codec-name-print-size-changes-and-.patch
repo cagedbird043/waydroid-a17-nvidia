@@ -1,0 +1,81 @@
+From 883dee08f094f2b519920b307f1e7db3a3536550 Mon Sep 17 00:00:00 2001
+From: Shiro836 <noreply>
+Date: Sat, 24 Oct 2026 03:29:10 +0300
+Subject: [PATCH 16/17] c2_smoke: optional codec name; print size changes and
+ hdr-static-info
+
+Live (guest, new service run by hand, 03:19): up-vp9/up-av1 (640x360 -> 1280x720 at a
+keyframe, past the configured max) 48/48 frames each through c2.nvprolapse.{vp9,av1};
+the previous service fails both. 8-bit HEVC (x265 SEI) and AV1 (SVT metadata OBUs)
+with the same mastering display/CLL: hdr-static-info R(34000,16000) G(13250,34500)
+B(7500,3000) W(15635,16450) maxL 1000 minL 1 MaxCLL 1000 MaxFALL 400 = encoder input
+(the MP4s carry no container HDR boxes).
+
+(cherry picked from commit 0445562588c3d1ec376c7e9d06ab524cd0276953)
+---
+ nvidia-prolapse/media/test/README.md    |  5 ++++-
+ nvidia-prolapse/media/test/c2_smoke.cpp | 19 +++++++++++++++++--
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/nvidia-prolapse/media/test/README.md b/nvidia-prolapse/media/test/README.md
+index 77e5216..917ebd1 100644
+--- a/nvidia-prolapse/media/test/README.md
++++ b/nvidia-prolapse/media/test/README.md
+@@ -40,5 +40,8 @@ make smoke NV_VIDEO_LIB="-L<dir> -lnv_bionic_native -Wl,-rpath,<dir>" CODECS="h2
+ `c2_smoke.cpp` is the guest-side client: it decodes an MP4 through the public MediaCodec
+ NDK on a ByteBuffer output (no Surface), i.e. through the shipped Codec2 service, the YV12
+ gralloc path and the CPU_READ pool flag. Build it against the NDK with `make c2-smoke`,
+-push it and the test MP4s to `/data/local/tmp`, and run it while `strace -f -c` is attached
++push it and the test MP4s to `/data/local/tmp`. `c2_smoke <in.mp4> [codec name]` prints every
++output-format change (size, and `hdr-static-info` as the client receives it), so an adaptive
++stream that switches size at a keyframe and an HDR stream's ST 2086 / CLL values can be checked
++end to end. Run it while `strace -f -c` is attached
+ to `android.hardware.media.c2@1.2-service-nvprolapse` to re-measure the seccomp policy.
+diff --git a/nvidia-prolapse/media/test/c2_smoke.cpp b/nvidia-prolapse/media/test/c2_smoke.cpp
+index b148513..f113f2e 100644
+--- a/nvidia-prolapse/media/test/c2_smoke.cpp
++++ b/nvidia-prolapse/media/test/c2_smoke.cpp
+@@ -37,7 +37,7 @@ static int32_t format_int(AMediaFormat *f, const char *key, int32_t dflt)
+ int main(int argc, char **argv)
+ {
+     if (argc < 2) {
+-        fprintf(stderr, "usage: c2_smoke <in.mp4>\n");
++        fprintf(stderr, "usage: c2_smoke <in.mp4> [codec name, e.g. c2.nvprolapse.hevc.decoder]\n");
+         return 2;
+     }
+     int fd = open(argv[1], O_RDONLY | O_CLOEXEC);
+@@ -73,7 +73,7 @@ int main(int argc, char **argv)
+     const int32_t w = format_int(fmt, AMEDIAFORMAT_KEY_WIDTH, 0);
+     const int32_t h = format_int(fmt, AMEDIAFORMAT_KEY_HEIGHT, 0);
+ 
+-    AMediaCodec *codec = AMediaCodec_createDecoderByType(mime);
++    AMediaCodec *codec = argc > 2 ? AMediaCodec_createCodecByName(argv[2]) : AMediaCodec_createDecoderByType(mime);
+     if (!codec) {
+         fprintf(stderr, "no decoder for %s\n", mime);
+         return 77;
+@@ -124,7 +124,22 @@ int main(int argc, char **argv)
+             if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
+                 break;
+         } else if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
++            /* size changes (adaptive streams) and HDR static info (MediaFormat "hdr-static-info":
++             * HDRStaticInfo type 1, little-endian u16 R/G/B/W xy in 0.00002, max/min display
++             * luminance in 1 / 0.0001 cd/m2, MaxCLL, MaxFALL) as the client sees them */
+             AMediaFormat *of = AMediaCodec_getOutputFormat(codec);
++            printf("output format: %dx%d\n", format_int(of, AMEDIAFORMAT_KEY_WIDTH, 0),
++                   format_int(of, AMEDIAFORMAT_KEY_HEIGHT, 0));
++            void *hdr = nullptr;
++            size_t hdr_len = 0;
++            if (AMediaFormat_getBuffer(of, AMEDIAFORMAT_KEY_HDR_STATIC_INFO, &hdr, &hdr_len) && hdr_len >= 25) {
++                const uint8_t *b = (const uint8_t *)hdr;
++                auto u16 = [b](int i) { return (unsigned)(b[1 + 2 * i] | b[2 + 2 * i] << 8); };
++                printf("hdr-static-info: type %u R(%u,%u) G(%u,%u) B(%u,%u) W(%u,%u) maxL %u minL %u MaxCLL %u "
++                       "MaxFALL %u\n",
++                       b[0], u16(0), u16(1), u16(2), u16(3), u16(4), u16(5), u16(6), u16(7), u16(8), u16(9), u16(10),
++                       u16(11));
++            }
+             AMediaFormat_delete(of);
+         }
+     }
+-- 
+2.56.0
+

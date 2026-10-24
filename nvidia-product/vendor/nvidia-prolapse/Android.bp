@@ -1,0 +1,89 @@
+// nvidia-prolapse modules that other modules of this tree link against (the remaining driver prebuilts are in
+// Android.mk). Sources and prebuilts are copied in by scripts/stage-product.sh: prebuilts/native = the native
+// bundle's payload, media-src = nvidia-prolapse/media (core, c2) and the nv_video ABI header.
+
+// Rust RM backend + nv_video (NVDEC). NVK, nvrm and the Codec2 service NEED it.
+cc_prebuilt_library_shared {
+    name: "libnv_bionic_native",
+    vendor: true,
+    compile_multilib: "both",
+    arch: {
+        x86_64: {
+            srcs: ["prebuilts/native/payload/vendor_extra/lib64/libnv_bionic_native.so"],
+        },
+        x86: {
+            srcs: ["prebuilts/native/payload/vendor_extra/lib/libnv_bionic_native.so"],
+        },
+    },
+    strip: {
+        none: true,
+    },
+    check_elf_files: false,
+}
+
+// Codec2 NVDEC decoder service on /odm. Built here, against this tree's vendor HIDL and Codec2 libraries: their
+// ABI is Android 17's (no Waydroid host-hwbinder patch in libhwbinder), so a service compiled against the
+// Waydroid LineageOS 20 headers would run with a shifted IBinder vtable and a wrong Parcel size. The native
+// bundle ships this module's output as payload/odm/bin/hw/<name>.
+cc_binary {
+    name: "android.hardware.media.c2@1.2-service-nvprolapse",
+    device_specific: true,
+    relative_install_path: "hw",
+    compile_multilib: "64",
+    // init_rc/vintf_fragments of a device_specific module land on /vendor/etc in the Make install list (the
+    // exported module is LOCAL_IN_VENDOR), so the two files are separate /odm prebuilt_etc modules
+    required: [
+        "android.hardware.media.c2@1.2-service-nvprolapse.rc",
+        "android.hardware.media.c2@1.2-nvprolapse.xml",
+    ],
+    srcs: [
+        "media-src/core/nvc2_caps.cpp",
+        "media-src/core/nvc2_decoder.cpp",
+        "media-src/c2/NvC2Component.cpp",
+        "media-src/c2/service.cpp",
+    ],
+    local_include_dirs: [
+        "media-src/core",
+        "media-src/c2",
+        "media-src/video",
+    ],
+    include_dirs: ["external/minigbm/cros_gralloc"],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+    shared_libs: [
+        "android.hardware.media.c2@1.0",
+        "android.hardware.media.c2@1.1",
+        "android.hardware.media.c2@1.2",
+        "libbase",
+        "libbinder",
+        "libcodec2",
+        "libcodec2_hidl@1.0",
+        "libcodec2_hidl@1.1",
+        "libcodec2_hidl@1.2",
+        "libcodec2_soft_common",
+        "libcodec2_vndk",
+        "libcutils",
+        "libhidlbase",
+        "libhwminijail",
+        "liblog",
+        "libnv_bionic_native",
+        "libstagefright_foundation",
+        "libutils",
+    ],
+}
+
+prebuilt_etc {
+    name: "android.hardware.media.c2@1.2-service-nvprolapse.rc",
+    device_specific: true,
+    sub_dir: "init",
+    src: "prebuilts/media/odm/etc/init/android.hardware.media.c2@1.2-service-nvprolapse.rc",
+}
+
+prebuilt_etc {
+    name: "android.hardware.media.c2@1.2-nvprolapse.xml",
+    device_specific: true,
+    sub_dir: "vintf/manifest",
+    src: "prebuilts/media/odm/etc/vintf/manifest/android.hardware.media.c2@1.2-nvprolapse.xml",
+}

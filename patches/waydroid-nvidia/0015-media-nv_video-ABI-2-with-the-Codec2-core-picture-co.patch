@@ -1,0 +1,3866 @@
+From 7768adefc100d3278e357197d78bbb2ac64ce2b5 Mon Sep 17 00:00:00 2001
+From: Shiro836 <noreply>
+Date: Sat, 24 Oct 2026 03:10:41 +0300
+Subject: [PATCH 15/17] =?utf-8?q?media:=20nv=5Fvideo=20ABI=202=20with=20th?=
+ =?utf-8?q?e=20Codec2=20core=20=E2=80=94=20picture=20count,=20size-change?=
+ =?utf-8?q?=20re-creation,=20HDR=20static=20info?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+nv_video (driver-source/native video tree):
+- ABI 2: nv_video_decode returns the displayable pictures a unit produced
+  (success is rc >= 0); NV_VIDEO_E_RESIZE + nv_video_required_size for a
+  random access point larger than the session; nv_video_picture_hdr.
+- VP9 segment maps: zeroed once with the side buffer at allocation, read/write
+  pair swapped only after segmentation_update_map, nothing touched at
+  key/intra-only/error-resilient pictures (the engine applies the reset).
+- HEVC 2-D tile grids, H.264/HEVC/AV1/VP9 refusals with named reasons,
+  HDR static metadata parser (SEI 137/144, AV1 HDR_MDCV/HDR_CLL).
+
+Codec2 core: rc >= 0 is success; a unit that produced no picture is finished
+at once; E_RESIZE drains the old session, re-creates it at the new size,
+replays in-band parameter sets and decodes the unit again (AOSP
+C2SoftHevcDec.cpp:881-890 precedent); HDR static metadata per output.
+Component: C2StreamHdrStaticInfo declared and reported (buffer info +
+configUpdate on change), coded units converted per codec.
+
+Verified: core_test + xml_test pass (stub covers count, retire, resize with
+and without buffer backpressure, HDR units); realtest-all 9/9 PASS on the
+RTX 5090; android-c2 compiles; native lib tests 46 video pass.
+
+(cherry picked from commit fbcc0669d9b41c79e1dd27b1601d02b15cd17f05)
+---
+ .../native/src/bin/nv-video-avc-test.rs       | 122 ++++-
+ .../native/src/bin/nv-video-test.rs           |  51 +-
+ .../native/src/video/av1/codec.rs             |  28 +-
+ .../native/src/video/av1/desc.rs              |   6 +-
+ .../native/src/video/av1/header.rs            | 112 +++-
+ .../driver-source/native/src/video/av1/mf.rs  |  12 +-
+ .../native/src/video/av1/tests.rs             | 111 ++++
+ .../driver-source/native/src/video/ffi.rs     | 136 ++++-
+ .../native/src/video/h264/codec.rs            |  13 +-
+ .../native/src/video/h264/legacy.rs           |   2 +-
+ .../native/src/video/h264/mod.rs              |  16 +-
+ .../native/src/video/h264/tests.rs            | 177 ++++++
+ .../driver-source/native/src/video/hdr.rs     | 514 ++++++++++++++++++
+ .../native/src/video/hevc/codec.rs            |   7 +-
+ .../native/src/video/hevc/desc.rs             |  17 +-
+ .../native/src/video/hevc/tests.rs            | 208 +++++++
+ .../driver-source/native/src/video/mod.rs     |  87 ++-
+ .../driver-source/native/src/video/pretend.rs |  38 +-
+ .../driver-source/native/src/video/session.rs | 313 ++++++++++-
+ .../driver-source/native/src/video/vp9.rs     | 140 ++++-
+ .../driver-source/native/video/README.md      |  73 ++-
+ .../driver-source/native/video/nv_video.h     |  70 ++-
+ nvidia-prolapse/media/c2/NvC2Component.cpp    |  42 ++
+ nvidia-prolapse/media/c2/NvC2Component.h      |   1 +
+ nvidia-prolapse/media/core/nvc2_decoder.cpp   | 138 ++++-
+ nvidia-prolapse/media/core/nvc2_decoder.h     |  30 +-
+ nvidia-prolapse/media/test/core_test.cpp      | 130 ++++-
+ nvidia-prolapse/media/test/nv_video_stub.cpp  |  48 +-
+ nvidia-prolapse/media/test/nv_video_stub.h    |   1 +
+ 29 files changed, 2474 insertions(+), 169 deletions(-)
+ create mode 100644 nvidia-prolapse/driver-source/native/src/video/hdr.rs
+
+diff --git a/nvidia-prolapse/driver-source/native/src/bin/nv-video-avc-test.rs b/nvidia-prolapse/driver-source/native/src/bin/nv-video-avc-test.rs
+index 2f7fef5..faf2aab 100644
+--- a/nvidia-prolapse/driver-source/native/src/bin/nv-video-avc-test.rs
++++ b/nvidia-prolapse/driver-source/native/src/bin/nv-video-avc-test.rs
+@@ -10,6 +10,7 @@
+ //! p010le: 16-bit little-endian samples, 10 MSBs).
+ //! NV_VIDEO_DUMP=<out.nv12>: also write every output picture (display order,
+ //! display window, tightly packed NV12, concatenated) to that file.
++use nv_bionic_native::video::ffi::NvVideoHdrMetadata;
+ use nv_bionic_native::video::{
+     bits::access_units, ffi::*, NvVideoDeviceInfo, TestDmaBuf, VideoDevice, CODEC_H264, CODEC_HEVC,
+     FORMAT_NV12, FORMAT_P010, FORMAT_YUV420P,
+@@ -25,28 +26,35 @@ fn check(r: i32, what: &str) {
+     }
+ }
+ 
++#[repr(C)]
++struct PollFd {
++    fd: i32,
++    e: i16,
++    r: i16,
++}
++extern "C" {
++    fn poll(f: *mut PollFd, n: std::ffi::c_ulong, t: i32) -> i32;
++    fn close(fd: i32) -> i32;
++}
++
+ fn wait_fd(fd: i32) {
+     if fd < 0 {
+         return;
+     }
+-    #[repr(C)]
+-    struct P {
+-        fd: i32,
+-        e: i16,
+-        r: i16,
+-    }
+-    extern "C" {
+-        fn poll(f: *mut P, n: std::ffi::c_ulong, t: i32) -> i32;
+-        fn close(fd: i32) -> i32;
+-    }
+-    let mut p = P { fd, e: 1, r: 0 };
+-    // SAFETY: one pollfd; fd owned by us.
++    wait_fd_keep(fd);
++    // SAFETY: fd owned by us.
++    unsafe { close(fd) };
++}
++
++/// poll(POLLIN) but leaving the fd open (measured acquire-fence path).
++fn wait_fd_keep(fd: i32) {
++    let mut p = PollFd { fd, e: 1, r: 0 };
++    // SAFETY: one pollfd, valid for the call.
+     unsafe {
+         if poll(&mut p, 1, 2000) != 1 {
+             eprintln!("release fence did not signal");
+             std::process::exit(3);
+         }
+-        close(fd);
+     }
+ }
+ 
+@@ -75,6 +83,9 @@ fn main() {
+         info.nvdec_class,
+         info.nvdec_engines
+     );
++    // NV_VIDEO_REPORT=1: per-unit picture counts (nv_video_decode's ABI 2 return) and the
++    // HDR static metadata of the first picture that carries any.
++    let report = std::env::var_os("NV_VIDEO_REPORT").is_some();
+     let bit_depth: u32 =
+         std::env::var("NV_VIDEO_BIT_DEPTH").map_or(8, |v| v.parse().expect("NV_VIDEO_BIT_DEPTH"));
+     let bps = if bit_depth > 8 { 2usize } else { 1 };
+@@ -110,6 +121,12 @@ fn main() {
+     let (mut frames, mut bad, mut diff_total) = (0usize, 0usize, 0usize);
+     let mut dec_times = Vec::new();
+     let mut copy_times = Vec::new();
++    // NV_VIDEO_MEASURE_ACQUIRE=1: pass the previous picture's (already signalled) release
++    // fence back as the acquire fence, the steady state of a media pipeline, and time the
++    // copy_out call alone. The wait on a signalled sync_file is one poll(2).
++    let measure_acquire = std::env::var_os("NV_VIDEO_MEASURE_ACQUIRE").is_some();
++    let mut acquire = -1i32;
++    let mut copy_call: Vec<Duration> = Vec::new();
+     let mut out = vec![0u8; size];
+     let mut dump = std::env::var_os("NV_VIDEO_DUMP")
+         .map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("create NV_VIDEO_DUMP")));
+@@ -118,7 +135,9 @@ fn main() {
+                       bad: &mut usize,
+                       diff_total: &mut usize,
+                       off: &mut usize,
+-                      copy_times: &mut Vec<Duration>| {
++                      copy_times: &mut Vec<Duration>,
++                      acquire: &mut i32,
++                      copy_call: &mut Vec<Duration>| {
+         loop {
+             let mut pic = std::mem::MaybeUninit::<NvVideoPicture>::zeroed();
+             let r = unsafe { nv_video_next_picture(s, pic.as_mut_ptr()) };
+@@ -127,6 +146,35 @@ fn main() {
+                 break;
+             }
+             let pic = unsafe { pic.assume_init() };
++            if report {
++                let mut hdr = std::mem::MaybeUninit::<NvVideoHdrMetadata>::zeroed();
++                check(
++                    unsafe { nv_video_picture_hdr(s, pic.id, hdr.as_mut_ptr()) },
++                    "picture_hdr",
++                );
++                let hdr = unsafe { hdr.assume_init() };
++                if hdr.has_mastering_display != 0 || hdr.has_content_light_level != 0 {
++                    println!(
++                        "picture {} HDR: mdcv {} primaries (SEI order G,B,R) ({},{}) ({},{}) ({},{}) WP({},{}) \
++                         L({},{}) CLL {} ({},{})",
++                        pic.id,
++                        hdr.has_mastering_display,
++                        hdr.mastering_display.display_primaries_x[0],
++                        hdr.mastering_display.display_primaries_y[0],
++                        hdr.mastering_display.display_primaries_x[1],
++                        hdr.mastering_display.display_primaries_y[1],
++                        hdr.mastering_display.display_primaries_x[2],
++                        hdr.mastering_display.display_primaries_y[2],
++                        hdr.mastering_display.white_point_x,
++                        hdr.mastering_display.white_point_y,
++                        hdr.mastering_display.max_luminance,
++                        hdr.mastering_display.min_luminance,
++                        hdr.has_content_light_level,
++                        hdr.max_content_light_level,
++                        hdr.max_pic_average_light_level
++                    );
++                }
++            }
+             let (w, h) = (pic.crop_width as usize, pic.crop_height as usize);
+             target.fill(0xa5).unwrap();
+             // NV_VIDEO_TARGET=yuv420p: planar target laid out like an Android YV12 buffer (Y, then
+@@ -148,7 +196,7 @@ fn main() {
+                 },
+                 width: max_w,
+                 height: max_h,
+-                acquire_fence_fd: -1,
++                acquire_fence_fd: if measure_acquire { *acquire } else { -1 },
+                 cr_dmabuf_fd: if planar { tfd } else { -1 },
+                 cr_pitch: if planar { cpitch } else { 0 },
+                 cr_offset: if planar { cr } else { 0 },
+@@ -160,7 +208,18 @@ fn main() {
+                 unsafe { nv_video_copy_out(s, pic.id, &t, &mut fence) },
+                 "copy_out",
+             );
+-            wait_fd(fence);
++            copy_call.push(t0.elapsed());
++            if measure_acquire {
++                // The acquire fd is borrowed for the call, ours afterwards.
++                if *acquire >= 0 {
++                    // SAFETY: fd owned by us.
++                    unsafe { close(*acquire) };
++                }
++                wait_fd_keep(fence);
++                *acquire = fence;
++            } else {
++                wait_fd(fence);
++            }
+             copy_times.push(t0.elapsed());
+             target.read(0, &mut out).unwrap();
+             let mut nv12 = Vec::with_capacity(w * h * 3 / 2 * bps);
+@@ -169,7 +228,8 @@ fn main() {
+             }
+             for y in 0..h.div_ceil(2) {
+                 if planar {
+-                    let row = |base: u64| &out[base as usize + y * cpitch as usize..][..w.div_ceil(2)];
++                    let row =
++                        |base: u64| &out[base as usize + y * cpitch as usize..][..w.div_ceil(2)];
+                     for (u, v) in row(cb).iter().zip(row(cr)) {
+                         nv12.extend_from_slice(&[*u, *v]);
+                     }
+@@ -203,12 +263,17 @@ fn main() {
+         }
+     };
+     let start = Instant::now();
++    let mut empty_units = 0usize;
+     for (i, p) in packets.iter().enumerate() {
+         let t0 = Instant::now();
+-        check(
+-            unsafe { nv_video_decode(s, p.as_ptr(), p.len(), i as u64, 0) },
+-            "decode",
+-        );
++        let shown = unsafe { nv_video_decode(s, p.as_ptr(), p.len(), i as u64, 0) };
++        check(shown, "decode");
++        if shown == 0 {
++            empty_units += 1;
++        }
++        if report {
++            println!("unit {i}: {shown} displayable pictures, {} bytes", p.len());
++        }
+         dec_times.push(t0.elapsed());
+         handle(
+             s,
+@@ -217,6 +282,8 @@ fn main() {
+             &mut diff_total,
+             &mut off,
+             &mut copy_times,
++            &mut acquire,
++            &mut copy_call,
+         );
+     }
+     check(
+@@ -230,6 +297,8 @@ fn main() {
+         &mut diff_total,
+         &mut off,
+         &mut copy_times,
++        &mut acquire,
++        &mut copy_call,
+     );
+     let wall = start.elapsed();
+     if let Some(d) = dump.as_mut() {
+@@ -246,8 +315,17 @@ fn main() {
+     };
+     let (dm, dmed, dmax) = stat(&mut dec_times);
+     let (cm, cmed, cmax) = stat(&mut copy_times);
++    let (mm, mmed, _) = stat(&mut copy_call.clone());
++    println!(
++        "copy_out call mean {mm:?} median {mmed:?}{}",
++        if measure_acquire {
++            " (acquire fence = the previous picture's release fence, already signalled)"
++        } else {
++            ""
++        }
++    );
+     println!(
+-        "{} packets, {frames} pictures, max {max_w}x{max_h}; nv_video_decode mean {dm:?} median {dmed:?} max {dmax:?}; copy_out+fence mean {cm:?} median {cmed:?} max {cmax:?}; wall {wall:?}",
++        "{} packets ({empty_units} without a displayable picture), {frames} pictures, max {max_w}x{max_h}; nv_video_decode mean {dm:?} median {dmed:?} max {dmax:?}; copy_out+fence mean {cm:?} median {cmed:?} max {cmax:?}; wall {wall:?}",
+         packets.len()
+     );
+     unsafe {
+diff --git a/nvidia-prolapse/driver-source/native/src/bin/nv-video-test.rs b/nvidia-prolapse/driver-source/native/src/bin/nv-video-test.rs
+index e5974dd..b7afdaf 100644
+--- a/nvidia-prolapse/driver-source/native/src/bin/nv-video-test.rs
++++ b/nvidia-prolapse/driver-source/native/src/bin/nv-video-test.rs
+@@ -9,6 +9,7 @@
+ //! p010le: 16-bit little-endian samples, 10 MSBs).
+ //! NV_VIDEO_DUMP=<out.nv12>: also write every output picture (display order,
+ //! display window, tightly packed NV12, concatenated) to that file.
++use nv_bionic_native::video::ffi::NvVideoHdrMetadata;
+ use nv_bionic_native::video::{
+     ffi::*, NvVideoDeviceInfo, TestDmaBuf, VideoDevice, CODEC_AV1, CODEC_VP9, FORMAT_NV12,
+     FORMAT_P010, FORMAT_YUV420P,
+@@ -109,6 +110,9 @@ fn main() {
+             config.extend_from_slice(o.payload);
+         }
+     }
++    // NV_VIDEO_REPORT=1: per-unit picture counts (nv_video_decode's ABI 2 return) and the
++    // HDR static metadata of every picture that carries any.
++    let report = std::env::var_os("NV_VIDEO_REPORT").is_some();
+     let bit_depth: u32 =
+         std::env::var("NV_VIDEO_BIT_DEPTH").map_or(8, |v| v.parse().expect("NV_VIDEO_BIT_DEPTH"));
+     let bps = if bit_depth > 8 { 2usize } else { 1 };
+@@ -170,6 +174,35 @@ fn main() {
+                 break;
+             }
+             let pic = unsafe { pic.assume_init() };
++            if report {
++                let mut hdr = std::mem::MaybeUninit::<NvVideoHdrMetadata>::zeroed();
++                check(
++                    unsafe { nv_video_picture_hdr(s, pic.id, hdr.as_mut_ptr()) },
++                    "picture_hdr",
++                );
++                let hdr = unsafe { hdr.assume_init() };
++                if hdr.has_mastering_display != 0 || hdr.has_content_light_level != 0 {
++                    println!(
++                        "picture {} HDR: mdcv {} R({},{}) G({},{}) B({},{}) WP({},{}) L({},{}) \
++                         CLL {} ({},{})",
++                        pic.id,
++                        hdr.has_mastering_display,
++                        hdr.mastering_display.display_primaries_x[0],
++                        hdr.mastering_display.display_primaries_y[0],
++                        hdr.mastering_display.display_primaries_x[1],
++                        hdr.mastering_display.display_primaries_y[1],
++                        hdr.mastering_display.display_primaries_x[2],
++                        hdr.mastering_display.display_primaries_y[2],
++                        hdr.mastering_display.white_point_x,
++                        hdr.mastering_display.white_point_y,
++                        hdr.mastering_display.max_luminance,
++                        hdr.mastering_display.min_luminance,
++                        hdr.has_content_light_level,
++                        hdr.max_content_light_level,
++                        hdr.max_pic_average_light_level
++                    );
++                }
++            }
+             let (w, h) = (pic.crop_width as usize, pic.crop_height as usize);
+             target.fill(0xa5).unwrap();
+             // NV_VIDEO_TARGET=yuv420p: planar target laid out like an Android YV12 buffer (Y, then
+@@ -212,7 +245,8 @@ fn main() {
+             }
+             for y in 0..h.div_ceil(2) {
+                 if planar {
+-                    let row = |base: u64| &out[base as usize + y * cpitch as usize..][..w.div_ceil(2)];
++                    let row =
++                        |base: u64| &out[base as usize + y * cpitch as usize..][..w.div_ceil(2)];
+                     for (u, v) in row(cb).iter().zip(row(cr)) {
+                         nv12.extend_from_slice(&[*u, *v]);
+                     }
+@@ -246,12 +280,17 @@ fn main() {
+         }
+     };
+     let start = Instant::now();
++    let mut empty_units = 0usize;
+     for (i, p) in packets.iter().enumerate() {
+         let t0 = Instant::now();
+-        check(
+-            unsafe { nv_video_decode(s, p.as_ptr(), p.len(), i as u64, 0) },
+-            "decode",
+-        );
++        let shown = unsafe { nv_video_decode(s, p.as_ptr(), p.len(), i as u64, 0) };
++        check(shown, "decode");
++        if shown == 0 {
++            empty_units += 1;
++        }
++        if report {
++            println!("unit {i}: {shown} displayable pictures, {} bytes", p.len());
++        }
+         dec_times.push(t0.elapsed());
+         handle(
+             s,
+@@ -290,7 +329,7 @@ fn main() {
+     let (dm, dmed, dmax) = stat(&mut dec_times);
+     let (cm, cmed, cmax) = stat(&mut copy_times);
+     println!(
+-        "{} packets, {frames} pictures, max {max_w}x{max_h}; nv_video_decode mean {dm:?} median {dmed:?} max {dmax:?}; copy_out+fence mean {cm:?} median {cmed:?} max {cmax:?}; wall {wall:?}",
++        "{} packets ({empty_units} without a displayable picture), {frames} pictures, max {max_w}x{max_h}; nv_video_decode mean {dm:?} median {dmed:?} max {dmax:?}; copy_out+fence mean {cm:?} median {cmed:?} max {cmax:?}; wall {wall:?}",
+         packets.len()
+     );
+     unsafe {
+diff --git a/nvidia-prolapse/driver-source/native/src/video/av1/codec.rs b/nvidia-prolapse/driver-source/native/src/video/av1/codec.rs
+index 230ba41..11214df 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/av1/codec.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/av1/codec.rs
+@@ -265,19 +265,31 @@ impl CodecDecoder for Av1Decoder {
+             }
+             Av1Out::Decode(j) => {
+                 let h = &j.hdr;
+-                if h.upscaled_width > self.max.0 || h.frame_height > self.max.1 {
+-                    return Err(VideoError::Unsupported(format!(
+-                        "AV1 frame {}x{} larger than the session max {}x{}",
+-                        h.upscaled_width, h.frame_height, self.max.0, self.max.1
+-                    )));
+-                }
+                 if h.use_superres && !h.frame_is_intra {
+-                    // Intra superres frames decode bit-exact; inter frames with superres-scaled references
+-                    // report NVDEC error_status 0xb/0xd (a stock capture with superres is the next step).
++                    // Stock libnvcuvid 615.78.08 decodes superres inter frames. This decoder now
++                    // reproduces its picture descriptor for them (current frame info carries the
++                    // coded width, the reference scale factors are upscaled-ref to coded-current,
++                    // and the motion-field size gate finds no candidate), verified byte-for-byte
++                    // against a runtime capture of the installed library; the engine still
++                    // reports error_status 0xd on the fifth picture of the capture stream, so a
++                    // field outside the compared region is still missing. Refuse rather than
++                    // submit a descriptor that is known incomplete.
+                     return Err(VideoError::Unsupported(
+                         "AV1 superres on inter frames".into(),
+                     ));
+                 }
++                if h.upscaled_width > self.max.0 || h.frame_height > self.max.1 {
++                    // A shown key frame refreshes every reference slot (spec 5.9.2:
++                    // refresh_frame_flags = allFrames).
++                    let random_access = h.frame_type == super::header::KEY_FRAME && h.show_frame;
++                    return Err(crate::video::too_large(
++                        "AV1",
++                        h.upscaled_width,
++                        h.frame_height,
++                        self.max,
++                        random_access,
++                    ));
++                }
+                 if j.apply_grain && !self.grain_capable {
+                     return Err(VideoError::Unsupported(
+                         "AV1 film grain: pass the sequence header as codec_config (reference surfaces are \
+diff --git a/nvidia-prolapse/driver-source/native/src/video/av1/desc.rs b/nvidia-prolapse/driver-source/native/src/video/av1/desc.rs
+index f791a6e..1e12598 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/av1/desc.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/av1/desc.rs
+@@ -438,7 +438,11 @@ pub fn build_pic_s(i: &PicInputs) -> [u8; PIC_S_SIZE] {
+     };
+     put(p, f::LR_UNIT_SIZE, lr_size);
+     let stride = (i.pitch / 16) as u64;
+-    put_frame_info(p, f::CUR_FRAME, h.upscaled_width, h.frame_height, stride);
++    // Current frame: the CUVID width is the upscaled width when superres is on, but the picture
++    // descriptor carries the coded (pre-superres) width — stock libnvcuvid 615.78.08 on a
++    // superres inter frame writes 213 for a 320-wide upscaled 213-coded picture, and the
++    // motion-field size gate compares references against this same width.
++    put_frame_info(p, f::CUR_FRAME, h.frame_width, h.frame_height, stride);
+     for k in 0..7 {
+         let base = f::REF_FRAME + f::REF_FRAME_BITS * k;
+         if h.frame_is_intra {
+diff --git a/nvidia-prolapse/driver-source/native/src/video/av1/header.rs b/nvidia-prolapse/driver-source/native/src/video/av1/header.rs
+index a0d8b99..27e9921 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/av1/header.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/av1/header.rs
+@@ -510,6 +510,110 @@ pub struct ParserState {
+ }
+ 
+ impl ParserState {
++    /// Spec 7.8 `set_frame_refs()`: derive the reference slots for
++    /// LAST..ALTREF from the reference slots' order hints when
++    /// `frame_refs_short_signaling` is set. Control flow follows FFmpeg's
++    /// cbs_av1_syntax_template.c:348-455 (a transcription of the spec
++    /// pseudocode): pick ALTREF (latest at/after the current frame), BWDREF
++    /// (earliest at/after), ALTREF2 (the next one), LAST2/LAST3 (latest before),
++    /// then fill anything left with the earliest slot overall.
++    pub(super) fn set_frame_refs(
++        &self,
++        last_frame_idx: u8,
++        gold_frame_idx: u8,
++        cur_order_hint: u32,
++    ) -> Result<[u8; REFS_PER_FRAME]> {
++        let seq = self.seq.as_ref().ok_or(Av1Error::NoSequenceHeader)?;
++        // 0 = LAST, 1 = LAST2, 2 = LAST3, 3 = GOLDEN, 4 = BWDREF, 5 = ALTREF2,
++        // 6 = ALTREF. 0xff = AV1_REF_FRAME_NONE.
++        let mut idx = [0xffu8; REFS_PER_FRAME];
++        idx[0] = last_frame_idx;
++        idx[3] = gold_frame_idx;
++        let mut used = [false; NUM_REF_FRAMES];
++        used[last_frame_idx as usize] = true;
++        used[gold_frame_idx as usize] = true;
++
++        let cur = 1i32 << (seq.order_hint_bits - 1);
++        let mut shifted = [0i32; NUM_REF_FRAMES];
++        for i in 0..NUM_REF_FRAMES {
++            shifted[i] = cur + get_relative_dist(seq, self.refs[i].order_hint, cur_order_hint);
++        }
++        let mut latest = shifted[last_frame_idx as usize];
++        let mut earliest = shifted[gold_frame_idx as usize];
++
++        // ALTREF
++        let mut r: i8 = -1;
++        for i in 0..NUM_REF_FRAMES {
++            let hint = shifted[i];
++            if !used[i] && hint >= cur && (r < 0 || hint >= latest) {
++                r = i as i8;
++                latest = hint;
++            }
++        }
++        if r >= 0 {
++            idx[6] = r as u8;
++            used[r as usize] = true;
++        }
++        // BWDREF
++        let mut r: i8 = -1;
++        for i in 0..NUM_REF_FRAMES {
++            let hint = shifted[i];
++            if !used[i] && hint >= cur && (r < 0 || hint < earliest) {
++                r = i as i8;
++                earliest = hint;
++            }
++        }
++        if r >= 0 {
++            idx[4] = r as u8;
++            used[r as usize] = true;
++        }
++        // ALTREF2
++        let mut r: i8 = -1;
++        for i in 0..NUM_REF_FRAMES {
++            let hint = shifted[i];
++            if !used[i] && hint >= cur && (r < 0 || hint < earliest) {
++                r = i as i8;
++                earliest = hint;
++            }
++        }
++        if r >= 0 {
++            idx[5] = r as u8;
++            used[r as usize] = true;
++        }
++        // LAST2, LAST3
++        for k in [1usize, 2] {
++            if idx[k] == 0xff {
++                let mut r: i8 = -1;
++                for j in 0..NUM_REF_FRAMES {
++                    let hint = shifted[j];
++                    if !used[j] && hint < cur && (r < 0 || hint >= latest) {
++                        r = j as i8;
++                        latest = hint;
++                    }
++                }
++                if r >= 0 {
++                    idx[k] = r as u8;
++                    used[r as usize] = true;
++                }
++            }
++        }
++        // Anything still unset: the earliest slot overall (may be reused).
++        let mut r: i8 = -1;
++        for i in 0..NUM_REF_FRAMES {
++            let hint = shifted[i];
++            if r < 0 || hint < earliest {
++                r = i as i8;
++                earliest = hint;
++            }
++        }
++        for k in idx.iter_mut() {
++            if *k == 0xff {
++                *k = r as u8;
++            }
++        }
++        Ok(idx)
++    }
++
+     pub fn parse_frame_header(
+         &mut self,
+         data: &[u8],
+@@ -645,10 +749,14 @@ impl ParserState {
+                 false
+             };
+             if short {
+-                return Err(Av1Error::Unsupported("frame_refs_short_signaling"));
++                let last_frame_idx = r.f(3)? as u8;
++                let gold_frame_idx = r.f(3)? as u8;
++                h.ref_frame_idx = self.set_frame_refs(last_frame_idx, gold_frame_idx, h.order_hint)?;
+             }
+             for i in 0..REFS_PER_FRAME {
+-                h.ref_frame_idx[i] = r.f(3)? as u8;
++                if !short {
++                    h.ref_frame_idx[i] = r.f(3)? as u8;
++                }
+                 if seq.frame_id_numbers_present {
+                     r.f(seq.delta_frame_id_length_minus_2 + 2)?;
+                 }
+diff --git a/nvidia-prolapse/driver-source/native/src/video/av1/mf.rs b/nvidia-prolapse/driver-source/native/src/video/av1/mf.rs
+index c9dc9b8..eec014e 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/av1/mf.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/av1/mf.rs
+@@ -27,9 +27,19 @@ pub fn select(
+     if h.frame_is_intra || !seq.enable_order_hint {
+         return (mf, out);
+     }
++    // Stock libnvcuvid 615.78.08 compares each reference's stored width (the upscaled width, as
++    // CUVID reports it: "coded width, if superres enabled then it is upscaled width") with the
++    // current picture's coded width taken from pic_s, both rounded to 8 (ELF 0x454a0). A
++    // superres frame therefore has no motion-field candidates: its coded grid differs from its
++    // own references' upscaled geometry. Our session always sizes surfaces by the session max,
++    // so the pitch never changes and only these dimensions can disagree.
+     let usable = |k: usize| -> bool {
+         match recs[k] {
+-            Some(r) => !r.intra && r.mi_rows == h.mi_rows && r.mi_cols == h.mi_cols,
++            Some(r) => {
++                !r.intra
++                    && (r.upscaled_width + 7) >> 3 == (h.frame_width + 7) >> 3
++                    && (r.frame_height + 7) >> 3 == (h.frame_height + 7) >> 3
++            }
+             None => false,
+         }
+     };
+diff --git a/nvidia-prolapse/driver-source/native/src/video/av1/tests.rs b/nvidia-prolapse/driver-source/native/src/video/av1/tests.rs
+index 2ede100..fa802cd 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/av1/tests.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/av1/tests.rs
+@@ -284,3 +284,114 @@ fn film_grain_hidden_frames_and_show_existing() {
+     assert_eq!(r.shown + r.show_existing, 40, "{r:?}");
+     assert!(r.hidden_grain > 0 && r.show_existing_grain > 0, "{r:?}");
+ }
++
++/// Spec 7.8 set_frame_refs: reference slots derived from order hints. The two
++/// cases walk every branch of the selection order (ALTREF/BWDREF/ALTREF2 from
++/// the future, then LAST2/LAST3, then the earliest-slot fallback), with the
++/// expected values worked out from the order hints by hand.
++#[test]
++fn frame_refs_short_signaling_derivation() {
++    let seq = SequenceHeader {
++        enable_order_hint: true,
++        order_hint_bits: 8,
++        ..Default::default()
++    };
++    let mut p = ParserState {
++        seq: Some(seq),
++        refs: [header::RefSlotState::default(); header::NUM_REF_FRAMES],
++    };
++    // Current frame order hint 50; all reference hints are before it.
++    for (i, hint) in [40u32, 45, 48, 30, 20, 10, 0, 35].into_iter().enumerate() {
++        p.refs[i].order_hint = hint;
++    }
++    // LAST = slot 0 (hint 40), GOLDEN = slot 3 (hint 30). LAST2 = slot 2 (126,
++    // the largest below the frame and >= LAST's 118); LAST3 starts over at the
++    // first unused slot below the frame (slot 1, hint 123); the three future
++    // slots fall back to the earliest slot overall (slot 6, hint 0).
++    assert_eq!(p.set_frame_refs(0, 3, 50).unwrap(), [0, 2, 1, 3, 6, 6, 6]);
++
++    // Future references: 60 (slot 4), 55 (slot 5), 70 (slot 6).
++    for (i, hint) in [40u32, 45, 48, 30, 60, 55, 70, 20].into_iter().enumerate() {
++        p.refs[i].order_hint = hint;
++    }
++    // ALTREF = 70, BWDREF = 55 (earliest in the future), ALTREF2 = 60;
++    // LAST2 = slot 2 (126) and LAST3 = slot 1 (123), the same two-step as above.
++    assert_eq!(p.set_frame_refs(0, 3, 50).unwrap(), [0, 2, 1, 3, 5, 4, 6]);
++
++    // get_relative_dist: signed wrap around the order-hint modulus.
++    let s = p.seq.clone().unwrap();
++    assert_eq!(header::get_relative_dist(&s, 40, 50), -10);
++    assert_eq!(header::get_relative_dist(&s, 60, 50), 10);
++    assert_eq!(header::get_relative_dist(&s, 250, 5), -11);
++}
++
++/// Superres inter frames: stock writes the coded (pre-superres) width into the
++/// current frame info and its motion-field size gate then finds no candidate
++/// (reference widths are upscaled), so use_temporal stays 0 and the motion-field
++/// words are zero. Both are pinned here on the values measured from a stock
++/// libnvcuvid 615.78.08 capture (320-wide upscaled / 213-wide coded picture,
++/// denom 12).
++#[test]
++fn superres_geometry_and_motion_field_gate() {
++    let seq = SequenceHeader {
++        enable_order_hint: true,
++        order_hint_bits: 8,
++        ..Default::default()
++    };
++    let cur = header::FrameHeader {
++        frame_type: header::INTER_FRAME,
++        use_superres: true,
++        superres_denom: 12,
++        upscaled_width: 320,
++        frame_width: 213,
++        frame_height: 240,
++        mi_cols: 40,
++        mi_rows: 30,
++        order_hint: 50,
++        use_ref_frame_mvs: true,
++        ..Default::default()
++    };
++    let rec = PicRecord {
++        // A reference of the same stream: same coded size, upscaled to 320.
++        upscaled_width: 320,
++        frame_width: 213,
++        frame_height: 240,
++        mi_cols: 40,
++        mi_rows: 30,
++        ..Default::default()
++    };
++    let (mf, _) = mf::select(&seq, &cur, &[Some(rec); 7], &[None; 7]);
++    assert!(
++        mf.use_temporal.iter().all(|&t| !t),
++        "stock projects no motion field on a superres frame: {mf:?}"
++    );
++    // The same reference geometry without superres is usable.
++    let cur2 = header::FrameHeader {
++        frame_width: 320,
++        upscaled_width: 320,
++        use_superres: false,
++        order_hints: [0; 7],
++        ..cur
++    };
++    let rec2 = PicRecord {
++        upscaled_width: 320,
++        ..rec
++    };
++    let (mf2, _) = mf::select(&seq, &cur2, &[Some(rec2); 7], &[None; 7]);
++    assert!(mf2.mf_type[0] != 0, "a same-size reference must be a candidate");
++}
++
++/// Large-scale tile (OBU_TILE_LIST, type 8) is still refused loudly: NVDEC
++/// decodes ordinary frame/tile-group OBUs only, and the tile-list mode (a
++/// still-picture map of independently decodable tiles) has no engine path.
++#[test]
++fn large_scale_tile_list_stays_unsupported() {
++    let mut c = Av1Codec::new();
++    // OBU header: forbidden 0, type 8, extension 0, has_size_field 1, reserved 0.
++    c.push_unit(&[0x42, 0x01, 0x00]);
++    match c.next_out() {
++        Err(obu::Av1Error::Unsupported(msg)) => assert!(msg.contains("OBU_TILE_LIST"), "{msg}"),
++        Err(e) => panic!("expected Unsupported, got {e}"),
++        Ok(_) => panic!("expected Unsupported, got a picture"),
++    }
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/ffi.rs b/nvidia-prolapse/driver-source/native/src/video/ffi.rs
+index 85bde6d..5c34fec 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/ffi.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/ffi.rs
+@@ -1,5 +1,7 @@
+-//! C ABI of video/nv_video.h (v1).
++//! C ABI of video/nv_video.h (v1 entry points, v2 additions: HDR static metadata and the
++//! per-unit displayable-picture count).
+ use super::{
++    hdr::HdrStaticMetadata,
+     session::{Session, SessionInfo, Target},
+     NvVideoCaps, NvVideoDeviceInfo, VideoDevice, VideoError,
+ };
+@@ -62,6 +64,54 @@ pub struct NvVideoPicture {
+     pub reserved: [u32; 5],
+ }
+ 
++/// `mastering_display_colour_volume` as coded in the bitstream (ST 2086 units).
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct NvVideoMasteringDisplay {
++    pub display_primaries_x: [u16; 3],
++    pub display_primaries_y: [u16; 3],
++    pub white_point_x: u16,
++    pub white_point_y: u16,
++    pub max_luminance: u32,
++    pub min_luminance: u32,
++}
++
++/// HDR static metadata of a picture (ABI v2, `nv_video_picture_hdr`). A field group with
++/// its `has_*` flag clear carries no values.
++#[repr(C)]
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct NvVideoHdrMetadata {
++    pub has_mastering_display: u32,
++    pub mastering_display: NvVideoMasteringDisplay,
++    pub has_content_light_level: u32,
++    pub max_content_light_level: u32,
++    pub max_pic_average_light_level: u32,
++    pub reserved: [u32; 6],
++}
++
++impl From<HdrStaticMetadata> for NvVideoHdrMetadata {
++    fn from(m: HdrStaticMetadata) -> Self {
++        let mut out = Self::default();
++        if let Some(d) = m.mastering {
++            out.has_mastering_display = 1;
++            out.mastering_display = NvVideoMasteringDisplay {
++                display_primaries_x: d.primaries_x,
++                display_primaries_y: d.primaries_y,
++                white_point_x: d.white_x,
++                white_point_y: d.white_y,
++                max_luminance: d.max_luminance,
++                min_luminance: d.min_luminance,
++            };
++        }
++        if let Some((cll, fall)) = m.content_light {
++            out.has_content_light_level = 1;
++            out.max_content_light_level = u32::from(cll);
++            out.max_pic_average_light_level = u32::from(fall);
++        }
++        out
++    }
++}
++
+ #[repr(C)]
+ pub struct NvVideoTarget {
+     pub dmabuf_fd: [i32; 2],
+@@ -201,8 +251,10 @@ pub unsafe extern "C" fn nv_video_decode(
+             // SAFETY: caller guarantees the buffer.
+             unsafe { std::slice::from_raw_parts(data, len) }
+         };
+-        unsafe { &mut *s }.0.decode(d, timestamp, flags)?;
+-        Ok(0)
++        let shown = unsafe { &mut *s }.0.decode(d, timestamp, flags)?;
++        // ABI v2: the displayable pictures this unit produced (callers test rc < 0).
++        i32::try_from(shown)
++            .map_err(|_| VideoError::Invalid("unit produced more than 2^31 pictures".into()))
+     })
+ }
+ 
+@@ -241,6 +293,46 @@ pub unsafe extern "C" fn nv_video_next_picture(
+     })
+ }
+ 
++/// # Safety
++/// Valid session, writable metadata.
++#[no_mangle]
++pub unsafe extern "C" fn nv_video_picture_hdr(
++    s: *mut NvVideoSession,
++    id: u64,
++    metadata: *mut NvVideoHdrMetadata,
++) -> i32 {
++    guard(|| {
++        null(s, "session")?;
++        null(metadata, "metadata")?;
++        let m = unsafe { &*s }.0.picture_hdr(id)?;
++        unsafe { metadata.write(NvVideoHdrMetadata::from(m)) };
++        Ok(0)
++    })
++}
++
++/// # Safety
++/// Valid session, writable width/height.
++#[no_mangle]
++pub unsafe extern "C" fn nv_video_required_size(
++    s: *mut NvVideoSession,
++    width: *mut u32,
++    height: *mut u32,
++) -> i32 {
++    guard(|| {
++        null(s, "session")?;
++        null(width, "width")?;
++        null(height, "height")?;
++        let (w, h) = unsafe { &*s }.0.required_size().ok_or_else(|| {
++            VideoError::Invalid("no unit of this session returned NV_VIDEO_E_RESIZE".into())
++        })?;
++        unsafe {
++            width.write(w);
++            height.write(h);
++        }
++        Ok(0)
++    })
++}
++
+ /// # Safety
+ /// Valid session.
+ #[no_mangle]
+@@ -302,3 +394,41 @@ pub extern "C" fn nv_video_last_error() -> *const std::ffi::c_char {
+ 
+ // The C struct keeps its v1 size (the Cr-plane fields took over reserved words).
+ const _: () = assert!(std::mem::size_of::<NvVideoTarget>() == 80);
++// ABI v2 structs: fixed C layout, no implicit padding.
++const _: () = assert!(std::mem::size_of::<NvVideoMasteringDisplay>() == 24);
++const _: () = assert!(std::mem::size_of::<NvVideoHdrMetadata>() == 64);
++
++#[cfg(test)]
++mod tests {
++    use super::super::hdr::{HdrStaticMetadata, MasteringDisplay};
++    use super::NvVideoHdrMetadata;
++
++    #[test]
++    fn hdr_metadata_conversion() {
++        let m = HdrStaticMetadata {
++            mastering: Some(MasteringDisplay {
++                primaries_x: [34000, 13250, 7500],
++                primaries_y: [16000, 34500, 3000],
++                white_x: 15635,
++                white_y: 16450,
++                max_luminance: 10_000_000,
++                min_luminance: 1,
++            }),
++            content_light: Some((1000, 400)),
++        };
++        let c = NvVideoHdrMetadata::from(m);
++        assert_eq!((c.has_mastering_display, c.has_content_light_level), (1, 1));
++        assert_eq!(
++            c.mastering_display.display_primaries_x,
++            [34000, 13250, 7500]
++        );
++        assert_eq!(c.mastering_display.max_luminance, 10_000_000);
++        assert_eq!(
++            (c.max_content_light_level, c.max_pic_average_light_level),
++            (1000, 400)
++        );
++        let e = NvVideoHdrMetadata::from(HdrStaticMetadata::default());
++        assert_eq!((e.has_mastering_display, e.has_content_light_level), (0, 0));
++        assert_eq!(e, NvVideoHdrMetadata::default());
++    }
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/h264/codec.rs b/nvidia-prolapse/driver-source/native/src/video/h264/codec.rs
+index f60a899..bed59d2 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/h264/codec.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/h264/codec.rs
+@@ -20,7 +20,7 @@ const SCALING: u64 = 0x200;
+ const SLICE_OFFSETS: u64 = 0x300;
+ const STATUS: u64 = 0x700;
+ /// Blackwell 0x4dc buffer (tinygrad `_ensure_has_vid_hw`: 2 MiB; stock places it after
+-/// INTRA_TOP, size untraced).
++/// INTRA_TOP).
+ const SIZE_4DC: u64 = 2 << 20;
+ 
+ pub struct H264Decoder {
+@@ -132,10 +132,13 @@ impl CodecDecoder for H264Decoder {
+             if b.info.width > self.max.0.next_multiple_of(16)
+                 || b.info.height > self.max.1.next_multiple_of(16)
+             {
+-                return Err(VideoError::Unsupported(format!(
+-                    "H.264 picture {}x{} larger than the session max {}x{}",
+-                    b.info.width, b.info.height, self.max.0, self.max.1
+-                )));
++                return Err(crate::video::too_large(
++                    "H.264",
++                    b.info.width,
++                    b.info.height,
++                    self.max,
++                    b.info.keyframe,
++                ));
+             }
+             let i = b.info;
+             let (l, r, t, bo) = i.crop;
+diff --git a/nvidia-prolapse/driver-source/native/src/video/h264/legacy.rs b/nvidia-prolapse/driver-source/native/src/video/h264/legacy.rs
+index d5927ee..9714a91 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/h264/legacy.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/h264/legacy.rs
+@@ -1,6 +1,6 @@
+ //! Legacy H.264 setup (`SET_APPLICATION_ID` 3, public `nvdec_h264_pic_s`, 0x2fc bytes; slice
+ //! offsets at setup+0x300). Stock 615.71.09 uses it for interlaced SPSs (frame_mbs_only_flag =
+-//! 0); its builder (0x3d070) is untraced, so this module follows the public struct
++//! 0; builder at ELF 0x3d070); this module follows the public struct
+ //! (`nvdec_drv.h`, MIT) and the values observed in stock captures of an MBAFF stream
+ //! (verified byte for byte in `tests.rs`).
+ //! Only frame pictures are produced (MBAFF or non-MBAFF frames of an interlaced SPS); field
+diff --git a/nvidia-prolapse/driver-source/native/src/video/h264/mod.rs b/nvidia-prolapse/driver-source/native/src/video/h264/mod.rs
+index 517d4aa..f0a85c0 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/h264/mod.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/h264/mod.rs
+@@ -56,7 +56,7 @@ pub struct PictureJob {
+     /// Colocated slot of the current picture (setup+0x1cc bits 0-4).
+     pub slot: u8,
+     /// `SET_PICTURE_INDEX`: stock sends a running picture counter (observed 0, 1, 2, … in decode
+-    /// order; its wrap is untraced).
++    /// order).
+     pub picture_index: u32,
+     /// Caller's surface id for the current picture.
+     pub surface: u32,
+@@ -509,12 +509,16 @@ impl Decoder {
+         }
+         if sps.chroma_format_idc != 1 {
+             return unsupported(format!(
+-                "H.264 chroma_format_idc {} (only 4:2:0)",
++                "H.264 chroma_format_idc {} (only 4:2:0: the session's surfaces and copy-out are \
++                 NV12/P010 4:2:0, so 4:2:2/4:4:4 needs a new surface layout and copy path)",
+                 sps.chroma_format_idc
+             ));
+         }
+         if sps.bit_depth_luma_minus8 != 0 || sps.bit_depth_chroma_minus8 != 0 {
+-            return unsupported("H.264 bit depth above 8");
++            return unsupported(
++                "H.264 bit depth above 8 (the H.264 codec creates 8-bit surfaces -- the session \
++                 passes no bit depth to it -- and there is no 10-bit setup path)",
++            );
+         }
+         if sps.width() > 4096 || sps.height() > 4096 {
+             return unsupported(format!(
+@@ -642,7 +646,7 @@ impl Decoder {
+         // DPB position whose slot is not the current one, kept from the previous picture when
+         // there is none (stock ELF 0x3ceea). Legacy: the last
+         // reference picture's slot (observed in the MBAFF capture and, for progressive pictures on
+-        // the legacy path, in the Ada High-profile trace; builder untraced).
++        // the legacy path, in the Ada High-profile capture).
+         if new_h264 {
+             if let Some(s) = self
+                 .dpb
+@@ -835,8 +839,8 @@ impl Decoder {
+     /// Colocated slot for the target surface. Slots are sticky per surface (stock keeps a record
+     /// {surface → slot} per slot, ELF 0x35a70): a surface reuses its slot;
+     /// a new surface takes the lowest unassigned slot, else the lowest slot whose surface is no
+-    /// longer a reference (stock's recycling rule is untraced; this one never moves a live
+-    /// reference, which is the engine contract).
++    /// longer a reference (this rule never moves a live reference, which is the engine
++    /// contract).
+     fn colocated_slot(&mut self, surface: u32) -> u8 {
+         if let Some(s) = self.slot_surface.iter().position(|&e| e == Some(surface)) {
+             return s as u8;
+diff --git a/nvidia-prolapse/driver-source/native/src/video/h264/tests.rs b/nvidia-prolapse/driver-source/native/src/video/h264/tests.rs
+index 69075c5..bdefe92 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/h264/tests.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/h264/tests.rs
+@@ -180,6 +180,183 @@ fn stock_legacy_h264_setup_mbaff() {
+     );
+ }
+ 
++/// Minimal MSB-first bit writer for the hand-built streams of the refusal tests below.
++struct Bw {
++    bytes: Vec<u8>,
++    nbits: usize,
++}
++impl Bw {
++    fn new() -> Self {
++        Bw {
++            bytes: Vec::new(),
++            nbits: 0,
++        }
++    }
++    fn bit(&mut self, b: bool) {
++        if self.nbits % 8 == 0 {
++            self.bytes.push(0);
++        }
++        if b {
++            self.bytes[self.nbits / 8] |= 0x80 >> (self.nbits % 8);
++        }
++        self.nbits += 1;
++    }
++    fn bits(&mut self, n: u32, v: u32) {
++        for i in (0..n).rev() {
++            self.bit((v >> i) & 1 != 0);
++        }
++    }
++    fn ue(&mut self, v: u32) {
++        let x = v + 1;
++        let n = 32 - x.leading_zeros();
++        self.bits(n - 1, 0);
++        self.bits(n, x);
++    }
++    fn se(&mut self, v: i32) {
++        self.ue(if v <= 0 {
++            (-2 * v) as u32
++        } else {
++            (2 * v - 1) as u32
++        });
++    }
++    /// rbsp_trailing_bits: a stop bit, then zero to the byte boundary.
++    fn finish(mut self) -> Vec<u8> {
++        self.bit(true);
++        self.bytes
++    }
++}
++
++/// A syntax-valid SPS: baseline (`profile_idc` 66) or High (100, with `ext` = chroma format,
++/// bit depths). `poc_order_cnt_type` is 2 so the slice header below carries no POC fields.
++fn sps_nal(profile: u8, ext: Option<(u32, u32, u32)>, frame_mbs_only: bool) -> Vec<u8> {
++    let mut w = Bw::new();
++    w.bits(8, 0x67); // nal_ref_idc 3, nal_unit_type 7
++    w.bits(8, u32::from(profile));
++    w.bits(8, 0); // constraint flags
++    w.bits(8, 40); // level
++    w.ue(0); // seq_parameter_set_id
++    if let Some((chroma, luma, chroma_depth)) = ext {
++        w.ue(chroma);
++        if chroma == 3 {
++            w.bit(false); // separate_colour_plane_flag
++        }
++        w.ue(luma); // bit_depth_luma_minus8
++        w.ue(chroma_depth); // bit_depth_chroma_minus8
++        w.bit(false); // qpprime_y_zero_transform_bypass_flag
++        w.bit(false); // seq_scaling_matrix_present_flag
++    }
++    w.ue(0); // log2_max_frame_num_minus4
++    w.ue(2); // pic_order_cnt_type
++    w.ue(1); // max_num_ref_frames
++    w.bit(false); // gaps_in_frame_num_value_allowed_flag
++    w.ue(1); // pic_width_in_mbs_minus1 (2 MBs)
++    w.ue(1); // pic_height_in_map_units_minus1
++    w.bit(frame_mbs_only);
++    if !frame_mbs_only {
++        w.bit(false); // mb_adaptive_frame_field_flag
++    }
++    w.bit(true); // direct_8x8_inference_flag
++    w.bit(false); // frame_cropping_flag
++    w.bit(false); // vui_parameters_present_flag
++    w.finish()
++}
++
++fn pps_nal() -> Vec<u8> {
++    let mut w = Bw::new();
++    w.bits(8, 0x68); // nal_ref_idc 3, nal_unit_type 8
++    w.ue(0); // pic_parameter_set_id
++    w.ue(0); // seq_parameter_set_id
++    w.bit(false); // entropy_coding_mode_flag
++    w.bit(false); // bottom_field_pic_order_in_frame_present_flag
++    w.ue(0); // num_slice_groups_minus1
++    w.ue(0); // num_ref_idx_l0_default_active_minus1
++    w.ue(0); // num_ref_idx_l1_default_active_minus1
++    w.bit(false); // weighted_pred_flag
++    w.bits(2, 0); // weighted_bipred_idc
++    w.se(0); // pic_init_qp_minus26
++    w.se(0); // pic_init_qs_minus26
++    w.se(0); // chroma_qp_index_offset
++    w.bit(false); // deblocking_filter_control_present_flag
++    w.bit(false); // constrained_intra_pred_flag
++    w.bit(false); // redundant_pic_cnt_present_flag
++    w.finish()
++}
++
++/// An IDR I slice with only the fields the parser needs for the picture-level checks.
++fn idr_i_slice_nal(field: bool, bottom: bool) -> Vec<u8> {
++    let mut w = Bw::new();
++    w.bits(8, 0x65); // nal_ref_idc 3, nal_unit_type 5
++    w.ue(0); // first_mb_in_slice
++    w.ue(2); // slice_type 2 = I
++    w.ue(0); // pic_parameter_set_id
++    w.bits(4, 0); // frame_num (log2_max_frame_num_minus4 = 0)
++    if field {
++        w.bit(true); // field_pic_flag
++        w.bit(bottom); // bottom_field_flag
++    }
++    w.ue(0); // idr_pic_id
++    // pic_order_cnt_type 2: no POC fields.
++    w.bit(false); // no_output_of_prior_pics_flag
++    w.bit(false); // long_term_reference_flag
++    w.finish()
++}
++
++fn au(sps: &[u8], pps: &[u8], slice: &[u8]) -> Vec<u8> {
++    let mut v = Vec::new();
++    for n in [sps, pps, slice] {
++        v.extend_from_slice(&[0, 0, 1]);
++        v.extend_from_slice(n);
++    }
++    v
++}
++
++/// Runs the front end over `data` and requires the loud refusal to name `feature`.
++fn expect_unsupported(data: &[u8], feature: &str) {
++    let mut dec = Decoder::new(EngineParams::blackwell(None));
++    match dec.begin(data) {
++        Err(crate::video::VideoError::Unsupported(reason)) => assert!(
++            reason.contains(feature),
++            "refusal reason {reason:?} does not name {feature:?}"
++        ),
++        Err(e) => panic!("expected Unsupported({feature:?}), got {e:?}"),
++        Ok(_) => panic!("expected Unsupported({feature:?}), the picture was accepted"),
++    }
++}
++
++#[test]
++fn field_pictures_refuse_naming_paff() {
++    // Interlaced SPS, field_pic_flag = 1: PAFF field pictures stay a named refusal: the
++    // legacy setup's field-picture fields have no verified values (no PAFF capture).
++    let data = au(
++        &sps_nal(66, None, false),
++        &pps_nal(),
++        &idr_i_slice_nal(true, false),
++    );
++    expect_unsupported(&data, "field pictures (PAFF)");
++}
++
++#[test]
++fn chroma_422_and_444_refuse_naming_the_format() {
++    for chroma in [2, 3] {
++        let data = au(
++            &sps_nal(100, Some((chroma, 0, 0)), true),
++            &pps_nal(),
++            &idr_i_slice_nal(false, false),
++        );
++        expect_unsupported(&data, &format!("chroma_format_idc {chroma}"));
++    }
++}
++
++#[test]
++fn high_bit_depth_refuses_naming_the_gate() {
++    let data = au(
++        &sps_nal(100, Some((1, 2, 2)), true),
++        &pps_nal(),
++        &idr_i_slice_nal(false, false),
++    );
++    expect_unsupported(&data, "bit depth above 8");
++}
++
+ #[test]
+ fn scaling_list_fallback_rules() {
+     // SPS with seq_scaling_matrix_present and every list absent → fall-back rule A = defaults.
+diff --git a/nvidia-prolapse/driver-source/native/src/video/hdr.rs b/nvidia-prolapse/driver-source/native/src/video/hdr.rs
+new file mode 100644
+index 0000000..030d288
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/src/video/hdr.rs
+@@ -0,0 +1,514 @@
++//! HDR static metadata carried by the bitstream: SMPTE ST 2086 mastering display
++//! colour volume and CEA-861.3 content light level (MaxCLL / MaxFALL).
++//!
++//! This is bitstream syntax from the public specifications, not engine state:
++//! - H.264/HEVC: SEI messages `mastering_display_colour_volume` (payload type 137) and
++//!   `content_light_level_info` (144) — ITU-T H.264 (2016) D.3.24/D.3.25 and ITU-T H.265
++//!   D.3.22/D.3.23, found in prefix SEI (HEVC NAL 39; H.264 NAL 6) and suffix SEI (HEVC 40).
++//! - AV1: metadata OBUs (`OBU_METADATA`, type 5), `metadata_type` 1 = HDR_CLL and 2 =
++//!   HDR_MDCV — AV1 specification 5.8.2/6.7.3 (libaom `OBU_METADATA_TYPE_HDR_CLL` /
++//!   `OBU_METADATA_TYPE_HDR_MDCV`).
++//!
++//! The session attaches what a unit carries to every displayable picture the unit
++//! produces (`PictureInfo` does not carry it: codecs do not parse SEI). A temporal unit
++//! with several AV1 frames therefore reports the unit's metadata for each of them; a
++//! stream that changes the metadata inside one temporal unit is not represented (the C2
++//! HAL attaches metadata per output buffer, and a unit maps to one time step).
++use super::{bitstream, VResult, VideoError, CODEC_AV1, CODEC_H264, CODEC_HEVC};
++
++/// `mastering_display_colour_volume()`: chromaticities in units of 0.00002, luminance in
++/// units of 0.0001 cd/m² (ST 2086, as coded in the SEI / AV1 metadata).
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct MasteringDisplay {
++    pub primaries_x: [u16; 3],
++    pub primaries_y: [u16; 3],
++    pub white_x: u16,
++    pub white_y: u16,
++    pub max_luminance: u32,
++    pub min_luminance: u32,
++}
++
++/// What one unit of the bitstream declares. When several declarations are present the
++/// last one wins per field group (streams repeat the same values per AU).
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct HdrStaticMetadata {
++    pub mastering: Option<MasteringDisplay>,
++    /// (max_content_light_level, max_pic_average_light_level) in cd/m².
++    pub content_light: Option<(u16, u16)>,
++}
++
++impl HdrStaticMetadata {
++    pub fn is_empty(&self) -> bool {
++        self.mastering.is_none() && self.content_light.is_none()
++    }
++    /// Carry the last declaration forward: a stream declares the mastering display and the
++    /// content light level once (an encoder may repeat them), and every later picture is
++    /// displayed with them until a new declaration replaces that field group.
++    pub fn merge(&mut self, other: Self) {
++        if other.mastering.is_some() {
++            self.mastering = other.mastering;
++        }
++        if other.content_light.is_some() {
++            self.content_light = other.content_light;
++        }
++    }
++}
++
++/// Parse the HDR declarations of one `nv_video_decode()` unit (Annex-B access unit for
++/// H.264/HEVC, low-overhead OBUs for AV1). A recognized declaration with the wrong size is
++/// a malformed bitstream; unknown payload types and other OBUs are skipped.
++pub fn parse_unit(codec: u32, unit: &[u8]) -> VResult<HdrStaticMetadata> {
++    let mut m = HdrStaticMetadata::default();
++    match codec {
++        CODEC_H264 | CODEC_HEVC => {
++            for nal in annexb_nals(unit) {
++                let (is_sei, escaped) = if codec == CODEC_HEVC {
++                    let t = (nal[0] >> 1) & 0x3f;
++                    (nal.len() > 2 && (t == 39 || t == 40), &nal[2..])
++                } else {
++                    (nal.len() > 1 && nal[0] & 0x1f == 6, &nal[1..])
++                };
++                if !is_sei {
++                    continue;
++                }
++                let rbsp = unescape(escaped);
++                for (kind, payload) in sei_payloads(&rbsp)? {
++                    match kind {
++                        137 => m.merge(HdrStaticMetadata {
++                            mastering: Some(mastering_display(payload)?),
++                            content_light: None,
++                        }),
++                        144 => m.merge(HdrStaticMetadata {
++                            mastering: None,
++                            content_light: Some(content_light(payload)?),
++                        }),
++                        _ => {}
++                    }
++                }
++            }
++        }
++        CODEC_AV1 => {
++            for (kind, payload) in obus(unit) {
++                if kind != 5 {
++                    continue;
++                }
++                let Some((metadata_type, used)) = leb128(payload, 0) else {
++                    return bitstream("AV1 metadata OBU: truncated metadata_type");
++                };
++                let Some(body) = payload.get(used..) else {
++                    return bitstream("AV1 metadata OBU: metadata_type past the payload");
++                };
++                let metadata_type = u32::try_from(metadata_type).map_err(|_| {
++                    VideoError::Bitstream("AV1 metadata OBU: metadata_type overflow".into())
++                })?;
++                match metadata_type {
++                    1 => m.merge(HdrStaticMetadata {
++                        mastering: None,
++                        content_light: Some(content_light(body)?),
++                    }),
++                    2 => m.merge(HdrStaticMetadata {
++                        mastering: Some(av1_mastering_display(body)?),
++                        content_light: None,
++                    }),
++                    _ => {}
++                }
++            }
++        }
++        _ => {}
++    }
++    Ok(m)
++}
++
++fn u16_at(b: &[u8], o: usize) -> u16 {
++    u16::from_be_bytes([b[o], b[o + 1]])
++}
++
++fn u32_at(b: &[u8], o: usize) -> u32 {
++    u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
++}
++
++/// `mastering_display_colour_volume(payloadSize)`, 24 bytes: per component the x/y
++/// chromaticity pair, then the white point, then max/min luminance.
++fn mastering_display(p: &[u8]) -> VResult<MasteringDisplay> {
++    // The fields are a fixed prefix; padding bits/bytes after them are allowed and ignored.
++    if p.len() < 24 {
++        return bitstream(format!(
++            "SEI mastering display colour volume: {} payload bytes, at least 24 expected",
++            p.len()
++        ));
++    }
++    Ok(MasteringDisplay {
++        primaries_x: [u16_at(p, 0), u16_at(p, 4), u16_at(p, 8)],
++        primaries_y: [u16_at(p, 2), u16_at(p, 6), u16_at(p, 10)],
++        white_x: u16_at(p, 12),
++        white_y: u16_at(p, 14),
++        max_luminance: u32_at(p, 16),
++        min_luminance: u32_at(p, 20),
++    })
++}
++
++fn content_light(p: &[u8]) -> VResult<(u16, u16)> {
++    if p.len() < 4 {
++        return bitstream(format!(
++            "content light level info: {} payload bytes, at least 4 expected",
++            p.len()
++        ));
++    }
++    Ok((u16_at(p, 0), u16_at(p, 2)))
++}
++
++/// AV1 `metadata_type == OBU_METADATA_TYPE_HDR_MDCV` (2): 24 bytes, the same field order as
++/// the SEI payload (per primary the x/y pair, then the white point, then the luminances;
++/// AV1 5.8.2, FFmpeg cbs_av1_syntax_template.c `metadata_hdr_mdcv`).
++fn av1_mastering_display(p: &[u8]) -> VResult<MasteringDisplay> {
++    if p.len() < 24 {
++        return bitstream(format!(
++            "AV1 HDR_MDCV metadata: {} payload bytes, at least 24 expected",
++            p.len()
++        ));
++    }
++    Ok(MasteringDisplay {
++        primaries_x: [u16_at(p, 0), u16_at(p, 4), u16_at(p, 8)],
++        primaries_y: [u16_at(p, 2), u16_at(p, 6), u16_at(p, 10)],
++        white_x: u16_at(p, 12),
++        white_y: u16_at(p, 14),
++        max_luminance: u32_at(p, 16),
++        min_luminance: u32_at(p, 20),
++    })
++}
++
++/// NAL units of an Annex-B byte stream (3- or 4-byte start codes), without the start code
++/// and without trailing zero bytes (the byte stream's trailing_zero_8bits).
++fn annexb_nals(unit: &[u8]) -> Vec<&[u8]> {
++    let mut out = Vec::new();
++    let mut i = 0;
++    let mut start = None;
++    while i + 2 < unit.len() {
++        if unit[i] == 0 && unit[i + 1] == 0 && unit[i + 2] == 1 {
++            if let Some(s) = start {
++                out.push(trim(&unit[s..i]));
++            }
++            i += 3;
++            start = Some(i);
++        } else if unit[i] == 0 && unit[i + 1] == 0 && unit[i + 2] == 0 && i + 3 < unit.len() {
++            // A 4-byte start code ends here when the fourth byte is 1.
++            if unit[i + 3] == 1 {
++                if let Some(s) = start {
++                    out.push(trim(&unit[s..i]));
++                }
++                i += 4;
++                start = Some(i);
++            } else {
++                i += 1;
++            }
++        } else {
++            i += 1;
++        }
++    }
++    if let Some(s) = start {
++        out.push(trim(&unit[s..]));
++    }
++    out.into_iter().filter(|n| !n.is_empty()).collect()
++}
++
++fn trim(mut n: &[u8]) -> &[u8] {
++    while n.last() == Some(&0) {
++        n = &n[..n.len() - 1];
++    }
++    n
++}
++
++/// Emulation-prevention removal (H.264 7.4.1 / H.265 7.4.2): drop the 0x03 of an
++/// emulation_prevention_three_byte.
++fn unescape(b: &[u8]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(b.len());
++    let mut zeros = 0usize;
++    for &x in b {
++        if zeros >= 2 && x == 0x03 {
++            zeros = 0;
++            continue;
++        }
++        zeros = if x == 0 { zeros + 1 } else { 0 };
++        out.push(x);
++    }
++    out
++}
++
++/// `sei_message()` list: (payloadType, payload).
++fn sei_payloads(b: &[u8]) -> VResult<Vec<(u32, &[u8])>> {
++    let mut out = Vec::new();
++    let mut i = 0;
++    while i < b.len() {
++        // rbsp_trailing_bits (stop bit + zeros) ends the SEI message list.
++        if (b[i] == 0x80 || b[i] == 0) && b[i..].iter().all(|&x| x == 0x80 || x == 0) {
++            break;
++        }
++        let mut kind = 0u32;
++        while i < b.len() && b[i] == 0xff {
++            kind += 255;
++            i += 1;
++        }
++        if i >= b.len() {
++            return bitstream("SEI: truncated payloadType");
++        }
++        kind += u32::from(b[i]);
++        i += 1;
++        let mut size = 0usize;
++        while i < b.len() && b[i] == 0xff {
++            size += 255;
++            i += 1;
++        }
++        if i >= b.len() {
++            return bitstream("SEI: truncated payloadSize");
++        }
++        size += usize::from(b[i]);
++        i += 1;
++        let end = i
++            .checked_add(size)
++            .filter(|e| *e <= b.len())
++            .ok_or_else(|| {
++                VideoError::Bitstream(format!(
++                    "SEI payload type {kind}: size {size} runs past the NAL ({} bytes)",
++                    b.len()
++                ))
++            })?;
++        out.push((kind, &b[i..end]));
++        i = end;
++    }
++    Ok(out)
++}
++
++/// Low-overhead OBUs: (obu_type, payload). OBUs without a size field are skipped (the
++/// spec allows that only for the fixed-size OBUs, which carry no metadata).
++fn obus(unit: &[u8]) -> Vec<(u32, &[u8])> {
++    let mut out = Vec::new();
++    let mut i = 0;
++    while i < unit.len() {
++        let header = unit[i];
++        if header & 0x80 != 0 {
++            break; // forbidden bit: not an OBU stream
++        }
++        let kind = u32::from((header >> 3) & 0xf);
++        let mut p = i + 1;
++        if header & 0x04 != 0 {
++            p += 1; // extension header
++        }
++        if header & 0x02 == 0 {
++            i = p;
++            continue; // no size field
++        }
++        let Some((size, used)) = leb128(unit, p) else {
++            break;
++        };
++        let start = p + used;
++        let Ok(size) = usize::try_from(size) else {
++            break;
++        };
++        let Some(end) = start.checked_add(size).filter(|e| *e <= unit.len()) else {
++            break;
++        };
++        out.push((kind, &unit[start..end]));
++        i = end;
++    }
++    out
++}
++
++/// LEB128 (AV1's `leb128()`), returning the value and the bytes consumed.
++fn leb128(b: &[u8], mut i: usize) -> Option<(u64, usize)> {
++    let start = i;
++    let mut value = 0u64;
++    for shift in (0..64).step_by(7) {
++        let byte = *b.get(i)?;
++        i += 1;
++        value |= u64::from(byte & 0x7f) << shift;
++        if byte & 0x80 == 0 {
++            return Some((value, i - start));
++        }
++    }
++    None
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Emulation prevention as an encoder applies it (H.264 7.4.1): the payload size
++    /// counts RBSP bytes, the byte stream carries the escaped form.
++    fn escape(b: &[u8]) -> Vec<u8> {
++        let mut out = Vec::with_capacity(b.len());
++        let mut zeros = 0usize;
++        for &x in b {
++            if zeros >= 2 && x <= 3 {
++                out.push(3);
++                zeros = 0;
++            }
++            out.push(x);
++            zeros = if x == 0 { zeros + 1 } else { 0 };
++        }
++        out
++    }
++
++    /// A prefix SEI NAL (HEVC type 39) with the given payload types, Annex-B framed.
++    fn hevc_sei(payloads: &[(u32, Vec<u8>)]) -> Vec<u8> {
++        let mut nal = vec![39 << 1, 1]; // nal_unit_type 39, nuh_layer_id 0, temporal_id_plus1 1
++        for (kind, body) in payloads {
++            nal.push(*kind as u8);
++            nal.push(body.len() as u8);
++            nal.extend_from_slice(&escape(body));
++        }
++        nal.push(0x80); // rbsp_trailing_bits
++        let mut out = vec![0, 0, 0, 1];
++        out.extend_from_slice(&nal);
++        out
++    }
++
++    fn mdcv() -> Vec<u8> {
++        let mut v = Vec::new();
++        for (x, y) in [(34000u16, 16000u16), (13250, 34500), (7500, 3000)] {
++            v.extend_from_slice(&x.to_be_bytes());
++            v.extend_from_slice(&y.to_be_bytes());
++        }
++        v.extend_from_slice(&15635u16.to_be_bytes());
++        v.extend_from_slice(&16450u16.to_be_bytes());
++        v.extend_from_slice(&10_000_000u32.to_be_bytes());
++        v.extend_from_slice(&1u32.to_be_bytes());
++        v
++    }
++
++    /// HEVC: the encoder's `master-display`/`max-cll` SEI pair, in one access unit that also
++    /// carries a slice NAL (start codes of both lengths, an emulation-prevention byte).
++    #[test]
++    fn hevc_sei_mastering_and_cll() {
++        let mut unit = hevc_sei(&[(137, mdcv()), (144, vec![0x03, 0xe8, 0x01, 0x90])]);
++        unit.extend_from_slice(&[0, 0, 1, 0x26, 0x01]); // slice NAL, ignored by the parser
++        let m = parse_unit(CODEC_HEVC, &unit).unwrap();
++        let d = m.mastering.expect("mastering display");
++        assert_eq!(d.primaries_x, [34000, 13250, 7500]);
++        assert_eq!(d.primaries_y, [16000, 34500, 3000]);
++        assert_eq!((d.white_x, d.white_y), (15635, 16450));
++        assert_eq!((d.max_luminance, d.min_luminance), (10_000_000, 1));
++        assert_eq!(m.content_light, Some((1000, 400)));
++    }
++
++    /// Only a 0x03 after two zeros is emulation prevention; a byte stream escape inside the
++    /// RBSP is restored before the payload is read.
++    #[test]
++    fn unescape_only_removes_emulation_prevention() {
++        assert_eq!(unescape(&[0, 0, 3, 1]), vec![0, 0, 1]);
++        assert_eq!(unescape(&[0, 3, 1]), vec![0, 3, 1]);
++        // RBSP 00 00 03 is coded 00 00 03 03: the second 03 is data.
++        assert_eq!(unescape(&[0, 0, 3, 3]), vec![0, 0, 3]);
++    }
++
++    #[test]
++    fn h264_sei_types() {
++        let mut nal = vec![6]; // nal_unit_type 6 (SEI), nal_ref_idc 0
++        nal.push(144);
++        nal.push(4);
++        nal.extend_from_slice(&[0x03, 0xe8, 0x01, 0x90]);
++        nal.push(0x80);
++        let mut unit = vec![0, 0, 0, 1];
++        unit.extend_from_slice(&nal);
++        let m = parse_unit(CODEC_H264, &unit).unwrap();
++        assert_eq!(m.content_light, Some((1000, 400)));
++        assert!(m.mastering.is_none());
++    }
++
++    #[test]
++    fn sei_unknown_payload_skipped_and_sizes_checked() {
++        let unit = hevc_sei(&[(5, vec![1, 2, 3]), (144, vec![0, 1, 0, 2])]);
++        assert_eq!(
++            parse_unit(CODEC_HEVC, &unit).unwrap().content_light,
++            Some((1, 2))
++        );
++        let bad = hevc_sei(&[(137, vec![0; 20])]);
++        let e = parse_unit(CODEC_HEVC, &bad).unwrap_err();
++        assert!(
++            e.message().contains("at least 24 expected"),
++            "{}",
++            e.message()
++        );
++        let trunc = hevc_sei(&[(144, vec![0, 1])]);
++        assert!(parse_unit(CODEC_HEVC, &trunc).is_err());
++    }
++
++    fn obu(kind: u32, payload: &[u8]) -> Vec<u8> {
++        let mut out = vec![(kind as u8) << 3 | 0x02]; // has_size_field
++        let mut n = payload.len();
++        loop {
++            let b = (n & 0x7f) as u8;
++            n >>= 7;
++            out.push(if n > 0 { b | 0x80 } else { b });
++            if n == 0 {
++                break;
++            }
++        }
++        out.extend_from_slice(payload);
++        out
++    }
++
++    /// AV1: metadata OBUs HDR_CLL (1) and HDR_MDCV (2) followed by a frame OBU.
++    #[test]
++    fn av1_metadata_obus() {
++        let mut cll = vec![1u8]; // metadata_type 1
++        cll.extend_from_slice(&[0x03, 0xe8, 0x01, 0x90]);
++        let mut mdcv_body = vec![2u8]; // metadata_type 2
++        mdcv_body.extend_from_slice(&mdcv()); // same field order as the SEI payload
++        let mut unit = obu(5, &cll);
++        unit.extend_from_slice(&obu(5, &mdcv_body));
++        unit.extend_from_slice(&obu(6, &[0xaa; 3]));
++        let m = parse_unit(CODEC_AV1, &unit).unwrap();
++        assert_eq!(m.content_light, Some((1000, 400)));
++        let d = m.mastering.expect("mastering display");
++        assert_eq!(d.primaries_x, [34000, 13250, 7500]);
++        assert_eq!(d.primaries_y, [16000, 34500, 3000]);
++        assert_eq!((d.white_x, d.white_y), (15635, 16450));
++        assert_eq!((d.max_luminance, d.min_luminance), (10_000_000, 1));
++    }
++
++    #[test]
++    fn av1_wrong_hdr_size_is_an_error() {
++        let mut cll = vec![1u8];
++        cll.extend_from_slice(&[0, 1]);
++        let e = parse_unit(CODEC_AV1, &obu(5, &cll)).unwrap_err();
++        assert!(
++            e.message().contains("at least 4 expected"),
++            "{}",
++            e.message()
++        );
++    }
++
++    #[test]
++    fn merge_carries_each_field_group_forward() {
++        let mut cur = HdrStaticMetadata::default();
++        cur.merge(HdrStaticMetadata {
++            mastering: Some(MasteringDisplay {
++                primaries_x: [1, 2, 3],
++                ..Default::default()
++            }),
++            content_light: None,
++        });
++        cur.merge(HdrStaticMetadata {
++            mastering: None,
++            content_light: Some((1000, 400)),
++        });
++        assert_eq!(cur.mastering.unwrap().primaries_x, [1, 2, 3]);
++        assert_eq!(cur.content_light, Some((1000, 400)));
++        // A later declaration replaces only its own group.
++        cur.merge(HdrStaticMetadata {
++            mastering: Some(MasteringDisplay {
++                primaries_x: [4, 5, 6],
++                ..Default::default()
++            }),
++            content_light: None,
++        });
++        assert_eq!(cur.mastering.unwrap().primaries_x, [4, 5, 6]);
++        assert_eq!(cur.content_light, Some((1000, 400)));
++    }
++
++    #[test]
++    fn empty_unit_has_no_metadata() {
++        assert!(parse_unit(CODEC_HEVC, &[]).unwrap().is_empty());
++        assert!(parse_unit(CODEC_AV1, &[]).unwrap().is_empty());
++    }
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/hevc/codec.rs b/nvidia-prolapse/driver-source/native/src/video/hevc/codec.rs
+index 6782850..d086d3f 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/hevc/codec.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/hevc/codec.rs
+@@ -171,10 +171,9 @@ impl CodecDecoder for HevcDecoder {
+             }
+             if j.width > self.max.0.next_multiple_of(8) || j.height > self.max.1.next_multiple_of(8)
+             {
+-                return Err(VideoError::Unsupported(format!(
+-                    "HEVC picture {}x{} larger than the session max {}x{}",
+-                    j.width, j.height, self.max.0, self.max.1
+-                )));
++                return Err(crate::video::too_large(
++                    "HEVC", j.width, j.height, self.max, j.keyframe,
++                ));
+             }
+             // Output epochs: an IRAP whose POC does not exceed every POC of the current epoch
+             // resets POC (IDR/BLA/CRA with NoRaslOutputFlag); pictures before it output first.
+diff --git a/nvidia-prolapse/driver-source/native/src/video/hevc/desc.rs b/nvidia-prolapse/driver-source/native/src/video/hevc/desc.rs
+index ed87471..47f8453 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/hevc/desc.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/hevc/desc.rs
+@@ -406,18 +406,21 @@ pub fn build(
+             sl,
+         );
+     }
+-    // Tile table, column-major (c outer, r inner), one entry when tiles are off (stock writes the
+-    // same for the 3x1 tiles capture; the order with >1 row is not observed).
++    // Tile-size table: one 4-byte entry per tile in raster-scan order (rows outer, columns
++    // inner), entry = {u16 column width in CTBs, u16 row height in CTBs}; the rest of the
++    // 0x700-byte area stays zero. Stock libnvcuvid 615.78.08 builds exactly this at ELF
++    // 0x3ec2b..0x3ecfc (uniform spacing: width = ((i+1)*W)/n - (i*W)/n per column, height by
++    // the same 6-3 split over the rows) and 0x3eef2..0x3f01c (explicit column_width_minus1 /
++    // row_height_minus1 + 1, last column/row = the remainder), then copies the table to
++    // setup+0x600 (0x3eb43..0x3ec03); with tiles off it writes the single {W, H} entry
++    // (0x3eba7..0x3ebb7).
+     let (cols, rows) = match &pps.tiles {
+         Some(t) => t.sizes(sps.width_ctbs(), sps.height_ctbs()),
+         None => (vec![sps.width_ctbs()], vec![sps.height_ctbs()]),
+     };
+-    if cols.len() > 1 && rows.len() > 1 {
+-        return unsupported("HEVC tiles in both directions (tile-size table order for >1 row and >1 column unverified)");
+-    }
+     let mut o = TILE_SIZES_OFFSET;
+-    for &c in &cols {
+-        for &r in &rows {
++    for &r in &rows {
++        for &c in &cols {
+             put16(&mut d, o, c as u16);
+             put16(&mut d, o + 2, r as u16);
+             o += 4;
+diff --git a/nvidia-prolapse/driver-source/native/src/video/hevc/tests.rs b/nvidia-prolapse/driver-source/native/src/video/hevc/tests.rs
+index e8ab209..dc61569 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/hevc/tests.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/hevc/tests.rs
+@@ -506,3 +506,211 @@ fn libx265_open_gop_random_access_and_pyramid() {
+         .iter()
+         .all(|j| j.bitstream.windows(3).filter(|w| *w == [0, 0, 1]).count() >= 3));
+ }
++
++// ---------------------------------------------------------------------------------------------------------------
++// Refusal tests: features that stay a loud E_UNSUPPORTED until their stock contract is established.
++// ---------------------------------------------------------------------------------------------------------------
++
++/// SPS/PPS of the checked-in 160x144 stream, for the descriptor-builder refusal tests.
++fn testdata_parameter_sets() -> (Sps, Pps) {
++    const HEVC: &[u8] = include_bytes!("../testdata/hevc_160x144.hevc");
++    let mut sps = None;
++    for n in split_annexb(HEVC) {
++        match (n.nal[0] >> 1) & 0x3f {
++            33 => sps = Some(ps::parse_sps(&crate::video::bits::unescape(n.nal)).unwrap()),
++            34 => {
++                let p = ps::parse_pps(&crate::video::bits::unescape(n.nal)).unwrap();
++                return (sps.unwrap(), p);
++            }
++            _ => {}
++        }
++    }
++    panic!("testdata has no SPS/PPS pair");
++}
++
++fn idle_pic_state() -> PicState {
++    PicState {
++        stream_len: 16,
++        idr: true,
++        irap: true,
++        curr_slot: 0,
++        num_poc_total_curr: 0,
++        list0: [0; 16],
++        list1: [0; 16],
++        diff: [0; 16],
++        sw_hdr_skip_length: 0,
++        num_bits_st_rps: 0,
++        num_delta_pocs_ref: 0,
++    }
++}
++
++fn session_inputs() -> SessionInputs {
++    SessionInputs {
++        framestride: [160, 320],
++        filter: FilterOffsets::default(),
++        gptimer_max: u32::MAX,
++        general_bits: 1,
++        tail_11a: 0,
++        blackwell_b: true,
++    }
++}
++
++fn expect_build_unsupported(sps: &Sps, pps: &Pps, feature: &str) {
++    match desc::build(
++        sps,
++        pps,
++        &idle_pic_state(),
++        &session_inputs(),
++        StockOpaque::observed(sps.bit_depth_luma),
++    ) {
++        Err(VideoError::Unsupported(m)) => assert!(
++            m.contains(feature),
++            "refusal reason {m:?} does not name {feature:?}"
++        ),
++        Err(e) => panic!("expected Unsupported({feature:?}), got {e:?}"),
++        Ok(_) => panic!("expected Unsupported({feature:?}), the descriptor was built"),
++    }
++}
++
++#[test]
++fn two_dimensional_tile_grids_are_raster_ordered() {
++    // Stock builds one {u16 width, u16 height} entry per tile in raster-scan order (rows outer,
++    // columns inner) at setup+0x600: uniform path ELF 0x3ec2b..0x3ecfc, explicit path
++    // 0x3eef2..0x3f01c of libnvcuvid 615.78.08 (measured with read watchpoints on
++    // column_width_minus1 / row_height_minus1).
++    let (sps, mut pps) = testdata_parameter_sets();
++    let (w, h) = (sps.width_ctbs(), sps.height_ctbs());
++    assert_eq!((w, h), (3, 3), "testdata grid");
++    // Explicit 2x2: columns [2, 1], rows [1, 2].
++    pps.tiles = Some(Tiles {
++        uniform: false,
++        col_minus1: vec![1],
++        row_minus1: vec![0],
++        cols: 2,
++        rows: 2,
++        loop_filter_across_tiles: true,
++    });
++    let d = desc::build(
++        &sps,
++        &pps,
++        &idle_pic_state(),
++        &session_inputs(),
++        StockOpaque::observed(sps.bit_depth_luma),
++    )
++    .unwrap();
++    let entry = |i: usize| {
++        (
++            u16::from_le_bytes([d[desc::TILE_SIZES_OFFSET + 4 * i], d[desc::TILE_SIZES_OFFSET + 4 * i + 1]]),
++            u16::from_le_bytes([d[desc::TILE_SIZES_OFFSET + 4 * i + 2], d[desc::TILE_SIZES_OFFSET + 4 * i + 3]]),
++        )
++    };
++    assert_eq!(
++        [entry(0), entry(1), entry(2), entry(3)],
++        [(2, 1), (1, 1), (2, 2), (1, 2)],
++        "explicit 2x2 entries are raster ordered"
++    );
++    // Uniform 2x2 over 3x3 CTBs: columns [1, 2], rows [1, 2].
++    pps.tiles = Some(Tiles {
++        uniform: true,
++        col_minus1: vec![],
++        row_minus1: vec![],
++        cols: 2,
++        rows: 2,
++        loop_filter_across_tiles: true,
++    });
++    let d = desc::build(
++        &sps,
++        &pps,
++        &idle_pic_state(),
++        &session_inputs(),
++        StockOpaque::observed(sps.bit_depth_luma),
++    )
++    .unwrap();
++    let entry = |i: usize| {
++        (
++            u16::from_le_bytes([d[desc::TILE_SIZES_OFFSET + 4 * i], d[desc::TILE_SIZES_OFFSET + 4 * i + 1]]),
++            u16::from_le_bytes([d[desc::TILE_SIZES_OFFSET + 4 * i + 2], d[desc::TILE_SIZES_OFFSET + 4 * i + 3]]),
++        )
++    };
++    assert_eq!(
++        [entry(0), entry(1), entry(2), entry(3)],
++        [(1, 1), (2, 1), (1, 2), (2, 2)],
++        "uniform 2x2 entries are raster ordered"
++    );
++}
++
++#[test]
++fn pcm_is_refused() {
++    // pcm_enabled_flag alone is not enough: the PCM sample depths and block sizes are not
++    // verified in the stock descriptor.
++    let (mut sps, pps) = testdata_parameter_sets();
++    sps.pcm = true;
++    expect_build_unsupported(&sps, &pps, "HEVC PCM");
++}
++
++#[test]
++fn slice_long_term_references_are_refused() {
++    use super::slice::parse_slice_header;
++    let (mut sps, pps) = testdata_parameter_sets();
++    sps.long_term_ref_pics_present = true;
++    sps.num_long_term_ref_pics_sps = 1;
++    // P slice header: first slice segment, our PPS, one inline (empty) short-term RPS, then a
++    // single num_long_term_sps entry (the long-term syntax itself is what is unimplemented).
++    let mut w = W(Vec::new());
++    w.u(1, 1); // first_slice_segment_in_pic_flag
++    w.ue(pps.id);
++    w.u(pps.num_extra_slice_header_bits, 0);
++    w.ue(1); // slice_type = P (non-IDR, so no no_output_of_prior_pics_flag)
++    if pps.output_flag_present {
++        w.u(1, 1);
++    }
++    if sps.separate_colour_plane {
++        w.u(2, 0);
++    }
++    w.u(sps.log2_max_poc_lsb, 0); // slice_pic_order_cnt_lsb
++    w.u(1, 0); // short_term_ref_pic_set_sps_flag = 0 (inline set)
++    w.ue(0); // num_negative_pics
++    w.ue(0); // num_positive_pics
++    w.ue(1); // num_long_term_sps
++    w.ue(0); // num_long_term_pics
++    let mut rbsp = vec![0u8, 0u8]; // the parser skips a 2-byte NAL header
++    rbsp.extend_from_slice(&w.bytes());
++    let r = parse_slice_header(
++        &rbsp,
++        1,
++        |i| (i == pps.id).then_some(&pps),
++        |i| (i == sps.id).then_some(&sps),
++    );
++    match r {
++        Err(VideoError::Unsupported(m)) => assert!(
++            m.contains("long-term reference"),
++            "refusal reason {m:?} does not name the feature"
++        ),
++        Err(e) => panic!("expected Unsupported(long-term), got {e:?}"),
++        Ok(_) => panic!("long-term slice references were accepted"),
++    }
++}
++
++#[test]
++fn range_extension_profiles_are_refused() {
++    // profile_idc 4 = Format Range Extensions (SCC is 9); parse_sps refuses before the coding
++    // tools, so only the profile_tier_level is needed.
++    let mut w = W(Vec::new());
++    w.u(4, 0); // sps_video_parameter_set_id
++    w.u(3, 0); // sps_max_sub_layers_minus1
++    w.u(1, 1); // sps_temporal_id_nesting_flag
++    w.u(2 + 1, 0); // general_profile_space, general_tier_flag
++    w.u(5, 4); // general_profile_idc = 4
++    w.u(32, 0); // general_profile_compatibility_flags
++    w.u(32, 0).u(16, 0); // source flags, 43 constraint bits, inbld
++    w.u(8, 0); // general_level_idc
++    let mut nal = vec![0u8; 2]; // NAL header (skipped by the parser)
++    nal.extend_from_slice(&w.bytes());
++    match ps::parse_sps(&nal) {
++        Err(VideoError::Unsupported(m)) => {
++            assert!(m.contains("profile_idc 4"), "reason {m:?} does not name the profile")
++        }
++        Err(e) => panic!("expected Unsupported(profile_idc 4), got {e:?}"),
++        Ok(_) => panic!("range-extension profile accepted"),
++    }
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/mod.rs b/nvidia-prolapse/driver-source/native/src/video/mod.rs
+index edd819a..fd2e3df 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/mod.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/mod.rs
+@@ -1,5 +1,5 @@
+-//! nv_video (video/nv_video.h v1): NVDEC decode sessions on the native RM
+-//! backend. No NVIDIA userspace is loaded.
++//! nv_video (video/nv_video.h v1 entry points, v2 additions): NVDEC decode
++//! sessions on the native RM backend. No NVIDIA userspace is loaded.
+ //!
+ //! Layering (see video/README.md for the codec plug-in contract):
+ //! - `channel`: one NVDEC GPFIFO channel + its completion timeline.
+@@ -16,6 +16,7 @@ pub mod bits;
+ pub mod channel;
+ pub mod ffi;
+ pub mod h264;
++pub mod hdr;
+ pub mod hevc;
+ #[cfg(test)]
+ pub mod pretend;
+@@ -25,7 +26,12 @@ pub mod vp9;
+ use crate::rm::{self, Client};
+ use std::rc::Rc;
+ 
+-pub const ABI_VERSION: u32 = 1;
++/// ABI version reported in [`NvVideoDeviceInfo`]. v2 adds `nv_video_picture_hdr`
++/// (HDR static metadata), the "displayable pictures this unit produced" return of
++/// `nv_video_decode`, and `NV_VIDEO_E_RESIZE` + `nv_video_required_size` (a random
++/// access point that needs a session of another size); every v1 entry point keeps its
++/// v1 signature and layout.
++pub const ABI_VERSION: u32 = 2;
+ pub const CODEC_H264: u32 = 1;
+ pub const CODEC_HEVC: u32 = 2;
+ pub const CODEC_VP9: u32 = 3;
+@@ -44,6 +50,14 @@ pub enum VideoError {
+     NoMemory(String),
+     DeviceLost(String),
+     Again(String),
++    /// A random access point (key frame / IDR) that this session cannot decode at its
++    /// size: the caller drains the session, creates one of at least `width` x `height`
++    /// and submits the same unit to it (NV_VIDEO_E_RESIZE).
++    Resize {
++        width: u32,
++        height: u32,
++        reason: String,
++    },
+ }
+ 
+ impl VideoError {
+@@ -55,6 +69,7 @@ impl VideoError {
+             Self::NoMemory(_) => -4,
+             Self::DeviceLost(_) => -5,
+             Self::Again(_) => -6,
++            Self::Resize { .. } => -7,
+         }
+     }
+     pub fn message(&self) -> &str {
+@@ -64,7 +79,8 @@ impl VideoError {
+             | Self::Bitstream(m)
+             | Self::NoMemory(m)
+             | Self::DeviceLost(m)
+-            | Self::Again(m) => m,
++            | Self::Again(m)
++            | Self::Resize { reason: m, .. } => m,
+         }
+     }
+ }
+@@ -85,6 +101,38 @@ impl From<rm::Error> for VideoError {
+ 
+ pub type VResult<T> = std::result::Result<T, VideoError>;
+ 
++/// A picture larger than the session's maximum. At a random access point that starts a
++/// new reference chain (H.264 IDR, HEVC IRAP, VP9 key frame, AV1 shown key frame) a
++/// session of the new size decodes the stream from there on, so the caller re-creates
++/// the session ([`VideoError::Resize`]) the way FFmpeg re-creates its hardware decoder
++/// when the coded size changes (libavcodec/decode.c:1227 `ff_hwaccel_uninit` in
++/// `ff_get_format`, reached from h264_slice.c:920, hevc/hevcdec.c:725, vp9.c:254,
++/// av1dec.c:664). Anywhere else the references live in this session: refused.
++pub(crate) fn too_large(
++    codec: &str,
++    width: u32,
++    height: u32,
++    max: (u32, u32),
++    random_access: bool,
++) -> VideoError {
++    let what = format!(
++        "{codec} picture {width}x{height} larger than the session max {}x{}",
++        max.0, max.1
++    );
++    if random_access {
++        VideoError::Resize {
++            width,
++            height,
++            reason: format!("{what}: re-create the session at the new size"),
++        }
++    } else {
++        VideoError::Unsupported(format!(
++            "{what} on a picture that is not a random access point (references stay in this \
++             session)"
++        ))
++    }
++}
++
+ pub(crate) fn unsupported<T>(m: impl Into<String>) -> VResult<T> {
+     Err(VideoError::Unsupported(m.into()))
+ }
+@@ -155,7 +203,8 @@ impl NvdecGen {
+     pub fn ada_plus(self) -> bool {
+         self.bit & 0x1ff0_0000 != 0
+     }
+-    /// Bit 0x400000: D1B0 only (stock writes a setup word from ELF 0x3bc60, UNTRACED, for H.264/HEVC/VP9).
++    /// Bit 0x400000: D1B0 only (stock writes an extra setup word from ELF 0x3bc60 for
++    /// H.264/HEVC/VP9 whose value this library does not reproduce, so those codecs are refused there).
+     pub fn d1b0(self) -> bool {
+         self.bit & 0x0040_0000 != 0
+     }
+@@ -297,9 +346,9 @@ pub fn blackwell_gob_kinds(bytes_per_sample: u32) -> [u32; 2] {
+ /// GOB kinds of the engine output. Stock writes the plane kinds into the picture setup (VP9 +0xeb, HEVC
+ /// +0x71, AV1 stat word bits 15..18, as `luma | chroma << 2`: 8-bit 4:2:0 = 9, 10-bit = 2) only on classes
+ /// with [`NvdecGen::blackwell_b`] (stock 615 traces on GB202 and Ada); every other class gets 0 there, which we take as the standard
+-/// (pre-Blackwell, GOB kind 0) block-linear layout. Measured only on CFB0 (copy_out bit-exact); the
+-/// layout older engines write for tileformat 1 is UNTRACED in stock (it untiles with CUDA), see
+-/// [`output_layout_verified`].
++/// (pre-Blackwell, GOB kind 0) block-linear layout. Measured on CFB0 locally and on C4B0/C7B0/C9B0
++/// in the cross-generation run (copy_out bit-exact); the layout older engines write for
++/// tileformat 1 is not established (stock untiles with CUDA), see [`output_layout_verified`].
+ pub fn engine_gob_kinds(decoder_class: u32, bytes_per_sample: u32) -> [u32; 2] {
+     if NvdecGen::of(decoder_class).blackwell_b() {
+         blackwell_gob_kinds(bytes_per_sample)
+@@ -308,10 +357,13 @@ pub fn engine_gob_kinds(decoder_class: u32, bytes_per_sample: u32) -> [u32; 2] {
+     }
+ }
+ 
+-/// Whether the engine output layout copy_out assumes for this class was measured (copy of a decoded
+-/// surface bit-exact against a software decoder). Only GB202 (CFB0) so far.
++/// Whether the engine output layout copy_out assumes for this class was verified bit-exact
++/// (copy of a decoded surface against a software decoder): CFB0 locally (2026-10-14) and
++/// C9B0/C7B0/C4B0 in the cross-generation run 20261015-nvdec-xgen3 (31/31 bit-exact on each).
++/// On these classes the pre-Blackwell standard block-linear output (GOB kind 0) and the
++/// Blackwell GOB kinds 1/2 are measured, not assumed.
+ pub fn output_layout_verified(decoder_class: u32) -> bool {
+-    decoder_class == 0xcfb0
++    matches!(decoder_class, 0xcfb0 | 0xc9b0 | 0xc7b0 | 0xc4b0)
+ }
+ 
+ /// `luma | chroma << 2` of [`engine_gob_kinds`] as stock writes it into the picture setup of a
+@@ -783,6 +835,19 @@ mod tests {
+         );
+     }
+ 
++    /// The copy_out layout warning fires only on classes whose engine output was never
++    /// measured: the four classes of the decoding runs (local CFB0, cross-generation
++    /// C9B0/C7B0/C4B0) do not warn, every other class does.
++    #[test]
++    fn output_layout_warning_matches_measured_classes() {
++        for c in [0xcfb0, 0xc9b0, 0xc7b0, 0xc4b0] {
++            assert!(output_layout_verified(c), "{c:#x}");
++        }
++        for c in [0xd2b0, 0xceb0, 0xd1b0, 0xcdb0, 0xb8b0, 0xc6b0, 0xc3b0] {
++            assert!(!output_layout_verified(c), "{c:#x}");
++        }
++    }
++
+     #[test]
+     fn caps_bit_depths() {
+         let m = |codec, class| caps(codec, class, &NvdecEngineCaps::ALL).bit_depth_mask;
+diff --git a/nvidia-prolapse/driver-source/native/src/video/pretend.rs b/nvidia-prolapse/driver-source/native/src/video/pretend.rs
+index 872417d..c6e142a 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/pretend.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/pretend.rs
+@@ -74,12 +74,32 @@ pub fn run(
+     class: u32,
+     host_class: u32,
+     data: &[u8],
+-    (w, h): (u32, u32),
++    size: (u32, u32),
+     bit_depth: u32,
+ ) -> VResult<Vec<Built>> {
+-    // AV1: the first temporal unit carries the sequence header (as the av1 tests pass it).
++    Ok(run_units(codec, class, host_class, data, size, bit_depth)?
++        .into_iter()
++        .flatten()
++        .collect())
++}
++
++/// Like [`run`], but keeps the per-unit grouping: `out[i]` holds the pictures the i-th unit
++/// produced, empty when the unit produced none (parameter sets only, a skipped RASL picture,
++/// `pic_output_flag = 0`). This is the codec-side counterpart of `nv_video_decode`'s ABI v2
++/// return value.
++pub fn run_units(
++    codec: u32,
++    class: u32,
++    host_class: u32,
++    data: &[u8],
++    (w, h): (u32, u32),
++    bit_depth: u32,
++) -> VResult<Vec<Vec<Built>>> {
++    // AV1: the first temporal unit carries the sequence header (as the av1 tests pass it);
++    // it is still decoded, like the session does when the caller sends frame 0 in-band.
++    let units = units(codec, data);
+     let config = if codec == CODEC_AV1 {
+-        units(codec, data).swap_remove(0)
++        units.first().cloned().unwrap_or_default()
+     } else {
+         Vec::new()
+     };
+@@ -96,10 +116,11 @@ pub fn run(
+             }
+         })
+         .collect();
+-    let mut out = Vec::new();
++    let mut out = Vec::with_capacity(units.len());
+     let mut picture_index = 0u32;
+-    for unit in units(codec, data) {
+-        dec.push_unit(&unit)?;
++    for unit in &units {
++        let mut built = Vec::new();
++        dec.push_unit(unit)?;
+         while let Some(job) = dec.next_job()? {
+             let Job::Decode(job) = job else { continue };
+             let referenced = dec.referenced();
+@@ -122,7 +143,7 @@ pub fn run(
+             let words = dec.build(&job, &ctx, &mut desc)?;
+             let readback = job.readback.clone().map(|r| vec![0u8; r.len()]);
+             dec.finish(&job, current, readback.as_deref())?;
+-            out.push(Built {
++            built.push(Built {
+                 desc,
+                 words,
+                 descriptor: ctx.descriptor,
+@@ -131,6 +152,7 @@ pub fn run(
+             });
+             picture_index += 1;
+         }
++        out.push(built);
+     }
+     Ok(out)
+ }
+@@ -397,7 +419,7 @@ fn caps_per_generation() {
+     assert!(!e([1, 0, 0, 1, 0, 0, 0, 0], 0xcfb0).decodes(CODEC_AV1));
+     assert!(!e([0, 0, 0, 0, 0x10, 0, 0, 0], 0xc7b0).decodes(CODEC_VP9));
+     assert!(!e([1, 1, 1, 0, 0, 0, 0, 0], 0xc7b0).decodes(CODEC_HEVC));
+-    // D1B0: untraced setup word → refused with a reason.
++    // D1B0: extra setup word not reproduced → refused with a reason.
+     assert!(class_gap(CODEC_HEVC, 0xd1b0).is_some() && class_gap(CODEC_AV1, 0xd1b0).is_none());
+     assert!(ok(CODEC_HEVC, 0xc4b0));
+     // Classes verified on hardware (CFB0/C9B0/C7B0/C4B0) are enabled without the opt-in; GA100 is not.
+diff --git a/nvidia-prolapse/driver-source/native/src/video/session.rs b/nvidia-prolapse/driver-source/native/src/video/session.rs
+index 8c3b761..3236eeb 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/session.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/session.rs
+@@ -7,13 +7,14 @@
+ //!   `(len + 0x8ff) & ~0xff`: 0x141d50, allocations at 0x1393f0.
+ //! - DPB surfaces in VRAM in the engine layout, chroma after an aligned luma
+ //!   plane: 0x13a310.
+-//! - stock un-tiles in MapVideoFrame with CUDA kernels (UNTRACED); we copy with
++//! - stock un-tiles in MapVideoFrame with CUDA kernels; we copy with
+ //!   the copy engine instead: the VP9 engine output (tileformat 1 on Blackwell)
+ //!   is exactly the Blackwell 8-bit (luma) / 16-bit (chroma) GOB layout that the
+ //!   copy engine understands through SET_SRC_BLOCK_SIZE.GOB_KIND (measured
+ //!   2026-10-14, see video/README.md).
+ use super::{
+     channel::{wait_sync_file, NvdecChannel},
++    hdr::HdrStaticMetadata,
+     open_render_node, open_rm, Allocator, BuildContext, CodecDecoder, DecodeJob, Job, NvdecGen,
+     PictureInfo, SurfaceLayout, SurfaceRef, VResult, VideoDevice, VideoError, FORMAT_NV12,
+     FORMAT_P010, FORMAT_YUV420P,
+@@ -119,6 +120,8 @@ struct Picture {
+     timestamp: u64,
+     /// NVDEC timeline value that completes this picture's decode.
+     decoded_at: u64,
++    /// HDR static metadata of the unit that decoded this surface (empty: none declared).
++    hdr: HdrStaticMetadata,
+ }
+ 
+ /// An imported target dma-buf and its VA in the session's address space.
+@@ -199,6 +202,24 @@ pub(crate) fn unit_admitted(
+     need <= free || max_referenced.is_some_and(|n| n + 1 + held <= total)
+ }
+ 
++/// Why a session's requested bit depth cannot be built, or `None` when the caps mask covers
++/// it. H.264 has no 10/12-bit path in this library: the codec is constructed without a bit
++/// depth (8-bit engine surfaces) and has no High-10 descriptor setup, so the refusal names
++/// that instead of reporting a bare capability mask.
++pub(crate) fn bit_depth_refusal(codec: u32, depth: u32, mask: u32) -> Option<String> {
++    if depth < 32 && mask & (1 << depth) != 0 {
++        return None;
++    }
++    let mut m = format!("bit depth {depth} for codec {codec} is not supported (mask {mask:#x})");
++    if codec == super::CODEC_H264 && depth > 8 {
++        m.push_str(
++            ": 10/12-bit H.264 is not implemented - the codec is built with 8-bit surfaces \
++             only and has no High-10 descriptor setup",
++        );
++    }
++    Some(m)
++}
++
+ /// The engine's `nvdec_status_s` head (nvdec_drv.h: mbs_correctly_decoded,
+ /// mbs_in_error, cycle_count, error_status): an error message when
+ /// error_status is non-zero (observed 0xd when the AV1 +0x244 word is missing).
+@@ -233,6 +254,17 @@ pub struct Session {
+     surface_refs: Vec<SurfaceRef>,
+     /// Last copy-engine token reading each surface.
+     surface_copy: Vec<u64>,
++    /// HDR static metadata declared by the unit that decoded each surface (a
++    /// show_existing_frame outputs the metadata of the frame it shows).
++    surface_hdr: Vec<HdrStaticMetadata>,
++    /// Last HDR declaration of the stream (carried to pictures of later units).
++    current_hdr: HdrStaticMetadata,
++    /// Set when a unit returned `VideoError::Resize`: the session only drains from
++    /// then on (the caller re-creates it at this size and resubmits the unit).
++    resize_needed: Option<(u32, u32)>,
++    /// Displayable pictures emitted since session start (nv_video_decode returns the
++    /// increase per unit, the ABI v2 "this unit produced a picture" signal).
++    shown: u64,
+     layout: SurfaceLayout,
+     _side: Vec<VramBuffer>,
+     pictures: HashMap<u64, Picture>,
+@@ -309,18 +341,13 @@ impl Session {
+                 caps.max_height
+             )));
+         }
+-        if info.bit_depth >= 32 || caps.bit_depth_mask & 1 << info.bit_depth == 0 {
+-            return Err(VideoError::Unsupported(format!(
+-                "bit depth {} for codec {} (supported mask {:#x}){}",
+-                info.bit_depth,
+-                info.codec,
+-                caps.bit_depth_mask,
+-                if info.codec == super::CODEC_VP9 && !dev.engine0.vp9_high_bit_depth {
+-                    ": NVDEC0's BSP caps report no high-bit-depth VP9 (capsTbl[4] bit 4), as stock reads them"
+-                } else {
+-                    ""
+-                }
+-            )));
++        if let Some(why) = bit_depth_refusal(info.codec, info.bit_depth, caps.bit_depth_mask) {
++            let hint = if info.codec == super::CODEC_VP9 && !dev.engine0.vp9_high_bit_depth {
++                ": NVDEC0's BSP caps report no high-bit-depth VP9 (capsTbl[4] bit 4), as stock reads them"
++            } else {
++                ""
++            };
++            return Err(VideoError::Unsupported(format!("{why}{hint}")));
+         }
+         let mut codec: Box<dyn CodecDecoder> = match info.codec {
+             super::CODEC_VP9 => Box::new(super::vp9::Vp9Decoder::new(
+@@ -350,6 +377,19 @@ impl Session {
+             )?),
+             c => return Err(VideoError::Unsupported(format!("codec {c} not built in"))),
+         };
++        // The codec decides the engine surface layout from its own bit depth, and the DPB
++        // surfaces below are sized from it: a codec built for another depth would allocate
++        // the wrong sample container silently.
++        if codec.bit_depth() != info.bit_depth {
++            return Err(VideoError::Unsupported(format!(
++                "codec {} was built for {}-bit surfaces but the session requested {} bits: the \
++                 codec constructor does not take the session bit depth (H.264 is built 8-bit \
++                 only; it has no High-10 descriptor setup)",
++                info.codec,
++                codec.bit_depth(),
++                info.bit_depth
++            )));
++        }
+         let (device, _) = open_rm(Some(dev.pci))?;
+         let drm = open_render_node(dev.pci)?;
+         let space = AddressSpace::new(&device)?;
+@@ -395,6 +435,10 @@ impl Session {
+             ring,
+             next_ring: 0,
+             surface_copy: vec![0; surfaces.len()],
++            surface_hdr: vec![HdrStaticMetadata::default(); surfaces.len()],
++            current_hdr: HdrStaticMetadata::default(),
++            resize_needed: None,
++            shown: 0,
+             surfaces,
+             surface_refs,
+             layout,
+@@ -461,9 +505,45 @@ impl Session {
+         Ok(())
+     }
+ 
+-    pub fn decode(&mut self, data: &[u8], timestamp: u64, flags: u32) -> VResult<()> {
++    /// Submit one unit. Returns the number of displayable pictures this unit produced
++    /// (ABI v2): 0 for a unit the decoder drops or decodes without output (parameter sets
++    /// only, a skipped RASL picture, `pic_output_flag = 0`) and for a drain call; a caller
++    /// may therefore retire the input buffer as soon as a unit reports 0.
++    /// Submit one unit; returns the displayable pictures it produced. After a
++    /// `VideoError::Resize` only an end-of-stream drain (no data) is accepted.
++    pub fn decode(&mut self, data: &[u8], timestamp: u64, flags: u32) -> VResult<u32> {
++        if let Some((w, h)) = self.resize_needed {
++            if !data.is_empty() {
++                return Err(VideoError::Invalid(format!(
++                    "the session needs re-creation at {w}x{h} (NV_VIDEO_E_RESIZE): only an \
++                     end-of-stream drain is accepted"
++                )));
++            }
++        }
++        let r = self.decode_unit(data, timestamp, flags);
++        if let Err(VideoError::Resize { width, height, .. }) = &r {
++            self.resize_needed = Some((*width, *height));
++        }
++        r
++    }
++
++    /// The coded size the last `VideoError::Resize` asked for.
++    pub fn required_size(&self) -> Option<(u32, u32)> {
++        self.resize_needed
++    }
++
++    fn decode_unit(&mut self, data: &[u8], timestamp: u64, flags: u32) -> VResult<u32> {
+         self.poll_status()?;
++        let shown_before = self.shown;
+         if !data.is_empty() {
++            // HDR static metadata is stream syntax (SEI / metadata OBU), not engine
++            // state: parse it before any decoder state changes and attach it to the
++            // pictures this unit produces. Declarations persist: a stream usually
++            // declares the mastering display / content light level once, and every later
++            // picture is displayed with them until a new declaration replaces the group.
++            let declared = super::hdr::parse_unit(self.info.codec, data)?;
++            self.current_hdr.merge(declared);
++            let hdr = self.current_hdr;
+             let need = self.codec.surfaces_needed(data)?;
+             let free = self.free_surfaces().len();
+             let held: std::collections::HashSet<usize> =
+@@ -490,9 +570,10 @@ impl Session {
+                             .map(|p| p.decoded_at)
+                             .max()
+                             .unwrap_or(self.nvdec.submitted);
+-                        self.emit(surface, info, timestamp, decoded_at, None);
++                        let hdr = self.surface_hdr[surface];
++                        self.emit(surface, info, timestamp, decoded_at, None, hdr);
+                     }
+-                    Job::Decode(job) => self.decode_job(job, timestamp)?,
++                    Job::Decode(job) => self.decode_job(job, timestamp, hdr)?,
+                 }
+             }
+         }
+@@ -502,7 +583,8 @@ impl Session {
+                 self.display.push_back(id);
+             }
+         }
+-        Ok(())
++        u32::try_from(self.shown - shown_before)
++            .map_err(|_| VideoError::Invalid("unit produced more than 2^32 pictures".into()))
+     }
+ 
+     fn emit(
+@@ -512,9 +594,11 @@ impl Session {
+         timestamp: u64,
+         decoded_at: u64,
+         key: Option<i64>,
++        hdr: HdrStaticMetadata,
+     ) {
+         let id = self.next_id;
+         self.next_id += 1;
++        self.shown += 1;
+         self.pictures.insert(
+             id,
+             Picture {
+@@ -522,6 +606,7 @@ impl Session {
+                 info,
+                 timestamp,
+                 decoded_at,
++                hdr,
+             },
+         );
+         match key {
+@@ -537,7 +622,12 @@ impl Session {
+         }
+     }
+ 
+-    fn decode_job(&mut self, job: DecodeJob, timestamp: u64) -> VResult<()> {
++    fn decode_job(
++        &mut self,
++        job: DecodeJob,
++        timestamp: u64,
++        hdr: HdrStaticMetadata,
++    ) -> VResult<()> {
+         let current = *self
+             .free_surfaces()
+             .first()
+@@ -608,8 +698,11 @@ impl Session {
+             None => None,
+         };
+         self.codec.finish(&job, current, readback.as_deref())?;
++        // Keep the unit's metadata on the surface even when the picture is hidden: a
++        // later show_existing_frame outputs the metadata of the frame it shows.
++        self.surface_hdr[current] = hdr;
+         if job.show {
+-            self.emit(current, job.info, timestamp, value, job.display_key);
++            self.emit(current, job.info, timestamp, value, job.display_key, hdr);
+         }
+         Ok(())
+     }
+@@ -621,6 +714,15 @@ impl Session {
+         Some((id, p.timestamp, p.info))
+     }
+ 
++    /// HDR static metadata of picture `id` (ABI v2). A picture whose unit declared none
++    /// returns the empty value; an unknown id is a caller error.
++    pub fn picture_hdr(&self, id: u64) -> VResult<HdrStaticMetadata> {
++        self.pictures
++            .get(&id)
++            .map(|p| p.hdr)
++            .ok_or_else(|| VideoError::Invalid(format!("unknown picture id {id}")))
++    }
++
+     pub fn release(&mut self, id: u64) -> VResult<()> {
+         self.display.retain(|d| *d != id);
+         self.pictures
+@@ -632,6 +734,9 @@ impl Session {
+     pub fn flush(&mut self) -> VResult<()> {
+         self.codec.flush();
+         self.failed = None;
++        self.resize_needed = None;
++        // A seek may land in a different grade: the next declaration replaces it.
++        self.current_hdr = HdrStaticMetadata::default();
+         for id in std::mem::take(&mut self.display) {
+             self.pictures.remove(&id);
+         }
+@@ -737,8 +842,13 @@ impl Session {
+             }
+             plane_va[p] = va.address() + t.offset[p];
+         }
+-        // The target must be free (acquire fence). CPU wait: the backend has no
+-        // GPU-side sync_file wait outside its Vulkan bridge yet (open item).
++        // The target must be free (acquire fence, an arbitrary dma-fence sync_file from
++        // the caller). Waited on the CPU: one poll(2) on the fd, which returns immediately
++        // when the producer already signalled it (measured: see video/README.md
++        // "copy_out"). A GPU-side wait needs the sync_file imported as an RM semaphore
++        // (dma-fence -> semaphore), which this backend does not implement, and stock has
++        // no equivalent to follow (libnvcuvid has no fence-fd API; its consumers
++        // synchronise through CUDA stream semantics), so no GPU method is invented here.
+         if t.acquire_fence_fd >= 0 {
+             wait_sync_file(t.acquire_fence_fd, Duration::from_secs(5))
+                 .map_err(|e| VideoError::Invalid(format!("acquire fence: {e}")))?;
+@@ -760,7 +870,14 @@ impl Session {
+             let (src_va, rows_alloc, rows, line_bytes, ox, oy) = if p == 0 {
+                 (src.luma, self.layout.luma_rows, ch, cw * bps, cl * bps, ct)
+             } else if remap.is_some() {
+-                (src.chroma, self.layout.chroma_rows, ch.div_ceil(2), cw.div_ceil(2), cl / 2, ct / 2)
++                (
++                    src.chroma,
++                    self.layout.chroma_rows,
++                    ch.div_ceil(2),
++                    cw.div_ceil(2),
++                    cl / 2,
++                    ct / 2,
++                )
+             } else {
+                 (
+                     src.chroma,
+@@ -771,9 +888,17 @@ impl Session {
+                     ct / 2,
+                 )
+             };
+-            let src_width = if remap.is_some() { self.layout.pitch / 2 } else { self.layout.pitch };
++            let src_width = if remap.is_some() {
++                self.layout.pitch / 2
++            } else {
++                self.layout.pitch
++            };
+             // Source: engine block linear, 1-GOB wide, 2-GOB high blocks.
+-            let gob_kind = if blackwell_ce { src_kinds[p.min(1)] << 16 } else { 0 };
++            let gob_kind = if blackwell_ce {
++                src_kinds[p.min(1)] << 16
++            } else {
++                0
++            };
+             method(&mut w, 4, 0x728, &[1 << 4 | 1 << 12 | gob_kind]); // SET_SRC_BLOCK_SIZE
+             method(&mut w, 4, 0x72c, &[src_width, rows_alloc, 1, 0]); // SRC W/H/D/LAYER
+             method(&mut w, 4, 0x744, &[ox, oy]); // SRC_ORIGIN_X/Y
+@@ -781,13 +906,22 @@ impl Session {
+             if let Some(component) = remap {
+                 // DST_X = SRC_X (Cb) or SRC_Y (Cr), DST_Y/Z/W = NO_WRITE (6), COMPONENT_SIZE ONE,
+                 // NUM_SRC_COMPONENTS TWO, NUM_DST_COMPONENTS ONE.
+-                method(&mut w, 4, 0x708, &[component | 6 << 4 | 6 << 8 | 6 << 12 | 1 << 20]);
++                method(
++                    &mut w,
++                    4,
++                    0x708,
++                    &[component | 6 << 4 | 6 << 8 | 6 << 12 | 1 << 20],
++                );
+                 launch |= 1 << 10; // REMAP_ENABLE
+             }
+             match dst.block {
+                 None => launch |= 1 << 8, // DST pitch
+                 Some((h, kinds)) => {
+-                    let dk = if blackwell_ce { kinds[p.min(1)] << 16 } else { 0 };
++                    let dk = if blackwell_ce {
++                        kinds[p.min(1)] << 16
++                    } else {
++                        0
++                    };
+                     method(&mut w, 4, 0x70c, &[h << 4 | 1 << 12 | dk]); // SET_DST_BLOCK_SIZE
+                     let dst_rows = rows.next_multiple_of(8 << h);
+                     method(
+@@ -945,6 +1079,18 @@ impl TargetLayout {
+                 planar,
+             });
+         }
++        // The 2-byte-sample (P010) block-linear destination write is derived, not measured:
++        // the destination GOB layout the copy engine produces for 16-bit luma / 32-bit CbCr
++        // has never been read back and compared on hardware. Refuse it rather than write a
++        // possibly wrong layout; LINEAR P010 is bit-exact (host test) and NV12 block-linear
++        // (1-byte samples) is measured.
++        if bytes_per_sample != 1 {
++            return Err(VideoError::Unsupported(format!(
++                "P010 block-linear target (modifier {:#x}): the copy engine's 16-bit \
++                 block-linear write is not verified end to end; use a LINEAR P010 target",
++                t.modifier
++            )));
++        }
+         let v = t.modifier & ((1 << 56) - 1);
+         if t.modifier >> 56 != VENDOR_NVIDIA || v & 0x10 == 0 || v >> 26 != 0 {
+             return Err(VideoError::Unsupported(format!(
+@@ -1030,9 +1176,17 @@ mod tests {
+             .is_none());
+         let t = TargetLayout::parse(&target(bl(0, 1, 3, 0xfe, 4)), 0xcab5, 1).unwrap();
+         assert_eq!(t.block, Some((4, [1, 2])));
+-        // P010 on Blackwell GOBs: 16-bit luma, 32-bit CbCr (the engine's 10-bit output kinds).
+-        let t = TargetLayout::parse(&target(bl(0, 1, 3, 0xfe, 4)), 0xcab5, 2).unwrap();
+-        assert_eq!(t.block, Some((4, [2, 0])));
++        // P010 (2-byte samples) block-linear: verified end to end nowhere, refused with the
++        // reason on both GOB generations instead of writing a guessed layout.
++        for modif in [bl(0, 1, 3, 0xfe, 4), bl(0, 1, 2, 0xfe, 1)] {
++            let e = TargetLayout::parse(&target(modif), 0xcab5, 2).unwrap_err();
++            assert!(
++                e.message().contains("P010 block-linear") && e.message().contains("not verified"),
++                "{}",
++                e.message()
++            );
++            assert_eq!(e.code(), -2); // NV_VIDEO_E_UNSUPPORTED
++        }
+         let t = TargetLayout::parse(&target(bl(0, 1, 2, 0xfe, 1)), 0xc7b5, 1).unwrap();
+         assert_eq!(t.block, Some((1, [0, 0])));
+         assert!(TargetLayout::parse(&target(bl(1, 1, 2, 0xfe, 1)), 0xcab5, 1).is_err()); // compressed
+@@ -1087,6 +1241,107 @@ mod tests {
+         );
+     }
+ 
++    /// The ABI v2 "this unit produced a picture" signal is 0 exactly when the codec hands
++    /// the session no displayable job. A unit that carries only parameter sets is the
++    /// simplest such unit (a skipped RASL picture and `pic_output_flag = 0` are the
++    /// stream cases, see `skipped_rasl_units_produce_no_picture`).
++    #[test]
++    fn parameter_set_unit_produces_no_picture() {
++        use super::super::{bits, pretend, CODEC_HEVC};
++        let stream: &[u8] = include_bytes!("testdata/hevc_160x144.hevc");
++        let aus = bits::access_units(stream, true);
++        let mut ps = Vec::new();
++        for n in bits::split_annexb(aus[0]) {
++            if (32..=34).contains(&((n.nal[0] >> 1) & 0x3f)) {
++                ps.extend_from_slice(&[0, 0, 1]);
++                ps.extend_from_slice(n.nal);
++            }
++        }
++        assert!(!ps.is_empty(), "no parameter sets in the bundled stream");
++        let out = pretend::run_units(CODEC_HEVC, 0xcfb0, 0xc96f, &ps, (160, 144), 8).unwrap();
++        assert_eq!(out.len(), 1);
++        assert!(
++            out[0].is_empty(),
++            "parameter-set unit built {} pictures",
++            out[0].len()
++        );
++        let first = pretend::run(CODEC_HEVC, 0xcfb0, 0xc96f, aus[0], (160, 144), 8).unwrap();
++        assert_eq!(first.len(), 1, "the first access unit decodes one picture");
++    }
++
++    /// Random access at a CRA: the RASL pictures that follow it are skipped (HEVC 8.1.3,
++    /// NoRaslOutputFlag), and exactly those units produce no picture — the C2 core relies on
++    /// this signal to retire their input instead of holding them until EOS/flush.
++    #[test]
++    #[ignore = "needs NVDEC_STOCK_EVIDENCE (streams/x265-opengop.hevc)"]
++    fn skipped_rasl_units_produce_no_picture() {
++        use super::super::{bits, pretend, CODEC_HEVC};
++        let dir = std::env::var("NVDEC_STOCK_EVIDENCE")
++            .expect("NVDEC_STOCK_EVIDENCE=<stock captures dir>");
++        let stream = std::fs::read(format!("{dir}/streams/x265-opengop.hevc")).unwrap();
++        let aus = bits::access_units(&stream, true);
++        let types = |a: &[u8]| -> Vec<u32> {
++            bits::split_annexb(a)
++                .into_iter()
++                .map(|n| u32::from((n.nal[0] >> 1) & 0x3f))
++                .collect()
++        };
++        let cra: Vec<usize> = aus
++            .iter()
++            .enumerate()
++            .filter(|(_, a)| types(a).contains(&21))
++            .map(|(i, _)| i)
++            .collect();
++        let start = cra[1];
++        let mut data = Vec::new();
++        for n in bits::split_annexb(aus[0]) {
++            if (32..=34).contains(&((n.nal[0] >> 1) & 0x3f)) {
++                data.extend_from_slice(&[0, 0, 1]);
++                data.extend_from_slice(n.nal);
++            }
++        }
++        data.extend(aus[start..].iter().flat_map(|a| a.iter().copied()));
++        let out = pretend::run_units(CODEC_HEVC, 0xcfb0, 0xc96f, &data, (176, 144), 8).unwrap();
++        assert_eq!(out.len(), aus.len() - start);
++        // Only the leading pictures of the random-access CRA are skipped (8.1.3); RASL
++        // pictures after the next CRA decode normally (NoRaslOutputFlag = 0).
++        let is_rasl = |a: &[u8]| types(a).iter().any(|&x| x == 8 || x == 9);
++        let lead = cra[2] - start;
++        let rasl_lead = aus[start..cra[2]].iter().filter(|a| is_rasl(a)).count();
++        assert!(rasl_lead > 0, "stream has no RASL pictures after the CRA");
++        let empty = out[..lead].iter().filter(|p| p.is_empty()).count();
++        assert_eq!(
++            empty, rasl_lead,
++            "skipped units must be exactly the leading RASLs"
++        );
++        for (i, pics) in out.iter().enumerate() {
++            if i < lead && is_rasl(aus[start + i]) {
++                continue;
++            }
++            assert_eq!(
++                pics.len(),
++                1,
++                "unit {i} (types {:?}) must decode one picture",
++                types(aus[start + i])
++            );
++        }
++    }
++
++    /// A 10-bit H.264 session is refused with the reason (no 16-bit surfaces are ever
++    /// allocated for it); the 8-bit path and the codecs that do take a depth are unaffected.
++    #[test]
++    fn h264_high_bit_depth_is_refused_by_name() {
++        let h264_mask = 1 << 8;
++        let m = bit_depth_refusal(super::super::CODEC_H264, 10, h264_mask).expect("refused");
++        assert!(m.contains("High-10") && m.contains("no High-10"), "{m}");
++        assert!(bit_depth_refusal(super::super::CODEC_H264, 8, h264_mask).is_none());
++        let hevc_mask = 1 << 8 | 1 << 10;
++        assert!(bit_depth_refusal(super::super::CODEC_HEVC, 10, hevc_mask).is_none());
++        let m = bit_depth_refusal(super::super::CODEC_HEVC, 12, hevc_mask).expect("refused");
++        assert!(!m.contains("High-10"), "{m}");
++        assert!(bit_depth_refusal(super::super::CODEC_VP9, 32, 1 << 8).is_some());
++    }
++
+     #[test]
+     fn surface_layout_constant_pitch() {
+         let l = SurfaceLayout::new(1928, 1208, 1);
+diff --git a/nvidia-prolapse/driver-source/native/src/video/vp9.rs b/nvidia-prolapse/driver-source/native/src/video/vp9.rs
+index e88eeea..1d2638a 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/vp9.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/vp9.rs
+@@ -5,8 +5,21 @@
+ //! Field derivations follow stock libnvcuvid 615.71.09: picture setup at ELF
+ //! 0x13f400 (bsd/flt above sizes, gptimer, word 0x108); method list and
+ //! seg/colMV slot rules at 0x141d50. Checked against FFmpeg/libvpx
+-//! (error-resilient sign bias, seg-map reset, stride from surface pitch,
+-//! scaled-reference validity).
++//! (error-resilient sign bias, stride from surface pitch, scaled-reference
++//! validity).
++//!
++//! Segment maps (libnvcuvid 615.78.08): the side buffer holding the two maps
++//! and the colMV pair is zeroed once when the decoder is created, before the
++//! first picture (ELF 0x3b7c0, a copy-engine fill of the whole buffer); here
++//! the session zeroes every side buffer through its mapping at allocation,
++//! before any submission. Per picture the pair is programmed READ = slot 0
++//! (method 0x5c8), WRITE = slot 1 (0x5cc) and swapped after a picture whose
++//! segmentation_update_map is set (ELF 0x3fbe1, swap at 0x437f3). Nothing is
++//! cleared, copied or reselected at key, intra-only or error-resilient
++//! pictures: the engine applies the VP9 reset (libvpx
++//! `vp9_setup_past_independence`) from the picture flags (pic_s +0x68 bits 0,
++//! 3 and 5). Engine work is ordered by submission, so the CPU never touches
++//! the maps after creation.
+ use super::{
+     BuildContext, CodecDecoder, DecodeJob, Job, NvdecGen, PictureInfo, VResult, VideoError,
+     CODEC_VP9,
+@@ -48,10 +61,13 @@ pub struct Vp9Decoder {
+     filter: u64,
+     seg_flip: usize,
+     mv_flip: usize,
+-    /// A seg map was written since the last reset (needs clearing on
+-    /// key / intra-only / error-resilient / resize, libvpx).
+-    seg_dirty: bool,
+-    seg_clear: bool,
++    /// Coded size of the last picture that wrote a segment map into the side
++    /// buffer (None: still the zeroed allocation). Survives `flush`, like the
++    /// buffer contents.
++    seg_extent: Option<(u32, u32)>,
++    /// A coded size change on a picture that is not a key frame while a map is
++    /// written: refused (see `next_job`).
++    seg_extent_change: bool,
+     prev_key: bool,
+     prev_show: bool,
+     last_decoded: Option<(u32, u32)>,
+@@ -74,8 +90,8 @@ impl Vp9Decoder {
+             filter: 0,
+             seg_flip: 0,
+             mv_flip: 0,
+-            seg_dirty: false,
+-            seg_clear: false,
++            seg_extent: None,
++            seg_extent_change: false,
+             prev_key: false,
+             prev_show: false,
+             last_decoded: None,
+@@ -268,6 +284,13 @@ fn stock_ext_108(width: u32) -> u32 {
+     (((2 * width + 0x7e) & 0x3ff80) + 0x1ff) >> 8
+ }
+ 
++/// Whether the segment map pair swaps after this picture: stock sets its swap flag iff
++/// pic_s +0x81 (segment_map_update) is non-zero, which `pic` writes as
++/// `enabled && update_map`.
++fn seg_swaps_after(seg: &crate::vp9::Segmentation) -> bool {
++    seg.enabled && seg.update_map
++}
++
+ impl CodecDecoder for Vp9Decoder {
+     fn codec(&self) -> u32 {
+         CODEC_VP9
+@@ -284,8 +307,10 @@ impl CodecDecoder for Vp9Decoder {
+         _max_width: u32,
+         _max_height: u32,
+     ) -> VResult<()> {
+-        // Sized for 8192x8192 like stock (ffmpeg's max); no initialisation
+-        // beyond zero (stock does none).
++        // Sized for 8192x8192 like stock (ffmpeg's max). The allocator zeroes
++        // each buffer before the session submits anything: stock zeroes the
++        // whole seg + colMV side buffer once at create (ELF 0x3b7c0) and never
++        // again.
+         self.seg = alloc.vram(2 * SEG_SIZE)?;
+         self.colmv = alloc.vram(2 * COLMV_SIZE)?;
+         self.filter = alloc.vram(FILTER_SIZE)?;
+@@ -340,16 +365,30 @@ impl CodecDecoder for Vp9Decoder {
+             info.keyframe = false;
+             return Ok(Some(Job::ShowExisting { surface, info }));
+         }
++        let key = h.frame_type == KEY_FRAME;
+         if h.width > self.max.0 || h.height > self.max.1 {
+-            return Err(VideoError::Unsupported(format!(
+-                "VP9 frame {}x{} larger than the session max {}x{}",
+-                h.width, h.height, self.max.0, self.max.1
+-            )));
++            // A key frame refreshes every reference slot.
++            return Err(super::too_large("VP9", h.width, h.height, self.max, key));
++        }
++        // A coded size change also changes the segment map extent: libvpx zeroes the maps
++        // on every size change (vp9_alloccommon.c vp9_init_context_buffers via
++        // resize_context_buffers). With no map written yet the side buffer is still the
++        // zeroed allocation. Otherwise a key frame starts a fresh session (zeroed side
++        // buffer, as FFmpeg re-creates its decoder at every VP9 size change, libavcodec/vp9.c:182-254), and any other picture is refused:
++        // what the engine does with a written map of the old extent is not established.
++        let extent_changed = self.seg_extent.is_some_and(|e| e != (h.width, h.height));
++        self.seg_extent_change = extent_changed && !key;
++        if extent_changed && key {
++            return Err(VideoError::Resize {
++                width: h.width,
++                height: h.height,
++                reason: format!(
++                    "VP9 key frame changes the coded size to {}x{} after segment maps were \
++                     written: a new session starts from zeroed maps",
++                    h.width, h.height
++                ),
++            });
+         }
+-        // Seg map reset rule (libvpx vp9_entropymode.c:433-437 via
+-        // setup_past_independence, and on resize).
+-        let resized = self.last_decoded.is_some_and(|s| s != (h.width, h.height));
+-        self.seg_clear = self.seg_dirty && (h.is_intra() || h.error_resilient || resized);
+         let info = self.info(&h, h.width, h.height);
+         let tiles = frame
+             .get(h.uncompressed_size + h.header_size..)
+@@ -389,11 +428,11 @@ impl CodecDecoder for Vp9Decoder {
+         }
+         let probs = self.st.entropy_table();
+         d[PROBS..PROBS + probs.as_bytes().len()].copy_from_slice(probs.as_bytes());
+-        if self.seg_clear {
+-            // Both maps start from zero (segment 0) after a reset point.
++        if self.seg_extent_change {
+             return Err(VideoError::Unsupported(
+-                "VP9 segmentation map reset after key/intra-only/error-resilient/resize with \
+-                 segmentation in use (GPU clear not implemented)"
++                "VP9 coded size change on a non-key picture after segment maps were written \
++                 (libvpx zeroes both maps at every size change): the engine's handling of a \
++                 map written at the old extent is not established"
+                     .into(),
+             ));
+         }
+@@ -455,12 +494,12 @@ impl CodecDecoder for Vp9Decoder {
+         let h = p.header;
+         let counts = readback.and_then(Vp9EntropyCounts::from_bytes);
+         self.mv_flip ^= 1;
+-        // libvpx swaps the seg maps iff segmentation is enabled
+-        // (vp9_decoder.c:483-487); stock swaps after map updates (+0x65e4).
+-        // Both agree on every stream with update_map whenever enabled.
+-        if self.st.seg.enabled {
++        // Stock swaps the read/write pair after a picture whose
++        // segmentation_update_map is set (libnvcuvid ELF 0x3fbd7/0x3fbe1, the swap at
++        // 0x437f3). The update flag only exists with segmentation enabled.
++        if seg_swaps_after(&self.st.seg) {
+             self.seg_flip ^= 1;
+-            self.seg_dirty = true;
++            self.seg_extent = Some((h.width, h.height));
+         }
+         self.prev_key = h.frame_type == KEY_FRAME;
+         self.prev_show = h.show_frame;
+@@ -478,6 +517,8 @@ impl CodecDecoder for Vp9Decoder {
+             seg: self.seg,
+             colmv: self.colmv,
+             filter: self.filter,
++            // The maps keep their contents across a flush.
++            seg_extent: self.seg_extent,
+             ..Self::new(self.gen.class, max.0, max.1, self.bit_depth)
+         };
+     }
+@@ -503,6 +544,43 @@ mod tests {
+         );
+     }
+     #[test]
++    fn segment_map_pair_swaps_on_update_map_only() {
++        use crate::vp9::Segmentation;
++        let seg = |enabled, update_map, temporal_update| Segmentation {
++            enabled,
++            update_map,
++            temporal_update,
++            ..Default::default()
++        };
++        // Stock swaps after a picture with segment_map_update set, temporal or not.
++        assert!(seg_swaps_after(&seg(true, true, false)));
++        assert!(seg_swaps_after(&seg(true, true, true)));
++        // Segmentation on without a map update reads the map in place: no swap
++        // (libvpx would swap here; stock does not).
++        assert!(!seg_swaps_after(&seg(true, false, false)));
++        // Segmentation off: no map write, no swap.
++        assert!(!seg_swaps_after(&seg(false, false, false)));
++    }
++    #[test]
++    fn key_frame_past_the_session_max_asks_for_a_new_session() {
++        let ivf = include_bytes!("testdata/vp9_160x144.ivf");
++        let frames = crate::vp9::ivf_frames(ivf).unwrap();
++        // The first frame is a 160x144 key frame: a 128x128 session cannot hold it, a new
++        // session of the reported size can.
++        let mut d = Vp9Decoder::new(0xcfb0, 128, 128, 8);
++        d.push_unit(frames[0]).unwrap();
++        match d.next_job() {
++            Err(VideoError::Resize { width, height, .. }) => {
++                assert_eq!((width, height), (160, 144))
++            }
++            Err(e) => panic!("expected Resize, got {e}"),
++            Ok(_) => panic!("expected Resize, got a job"),
++        }
++        let mut d = Vp9Decoder::new(0xcfb0, 160, 144, 8);
++        d.push_unit(frames[0]).unwrap();
++        assert!(matches!(d.next_job(), Ok(Some(Job::Decode(_)))));
++    }
++    #[test]
+     fn interp_filter_is_the_bitstream_literal() {
+         // Stock pic_s +0x79 on vp9_1080 (gallery, libvpx two-pass alt-ref):
+         // the 65/68/67/69-byte alt-ref overlay frames code
+@@ -534,6 +612,14 @@ mod tests {
+             d.surfaces_needed(&[0x92, 0, 0]),
+             Err(VideoError::Unsupported(_))
+         ));
++        // Profile 1 (4:4:4) is refused in every session: NVDEC's VP9 decode
++        // supports profiles 0 and 2 only (the engine input is NV12/P010;
++        // 4:2:0 is a session surface contract), so there is no 4:4:4 path to
++        // size a surface for.
++        assert!(matches!(
++            d.surfaces_needed(&[0xa2, 0, 0]),
++            Err(VideoError::Unsupported(_))
++        ));
+         assert_eq!(d.surfaces_needed(&[0x88]).unwrap(), 0); // show_existing
+                                                             // Profile 2 (10-bit) only in a 10-bit session; profile 1 (4:4:4) never.
+         let d10 = Vp9Decoder::new(0xcfb0, 640, 480, 10);
+diff --git a/nvidia-prolapse/driver-source/native/video/README.md b/nvidia-prolapse/driver-source/native/video/README.md
+index a04e9a3..a3c96c1 100644
+--- a/nvidia-prolapse/driver-source/native/video/README.md
++++ b/nvidia-prolapse/driver-source/native/video/README.md
+@@ -1,9 +1,15 @@
+ # nv_video — NVDEC decode on the native RM backend
+ 
+-C ABI: `nv_video.h` (v1, unchanged). Implementation: `src/video/` (exported from
+-`libnv_bionic_native` for GNU and bionic, 64- and 32-bit). Host test:
++C ABI: `nv_video.h` (v2: every v1 entry point and struct layout unchanged; v2 adds
++`nv_video_picture_hdr` with `struct NvVideoHdrMetadata`, makes `nv_video_decode` return
++the number of displayable pictures the unit produced (success is `rc >= 0`), and adds
++`NV_VIDEO_E_RESIZE` + `nv_video_required_size` for adaptive streams). Implementation: `src/video/`
++(exported from `libnv_bionic_native` for GNU and bionic, 64- and 32-bit). Host test:
+ `target/release/nv-video-test <in.ivf> <ref.nv12|-> [max_w max_h]` (every frame through
+ decode → next_picture → copy_out into a LINEAR NV12 dma-buf → release fence → readback).
++`NV_VIDEO_REPORT=1` prints the per-unit picture count (`nv_video_decode`'s v2 return) and the
++HDR metadata of every picture that carries any; `NV_VIDEO_MEASURE_ACQUIRE=1` (AVC test)
++re-passes the previous release fence as the acquire fence and times the copy_out call.
+ 
+ ## Layers
+ 
+@@ -17,8 +23,23 @@ decode → next_picture → copy_out into a LINEAR NV12 dma-buf → release fenc
+ | `h264/` | H.264: SPS/PPS/slice parser, POC 0/1/2, gaps, MMCO, NEW_H264 (app 8) and legacy (app 3, interlaced frame pictures) setups byte-exact vs stock; `codec.rs` = plug-in |
+ | `hevc/` | HEVC: general parser (POC MSB, RPS DPB, 8.3.4 lists, scaling lists, tiles, CRA/RASL), setup byte-exact vs stock; `codec.rs` = plug-in |
+ | `bits.rs` | Annex-B NAL / access-unit splitting, emulation-prevention removal, RBSP bit reader |
++| `hdr.rs` | HDR static metadata from the bitstream: H.264/HEVC SEI 137/144, AV1 metadata OBUs HDR_MDCV/HDR_CLL (attached per picture, declarations persist like a decoder's SEI state) |
+ | `ffi.rs` | `extern "C"` entry points, per-thread `nv_video_last_error` |
+ 
++## Size changes (adaptive streaming)
++
++A session is sized at create (`max_width`/`max_height`: DPB surfaces, side buffers, pitch). A
++random access point larger than that — H.264 IDR, HEVC IRAP, VP9 key frame, AV1 shown key
++frame — returns `NV_VIDEO_E_RESIZE`; `nv_video_required_size` gives the coded size. Those
++pictures start a new reference chain, so the caller drains the session (end-of-stream decode
++without data), destroys it, creates one at least that size and resubmits the unit, as FFmpeg
++re-creates its hardware decoder when the coded size changes (libavcodec/decode.c:1227 in
++`ff_get_format`; vp9.c:254, av1dec.c:664, hevc/hevcdec.c:725, h264_slice.c:920). A larger
++picture anywhere else (its references live in this session) is `E_UNSUPPORTED`. VP9 also
++returns `E_RESIZE` at a key frame that changes the coded size after a segment map was
++written (libvpx zeroes the maps at every size change; a new session's side buffer is zero),
++and refuses such a change on any other picture.
++
+ ## Codec plug-in contract (`CodecDecoder`, for impl-av1 / impl-avc)
+ 
+ A codec is a parse → descriptor builder; the session owns every GPU resource that is not
+@@ -94,8 +115,11 @@ Copy engine, not a shader: the measured engine output is a layout the copy engin
+   no shift or conversion pass. NV12 for 10-bit / P010 for 8-bit pictures is `E_UNSUPPORTED` (no
+   depth conversion), and a stream whose depth differs from the session's is `E_UNSUPPORTED`.
+ - Destination: LINEAR (pitch per plane) or `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D` (uncompressed,
+-  g = 2 → kind 0, g = 3 → kinds 1/2 for NV12, 2/0 for P010 on Blackwell copy classes; the P010
+-  block-linear write is not yet verified end to end). Target dma-bufs are imported
++  g = 2 → kind 0, g = 3 → kinds 1/2 for NV12 on Blackwell copy classes). A P010 block-linear
++  target is refused with `E_UNSUPPORTED`: the copy engine's 16-bit block-linear write
++  (16-bit luma / 32-bit CbCr GOBs) has never been read back and compared on hardware, so the
++  path refuses instead of writing a guessed layout; P010 goes to LINEAR targets (bit-exact).
++  Target dma-bufs are imported
+   per call (`external::import`) and kept until the copy retires; fds stay the caller's.
+ - Planar 4:2:0 (`NV_VIDEO_FORMAT_YUV420P`, 8-bit, LINEAR only): Y, Cb and Cr planes, the Cr plane
+   in `cr_dmabuf_fd/cr_offset/cr_pitch`. The engine's CbCr plane is split by the copy engine's
+@@ -104,14 +128,37 @@ Copy engine, not a shader: the measured engine output is a layout the copy engin
+   origin X and line length count 2-byte elements, pitches stay bytes (NVK `nouveau_copy_rect`).
+   Bit-exact: `NV_VIDEO_TARGET=yuv420p nv-video-avc-test` (YV12 plane order and pitches).
+ - Ordering: the copy queue acquires the NVDEC timeline (GPU wait); the release fence is the copy
+-  queue's semaphore sync_file. The acquire fence is waited on the CPU (open item).
++  queue's semaphore sync_file. The caller's acquire fence is waited on the CPU before submission:
++  one `poll(2)` on the sync_file, which returns immediately when the producer already signalled
++  it (measured on the 5090: copy_out call median 103–195 µs across runs, signalled fence or none,
++  i.e. below this harness's noise; directional). A GPU-side wait would need the sync_file
++  imported as an RM semaphore and acquired by the copy channel, which this backend does not
++  implement, and libnvcuvid has no fence-fd API to follow (its consumers synchronise through
++  CUDA stream semantics). A GPU-side wait needs to know how a dma-fence becomes an RM semaphore
++  on this driver (class/method, payload width, and whether the copy channel or a separate
++  semaphore object performs the acquire).
+ - NV12 from 8-bit pictures only; P010 → `E_UNSUPPORTED` until 10-bit decode exists.
+ 
++## HDR static metadata (ABI v2)
++
++HEVC/AV1 (and H.264) streams that carry SMPTE ST 2086 mastering display and CEA-861.3 content
++light level are parsed from the bitstream and returned per picture by `nv_video_picture_hdr`:
++the C2 HAL maps them to `C2StreamHdrStaticInfo` so the display can tone-map. Declarations
++persist across units (an encoder usually writes them once; every later picture carries them)
++and are cleared by `nv_video_flush`. Verified end to end on the 5090: an x265 HEVC
++`master-display=...:max-cll=1000,400` stream reports R(34000,16000) G(13250,34500)
++B(7500,3000) WP(15635,16450) L(10000000,1) CLL (1000,400) on every picture, and an AV1 stream
++with metadata OBUs HDR_CLL/HDR_MDCV reports the same values, matching libdav1d's
++`mastering_display_metadata` / `content_light_level_metadata` side data for the same file.
++An AV1 temporal unit that carries per-frame metadata for several frames reports the unit's
++metadata for each of them.
++
+ ## Coverage (RTX 5090, 615.71.09, 2026-10-14) — all bit-exact vs libvpx through the C ABI
+ 
+ | Stream | Feature | Frames |
+ |---|---|---|
+ | a640, b1080, c1928, d1000aq (stock-trace streams) | 640x360 / 1080p / odd 1928x1208 / aq-mode 3 segmentation | 40/40/8/40 |
++| aq3-g8-320 (libvpx aq-mode 3, `-g 8`), rt-er-aq3-320 (vpxenc `--rt --error-resilient=1 --aq-mode=3`) | segmentation off at key frames then temporal map prediction; error-resilient inter frames that read the previous map (reset applied by the engine, maps never cleared) | 30/30 |
+ | altref (2-pass, auto-alt-ref, lag 25, frame-parallel 0) | hidden alt-ref, backward adaptation, superframes | 60 |
+ | errres (error-resilient 1) | sign-bias reset, no adaptation | 60 |
+ | reschange (640x360 → 1280x720 at a key frame) | resolution change inside one session | 60 |
+@@ -135,6 +182,22 @@ Annex-B access unit per `nv_video_decode`). Descriptor-level checks against stoc
+ | HEVC Main10 | descriptor byte-exact vs stock; decode → `E_UNSUPPORTED` until P010 copy_out | — |
+ | H.264 field pictures (PAFF), 4:2:2/4:4:4, >8-bit; HEVC RExt/SCC, PCM, slice long-term refs, 2-D tile grids | `E_UNSUPPORTED` with the feature name | — |
+ 
++## Multi-NVDEC engines: not implemented (design decision)
++
++Sessions use NVDEC0 (`NV2080_ENGINE_TYPE_NVDEC0` 0x13) only; stock alternates NVDEC0/NVDEC1
++(0x16) across decode sessions. A second engine is a separate TSG + channel + decoder object on
++engine 0x16 with its own doorbell and its own BSP caps record, and the two engines are ordered
++through a shared semaphore (stock acquires and releases one per picture). Adding
++it means: enumerate every present NVDEC engine and read each one's `BSP_GET_CAPS_V2` record
++(`NvVideoDeviceInfo.nvdec_engines` then reports the usable count), create one channel per engine
++in `channel.rs`, assign sessions round-robin, and trace stock's alternation and cross-engine
++semaphore direction (which engine releases, which acquires, and the value sequence) before
++writing any of it. Half of that (two channels, one timeline) would change the ordering contract
++without evidence, so this stays a documented limitation: `nvdec_engines` reports 1 and every
++session decodes on NVDEC0. Throughput on one Blackwell engine already covers the decoded
++formats this library supports (8-bit H.264 up to 4096², HEVC/VP9/AV1 up to 8192²); the limit
++shows as serialisation across concurrent sessions, not as a wrong picture.
++
+ ## AV1 coverage (RTX 5090, 615.71.09, 2026-10-14) — bit-exact vs libdav1d through the C ABI
+ 
+ | Stream (libaom) | Feature | Frames |
+diff --git a/nvidia-prolapse/driver-source/native/video/nv_video.h b/nvidia-prolapse/driver-source/native/video/nv_video.h
+index 68ca59b..cac4d6b 100644
+--- a/nvidia-prolapse/driver-source/native/video/nv_video.h
++++ b/nvidia-prolapse/driver-source/native/video/nv_video.h
+@@ -29,7 +29,13 @@
+ extern "C" {
+ #endif
+ 
+-#define NV_VIDEO_ABI_VERSION 1u
++/* ABI 2 adds (all v1 entry points keep their v1 signature and struct layout):
++ *  - nv_video_decode() returns the number of displayable pictures the unit produced, so
++ *    success is rc >= 0 (a caller that tests rc != 0 treats every picture as an error);
++ *  - NV_VIDEO_E_RESIZE + nv_video_required_size(): a random access point larger than the
++ *    session (adaptive streaming), decoded by a new session;
++ *  - struct NvVideoHdrMetadata / nv_video_picture_hdr() for HDR static metadata. */
++#define NV_VIDEO_ABI_VERSION 2u
+ 
+ enum NvVideoError {
+    NV_VIDEO_OK = 0,
+@@ -39,6 +45,8 @@ enum NvVideoError {
+    NV_VIDEO_E_NO_MEMORY = -4,
+    NV_VIDEO_E_DEVICE_LOST = -5,  /* channel error / engine fault; session must be destroyed */
+    NV_VIDEO_E_AGAIN = -6,        /* no free DPB/output slot: release pictures, then retry */
++   NV_VIDEO_E_RESIZE = -7,       /* ABI 2: the unit starts a stream section this session cannot
++                                  * hold (see nv_video_required_size) */
+ };
+ 
+ enum NvVideoCodec {
+@@ -89,7 +97,9 @@ int nv_video_query_caps(struct NvVideoDevice *dev, uint32_t codec, struct NvVide
+ 
+ struct NvVideoSessionInfo {
+    uint32_t codec;              /* enum NvVideoCodec */
+-   uint32_t max_width, max_height; /* resources are sized for these; larger streams -> UNSUPPORTED */
++   uint32_t max_width, max_height; /* resources are sized for these; a larger random access
++                                    * point -> NV_VIDEO_E_RESIZE, any other larger picture ->
++                                    * NV_VIDEO_E_UNSUPPORTED */
+    uint32_t bit_depth;          /* expected luma bit depth (8/10); stream changes within caps are handled */
+    uint32_t extra_output_slots; /* decoded pictures the caller may hold (not yet released) beyond the DPB */
+    const uint8_t *codec_config; /* optional out-of-band config (avcC/hvcC/av1C/Annex-B PS), may be NULL */
+@@ -114,13 +124,56 @@ struct NvVideoPicture {
+    uint32_t reserved[5];
+ };
+ 
++/* HDR static metadata (ABI 2). The library reads it from the bitstream: H.264/HEVC SEI
++ * mastering_display_colour_volume (137) / content_light_level_info (144), AV1 metadata OBUs
++ * HDR_MDCV / HDR_CLL. Values and primary order are the coded ones of the stream's codec:
++ *  - H.264/HEVC: chromaticities in units of 0.00002, luminances in units of 0.0001 cd/m2,
++ *    primaries in SEI order (H.265 D.3.28: index 0 green, 1 blue, 2 red);
++ *  - AV1: chromaticities 0.16 fixed point, max luminance 24.8 and min luminance 18.14 fixed
++ *    point cd/m2, primaries red, green, blue (AV1 spec metadata_hdr_mdcv semantics).
++ * CLL values are cd/m2 for every codec. A field group whose has_* flag is 0 carries no
++ * values. An AV1 temporal unit with several frames reports the unit's metadata for each
++ * picture it produces. Declarations persist: every picture after one carries it until the
++ * stream declares new values or the session is flushed. */
++struct NvVideoMasteringDisplay {
++   uint16_t display_primaries_x[3];
++   uint16_t display_primaries_y[3];
++   uint16_t white_point_x, white_point_y;
++   uint32_t max_luminance, min_luminance;
++};
++
++struct NvVideoHdrMetadata {
++   uint32_t has_mastering_display;
++   struct NvVideoMasteringDisplay mastering_display;
++   uint32_t has_content_light_level;
++   uint32_t max_content_light_level, max_pic_average_light_level;
++   uint32_t reserved[6];
++};
++
+ /* Submits one unit (see framing above). Decoding is asynchronous on the GPU;
+  * pictures become available through nv_video_next_picture() in display order.
+- * flags: NV_VIDEO_DECODE_END_OF_STREAM drains all remaining pictures. */
++ * flags: NV_VIDEO_DECODE_END_OF_STREAM drains all remaining pictures.
++ *
++ * Returns 0 or more = the number of displayable pictures this unit produced (ABI 2):
++ * 0 when the unit can never produce one (parameter sets only, a skipped RASL picture,
++ * pic_output_flag = 0) and for a drain call, so a caller can retire the input as soon
++ * as the call returns 0 instead of holding it until EOS/flush. The pictures themselves
++ * still come out of nv_video_next_picture() in display order. */
+ #define NV_VIDEO_DECODE_END_OF_STREAM 0x1u
+ int nv_video_decode(struct NvVideoSession *s, const uint8_t *data, size_t len, uint64_t timestamp,
+                     uint32_t flags);
+ 
++/* After nv_video_decode() returned NV_VIDEO_E_RESIZE (ABI 2): 0 and the coded size the unit
++ * needs. The unit was a random access point (H.264 IDR, HEVC IRAP, VP9 key frame, AV1 shown
++ * key frame) that starts a new reference chain, so a new session decodes the stream from it:
++ * drain this one (nv_video_decode with NV_VIDEO_DECODE_END_OF_STREAM and no data, then
++ * nv_video_next_picture until 0), destroy it, create one with max_width/max_height at least
++ * this size and submit the same unit (with any out-of-band parameter sets) to it. Until then
++ * the session accepts only that drain. VP9 also returns it at a key frame that changes the
++ * coded size after segment maps were written (a new session starts from zeroed maps).
++ * <0 if no unit returned NV_VIDEO_E_RESIZE. */
++int nv_video_required_size(struct NvVideoSession *s, uint32_t *width, uint32_t *height);
++
+ /* Returns 1 and fills *pic if a picture is ready (its decode may still be
+  * running on the GPU: copy_out orders after it), 0 if none, <0 on error. */
+ int nv_video_next_picture(struct NvVideoSession *s, struct NvVideoPicture *pic);
+@@ -139,7 +192,10 @@ enum NvVideoFormat {
+ 
+ /* Destination buffer of copy_out. Planes may share one dma-buf. modifier is a
+  * DRM format modifier: DRM_FORMAT_MOD_LINEAR (0) or an NVIDIA block-linear
+- * modifier (fourcc_mod_code(NVIDIA, ...)) that the copy engine can write. */
++ * modifier (fourcc_mod_code(NVIDIA, ...)) that the copy engine can write.
++ * Block-linear carries NV12 (1-byte samples) only: a P010 block-linear target is
++ * refused with NV_VIDEO_E_UNSUPPORTED because the 10-bit block-linear write is not
++ * verified on hardware; P010 is copied to LINEAR targets. */
+ struct NvVideoTarget {
+    int dmabuf_fd[2];            /* plane 0 (Y), plane 1 (CbCr); [1] may equal [0] */
+    uint64_t offset[2];
+@@ -162,6 +218,12 @@ struct NvVideoTarget {
+ int nv_video_copy_out(struct NvVideoSession *s, uint64_t id, const struct NvVideoTarget *target,
+                       int *release_fence_fd);
+ 
++/* HDR static metadata of picture `id` (ABI 2): 0 and *metadata filled (flags 0 when the
++ * stream declared none), <0 on an unknown id or invalid argument. The values belong to the
++ * picture, not to the caller's buffer, and stay valid until nv_video_picture_release(). */
++int nv_video_picture_hdr(struct NvVideoSession *s, uint64_t id,
++                         struct NvVideoHdrMetadata *metadata);
++
+ /* The caller is done with picture `id` (copied out or dropped). */
+ int nv_video_picture_release(struct NvVideoSession *s, uint64_t id);
+ 
+diff --git a/nvidia-prolapse/media/c2/NvC2Component.cpp b/nvidia-prolapse/media/c2/NvC2Component.cpp
+index 17ab506..6b4c69f 100644
+--- a/nvidia-prolapse/media/c2/NvC2Component.cpp
++++ b/nvidia-prolapse/media/c2/NvC2Component.cpp
+@@ -252,6 +252,17 @@ public:
+                          .withSetter(DefaultColorAspectsSetter)
+                          .build());
+ 
++        /* HDR static metadata (ST 2086 mastering display + CEA-861.3 light levels) read from
++         * the bitstream; reported per output like AOSP declares it (C2SoftVpxDec.cpp:125-147,
++         * same key and struct) and updated the way C2SoftGav1Dec.cpp:620-626 reports a size
++         * change (interface config + output configUpdate). */
++        helper->addStructDescriptors<C2MasteringDisplayColorVolumeStruct, C2ColorXyStruct>();
++        addParameter(DefineParam(mHdrStaticInfo, C2_PARAMKEY_HDR_STATIC_INFO)
++                         .withDefault(new C2StreamHdrStaticInfo::output(0u))
++                         .withFields({C2F(mHdrStaticInfo, mastering.red.x).any()})
++                         .withSetter(HdrStaticInfoSetter)
++                         .build());
++
+         /* IMPLEMENTATION_DEFINED is listed so a Surface configuration is visible; the
+          * component picks NV12 or P010 from the stream's bit depth either way. */
+         std::vector<uint32_t> pixelFormats = {HAL_PIXEL_FORMAT_YCBCR_420_888};
+@@ -319,6 +330,12 @@ public:
+         return C2R::Ok();
+     }
+ 
++    static C2R HdrStaticInfoSetter(bool, C2P<C2StreamHdrStaticInfo::output> &me)
++    {
++        (void)me; /* values come from the bitstream */
++        return C2R::Ok();
++    }
++
+     uint32_t bitDepthHint() const
+     {
+         switch (mProfileLevel->profile) {
+@@ -342,6 +359,7 @@ private:
+     std::shared_ptr<C2StreamProfileLevelInfo::input> mProfileLevel;
+     std::shared_ptr<C2StreamColorInfo::output> mColorInfo;
+     std::shared_ptr<C2StreamColorAspectsTuning::output> mDefaultColorAspects;
++    std::shared_ptr<C2StreamHdrStaticInfo::output> mHdrStaticInfo;
+     std::shared_ptr<C2StreamPixelFormatInfo::output> mPixelFormat;
+     std::shared_ptr<C2ComponentAttributesSetting> mAttrib;
+ };
+@@ -663,6 +681,30 @@ void Component::deliver(std::vector<Output> &outs, std::list<std::unique_ptr<C2W
+                     map_primaries(o.picture.color_primaries), map_transfer(o.picture.transfer),
+                     map_matrix(o.picture.matrix));
+                 buf->setInfo(aspects);
++                const HdrStatic h = hdr_static(mEntry.codec, o.hdr);
++                if (h.present) {
++                    auto info = std::make_shared<C2StreamHdrStaticInfo::output>(0u);
++                    info->mastering.red = {h.red[0], h.red[1]};
++                    info->mastering.green = {h.green[0], h.green[1]};
++                    info->mastering.blue = {h.blue[0], h.blue[1]};
++                    info->mastering.white = {h.white[0], h.white[1]};
++                    info->mastering.maxLuminance = h.max_luminance;
++                    info->mastering.minLuminance = h.min_luminance;
++                    info->maxCll = h.max_cll;
++                    info->maxFall = h.max_fall;
++                    /* the Surface path reads it per buffer (CCodecBufferChannel.cpp:840) */
++                    buf->setInfo(info);
++                    if (!mHdr || memcmp(&mHdr->mastering, &info->mastering, sizeof(info->mastering)) ||
++                        mHdr->maxCll != info->maxCll || mHdr->maxFall != info->maxFall) {
++                        std::vector<std::unique_ptr<C2SettingResult>> failures;
++                        if (mIntf->mImpl->config({info.get()}, C2_MAY_BLOCK, &failures) == C2_OK) {
++                            wl->output.configUpdate.push_back(C2Param::Copy(*info));
++                            mHdr = std::make_unique<C2StreamHdrStaticInfo::output>(*info);
++                        } else {
++                            ALOGE("%s: HDR static info config failed", mEntry.name);
++                        }
++                    }
++                }
+                 wl->output.buffers.push_back(buf);
+                 if (o.size_changed)
+                     wl->output.configUpdate.push_back(
+diff --git a/nvidia-prolapse/media/c2/NvC2Component.h b/nvidia-prolapse/media/c2/NvC2Component.h
+index 6701d87..4f2aa13 100644
+--- a/nvidia-prolapse/media/c2/NvC2Component.h
++++ b/nvidia-prolapse/media/c2/NvC2Component.h
+@@ -112,6 +112,7 @@ private:
+     std::map<uint64_t, std::shared_ptr<C2GraphicBlock>> mBlocks; /* cookie -> fetched block */
+     std::map<uint64_t, native_handle_t *> mHandles;             /* cookie -> unwrapped gralloc handle */
+     uint64_t mNextCookie = 1;
++    std::unique_ptr<C2StreamHdrStaticInfo::output> mHdr; /* last HDR static info reported */
+ };
+ 
+ } // namespace nvc2
+diff --git a/nvidia-prolapse/media/core/nvc2_decoder.cpp b/nvidia-prolapse/media/core/nvc2_decoder.cpp
+index 07f5f86..5965623 100644
+--- a/nvidia-prolapse/media/core/nvc2_decoder.cpp
++++ b/nvidia-prolapse/media/core/nvc2_decoder.cpp
+@@ -7,11 +7,14 @@
+  *    So when the picture of unit N appears, every still-pending unit decoded before N can
+  *    no longer produce one and is finished empty. This tolerates any library latency.
+  *  - H.264 and HEVC reorder: a unit is finished when its picture appears, or at EOS/flush.
+- *    (ABI gap, reported: nv_video has no "unit produced no picture" signal, so a
+- *    non-output picture (pic_output_flag=0, skipped RASL) stays pending until EOS/flush.)
++ *  - Every codec: nv_video_decode() returns the displayable pictures the unit produced
++ *    (ABI 2). A unit that produced none (parameter sets, a VP9/AV1 hidden frame, an
++ *    H.264/HEVC picture with pic_output_flag = 0 or a skipped RASL picture) can never show a
++ *    picture and is finished empty as soon as the call returns.
+  */
+ #include "nvc2_decoder.h"
+ 
++#include <algorithm>
+ #include <cerrno>
+ #include <cstdio>
+ #include <unistd.h>
+@@ -23,6 +26,40 @@ uint32_t output_format_for_depth(uint32_t bit_depth)
+     return bit_depth > 8 ? NV_VIDEO_FORMAT_P010 : NV_VIDEO_FORMAT_NV12;
+ }
+ 
++HdrStatic hdr_static(uint32_t codec, const NvVideoHdrMetadata &m)
++{
++    HdrStatic h;
++    if (m.has_mastering_display) {
++        const NvVideoMasteringDisplay &d = m.mastering_display;
++        h.present = true;
++        float chroma, max_l, min_l;
++        int r, g, b; /* index of each primary in the coded order */
++        if (codec == NV_VIDEO_CODEC_AV1) {
++            /* AV1 metadata_hdr_mdcv: 0.16 chromaticities, 24.8 / 18.14 luminances, R,G,B
++             * (as FFmpeg av1dec.c:1053-1060) */
++            chroma = 1.0f / 65536, max_l = 1.0f / 256, min_l = 1.0f / 16384;
++            r = 0, g = 1, b = 2;
++        } else {
++            /* H.264/HEVC SEI: chromaticities 0.00002, luminances 0.0001 cd/m2, coded G,B,R
++             * (as FFmpeg h2645_sei.c:608 mapping {2, 0, 1}) */
++            chroma = 0.00002f, max_l = min_l = 0.0001f;
++            r = 2, g = 0, b = 1;
++        }
++        h.red[0] = d.display_primaries_x[r] * chroma, h.red[1] = d.display_primaries_y[r] * chroma;
++        h.green[0] = d.display_primaries_x[g] * chroma, h.green[1] = d.display_primaries_y[g] * chroma;
++        h.blue[0] = d.display_primaries_x[b] * chroma, h.blue[1] = d.display_primaries_y[b] * chroma;
++        h.white[0] = d.white_point_x * chroma, h.white[1] = d.white_point_y * chroma;
++        h.max_luminance = d.max_luminance * max_l;
++        h.min_luminance = d.min_luminance * min_l;
++    }
++    if (m.has_content_light_level) {
++        h.present = true;
++        h.max_cll = (float)m.max_content_light_level;
++        h.max_fall = (float)m.max_pic_average_light_level;
++    }
++    return h;
++}
++
+ static const char *err_name(int rc)
+ {
+     switch (rc) {
+@@ -32,11 +69,12 @@ static const char *err_name(int rc)
+     case NV_VIDEO_E_NO_MEMORY: return "NO_MEMORY";
+     case NV_VIDEO_E_DEVICE_LOST: return "DEVICE_LOST";
+     case NV_VIDEO_E_AGAIN: return "AGAIN";
++    case NV_VIDEO_E_RESIZE: return "RESIZE";
+     default: return "unknown";
+     }
+ }
+ 
+-Decoder *Decoder::create(NvVideoDevice *dev, const Config &cfg, std::string *error)
++NvVideoSession *Decoder::open_session(NvVideoDevice *dev, const Config &cfg, std::string *error)
+ {
+     NvVideoCaps caps{};
+     int rc = nv_video_query_caps(dev, cfg.codec, &caps);
+@@ -75,14 +113,54 @@ Decoder *Decoder::create(NvVideoDevice *dev, const Config &cfg, std::string *err
+                  (nv_video_last_error() ? nv_video_last_error() : "");
+         return nullptr;
+     }
+-    return new Decoder(s, cfg.codec);
++    return s;
++}
++
++Decoder *Decoder::create(NvVideoDevice *dev, const Config &cfg, std::string *error)
++{
++    NvVideoSession *s = open_session(dev, cfg, error);
++    return s ? new Decoder(dev, s, cfg) : nullptr;
+ }
+ 
+ Decoder::~Decoder()
+ {
+     if (have_held_)
+         nv_video_picture_release(session_, held_.id);
++    if (session_)
++        nv_video_session_destroy(session_);
++}
++
++/* The old session got its END_OF_STREAM drain; copy out what it still holds, then replace it
++ * by one of at least the required size. Again = waiting for an output buffer. */
++Status Decoder::finish_resize(OutputPool *pool, std::vector<Output> *out)
++{
++    Status st = drain(pool, out);
++    if (st != Status::Ok)
++        return st;
++    /* everything decoded before the keyframe has been output: the rest can never show */
++    finish_all(out);
+     nv_video_session_destroy(session_);
++    session_ = nullptr;
++    Config next = cfg_;
++    next.max_width = std::max(cfg_.max_width, resize_w_);
++    next.max_height = std::max(cfg_.max_height, resize_h_);
++    std::string err;
++    session_ = open_session(dev_, next, &err);
++    if (!session_) {
++        dead_ = true;
++        error_ = "re-creating the session at " + std::to_string(next.max_width) + "x" +
++                 std::to_string(next.max_height) + " for a size change: " + err;
++        return Status::Error;
++    }
++    cfg_ = next;
++    resizing_ = false;
++    /* H.264/HEVC parameter sets sent in-band (csd) belong to the stream, not the session */
++    for (const auto &u : csd_) {
++        int rc = nv_video_decode(session_, u.data(), u.size(), 0, 0);
++        if (rc < 0)
++            return fail("nv_video_decode(codec config after a size change)", rc);
++    }
++    return Status::Ok;
+ }
+ 
+ Status Decoder::fail(const char *what, int rc)
+@@ -148,6 +226,13 @@ Status Decoder::emit_picture(const NvVideoPicture &pic, OutputPool *pool, std::v
+                  std::to_string(pic.bit_depth) + "-bit picture (wants " + std::to_string(fmt) + ")";
+         return Status::Error;
+     }
++    NvVideoHdrMetadata hdr{};
++    rc = nv_video_picture_hdr(session_, pic.id, &hdr);
++    if (rc < 0) {
++        pool->discard(buf);
++        nv_video_picture_release(session_, pic.id);
++        return fail("nv_video_picture_hdr", rc);
++    }
+     int fence = -1;
+     rc = nv_video_copy_out(session_, pic.id, &buf.target, &fence);
+     /* copy_out consumed (or ignored) the acquire fence; the front must not reuse it */
+@@ -182,6 +267,7 @@ Status Decoder::emit_picture(const NvVideoPicture &pic, OutputPool *pool, std::v
+     o.buffer = buf;
+     o.release_fence = fence;
+     o.picture = pic;
++    o.hdr = hdr;
+     o.size_changed = pic.crop_width != cur_w_ || pic.crop_height != cur_h_;
+     cur_w_ = pic.crop_width;
+     cur_h_ = pic.crop_height;
+@@ -233,6 +319,11 @@ Status Decoder::queue(const uint8_t *data, size_t len, uint64_t index, bool eos,
+ {
+     if (dead_)
+         return Status::Error;
++    if (resizing_) {
++        Status st = finish_resize(pool, out);
++        if (st != Status::Ok)
++            return st;
++    }
+     if (codec_config && !eos) {
+         /* Annex-B parameter sets (H.264/HEVC csd) go in-band; VP9/AV1 csd (vpcC/av1C) carry
+          * nothing the bitstream does not repeat, and were handed to the session at create. */
+@@ -245,8 +336,13 @@ Status Decoder::queue(const uint8_t *data, size_t len, uint64_t index, bool eos,
+                 out->push_back(o);
+                 return Status::Ok;
+             }
+-            if (rc != 0)
++            if (rc < 0)
+                 return fail("nv_video_decode(codec config)", rc);
++            /* csd-0/csd-1 (SPS, PPS) arrive as consecutive config units; a new run replaces */
++            if (!last_was_csd_)
++                csd_.clear();
++            csd_.emplace_back(data, data + len);
++            last_was_csd_ = true;
+         }
+         Output o;
+         o.index = index;
+@@ -254,6 +350,7 @@ Status Decoder::queue(const uint8_t *data, size_t len, uint64_t index, bool eos,
+         return Status::Ok;
+     }
+ 
++    last_was_csd_ = false;
+     if (eos) {
+         eos_pending_ = true;
+         eos_index_ = index;
+@@ -278,7 +375,7 @@ Status Decoder::queue(const uint8_t *data, size_t len, uint64_t index, bool eos,
+             if (eos) {
+                 /* still drain what was decoded before */
+                 int drc = nv_video_decode(session_, nullptr, 0, index, NV_VIDEO_DECODE_END_OF_STREAM);
+-                if (drc != 0)
++                if (drc < 0)
+                     return fail("nv_video_decode(end of stream)", drc);
+                 eos_submitted_ = true;
+                 eos_out_ = o;
+@@ -288,10 +385,30 @@ Status Decoder::queue(const uint8_t *data, size_t len, uint64_t index, bool eos,
+             out->push_back(o);
+             break;
+         }
+-        if (rc != 0)
++        if (rc == NV_VIDEO_E_RESIZE) {
++            if (nv_video_required_size(session_, &resize_w_, &resize_h_) < 0)
++                return fail("nv_video_required_size", NV_VIDEO_E_INVALID);
++            /* the unit was not consumed: drain what the old session decoded before it */
++            int drc = nv_video_decode(session_, nullptr, 0, index, NV_VIDEO_DECODE_END_OF_STREAM);
++            if (drc < 0)
++                return fail("nv_video_decode(drain before a size change)", drc);
++            resizing_ = true;
++            Status st = finish_resize(pool, out);
++            if (st != Status::Ok)
++                return st; /* Again: the front re-calls queue() with this unit */
++            continue;      /* decode the unit on the new session */
++        }
++        if (rc < 0)
+             return fail("nv_video_decode", rc);
+-        if (len)
+-            pending_.push_back(index);
++        if (len) {
++            if (rc > 0 || eos) {
++                pending_.push_back(index);
++            } else {
++                Output o; /* produced no displayable picture: finished now */
++                o.index = index;
++                out->push_back(o);
++            }
++        }
+         if (eos)
+             eos_submitted_ = true;
+         break;
+@@ -309,6 +426,9 @@ Status Decoder::flush(std::vector<Output> *out)
+         nv_video_picture_release(session_, held_.id);
+         have_held_ = false;
+     }
++    /* a seek during a size change: the old session's drained pictures are dropped with the
++     * rest; the next keyframe asks for the new size again */
++    resizing_ = false;
+     int rc = nv_video_flush(session_);
+     bool was_eos = eos_pending_;
+     eos_pending_ = false;
+diff --git a/nvidia-prolapse/media/core/nvc2_decoder.h b/nvidia-prolapse/media/core/nvc2_decoder.h
+index 0ccccfb..1dcc23f 100644
+--- a/nvidia-prolapse/media/core/nvc2_decoder.h
++++ b/nvidia-prolapse/media/core/nvc2_decoder.h
+@@ -18,6 +18,12 @@
+  *  - Errors are never swallowed: DEVICE_LOST and UNSUPPORTED are terminal for the session
+  *              and carry nv_video_last_error(); BITSTREAM finishes that unit empty with the
+  *              corrupt flag (the library stays usable after the next keyframe).
++ *  - Size changes: NV_VIDEO_E_RESIZE (a keyframe larger than the session, adaptive streaming)
++ *              drains the old session's pictures, re-creates the session at the new size
++ *              with the parameter sets seen so far and decodes the unit again (AOSP
++ *              C2SoftHevcDec.cpp:881-890 on IVD_RES_CHANGED: drainInternal, resetDecoder,
++ *              re-decode). If the drain waits for a buffer, queue() returns Again and the
++ *              front re-calls it with the same unit.
+  */
+ #ifndef NVC2_DECODER_H
+ #define NVC2_DECODER_H
+@@ -59,6 +65,7 @@ struct Output {
+     OutputBuffer buffer{};     /* valid if !empty */
+     int release_fence = -1;    /* sync_file fd owned by the receiver, -1 = already complete */
+     NvVideoPicture picture{};  /* valid if !empty */
++    NvVideoHdrMetadata hdr{};  /* valid if !empty: HDR static metadata the stream declared */
+     bool size_changed = false; /* first picture with a new display size */
+ };
+ 
+@@ -87,14 +94,23 @@ public:
+     bool reorders() const { return codec_ == NV_VIDEO_CODEC_H264 || codec_ == NV_VIDEO_CODEC_HEVC; }
+ 
+ private:
+-    Decoder(NvVideoSession *s, uint32_t codec) : session_(s), codec_(codec) {}
++    Decoder(NvVideoDevice *dev, NvVideoSession *s, const Config &cfg)
++        : dev_(dev), session_(s), codec_(cfg.codec), cfg_(cfg) {}
++    static NvVideoSession *open_session(NvVideoDevice *dev, const Config &cfg, std::string *error);
+     Status fail(const char *what, int rc);
++    Status finish_resize(OutputPool *pool, std::vector<Output> *out);
+     Status emit_picture(const NvVideoPicture &pic, OutputPool *pool, std::vector<Output> *out);
+     void finish_older_than(uint64_t index, std::vector<Output> *out);
+     void finish_all(std::vector<Output> *out);
+ 
++    NvVideoDevice *dev_;
+     NvVideoSession *session_;
+     uint32_t codec_;
++    Config cfg_;                               /* the current session's config (max size grows) */
++    std::vector<std::vector<uint8_t>> csd_;    /* in-band parameter-set units, replayed after a resize */
++    bool last_was_csd_ = false;
++    bool resizing_ = false;                    /* old session drained up to here, not yet replaced */
++    uint32_t resize_w_ = 0, resize_h_ = 0;
+     std::deque<uint64_t> pending_;   /* decode order of units without a picture yet */
+     bool have_held_ = false;          /* a picture fetched from the library but not yet copied */
+     NvVideoPicture held_{};
+@@ -110,6 +126,18 @@ private:
+ 
+ uint32_t output_format_for_depth(uint32_t bit_depth);
+ 
++/* HDR static metadata in Codec2's units (C2HdrStaticMetadataStruct: CIE 1931 xy
++ * chromaticities, luminances and light levels in cd/m2). A group that the stream did not
++ * declare stays 0, which Codec2 reads as "not specified". */
++struct HdrStatic {
++    bool present = false;
++    float red[2]{}, green[2]{}, blue[2]{}, white[2]{};
++    float max_luminance = 0, min_luminance = 0;
++    float max_cll = 0, max_fall = 0;
++};
++/* Converts nv_video's coded values (per-codec units and primary order, nv_video.h) */
++HdrStatic hdr_static(uint32_t codec, const NvVideoHdrMetadata &m);
++
+ } // namespace nvc2
+ 
+ #endif
+diff --git a/nvidia-prolapse/media/test/core_test.cpp b/nvidia-prolapse/media/test/core_test.cpp
+index 2e8074d..fdc4678 100644
+--- a/nvidia-prolapse/media/test/core_test.cpp
++++ b/nvidia-prolapse/media/test/core_test.cpp
+@@ -166,10 +166,11 @@ static void test_vp9_hidden_frames(NvVideoDevice *dev)
+     out.clear();
+     /* superframe pattern: hidden alt-ref (1), shown inter (2), show_existing of the alt-ref (3) */
+     CHECK(q(d, unit(0, 640, 360), 1, pool, out) == Status::Ok);
+-    CHECK(out.empty()); /* pending until a later unit shows */
++    /* ABI 2: the hidden frame's unit produced no displayable picture -> finished at once */
++    CHECK(out.size() == 1 && out[0].index == 1 && out[0].empty);
++    out.clear();
+     CHECK(q(d, unit(SHOW, 640, 360), 2, pool, out) == Status::Ok);
+-    CHECK(out.size() == 2 && out[0].index == 1 && out[0].empty && out[1].index == 2 && !out[1].empty &&
+-          !out[1].size_changed);
++    CHECK(out.size() == 1 && out[0].index == 2 && !out[0].empty && !out[0].size_changed);
+     for (auto &o : out)
+         if (!o.empty)
+             pool.give_back(o);
+@@ -253,14 +254,129 @@ static void test_resolution_change_and_10bit(NvVideoDevice *dev)
+     CHECK(out.size() == 3 && out[0].size_changed && !out[1].size_changed && out[2].size_changed);
+     CHECK(pool.last_w == 1920 && pool.last_h == 1080 && pool.last_fmt == NV_VIDEO_FORMAT_P010);
+     CHECK(g_stub.last_copy_format == NV_VIDEO_FORMAT_P010);
+-    /* larger than the session: UNSUPPORTED is terminal and named */
+-    CHECK(q(d, unit(KEY | SHOW, 4096, 2160), 3, pool, out) == Status::Error);
++    /* a non-keyframe larger than the session: UNSUPPORTED is terminal and named */
++    CHECK(q(d, unit(SHOW, 4096, 2160), 3, pool, out) == Status::Error);
+     CHECK(d->error().find("UNSUPPORTED") != std::string::npos);
+     CHECK(d->error().find("larger than the session") != std::string::npos);
+     CHECK(q(d, unit(KEY | SHOW, 640, 360), 4, pool, out) == Status::Error); /* stays dead */
+     delete d;
+ }
+ 
++/* Adaptive upswitch: a keyframe past the session max re-creates the session at the new size,
++ * after every picture of the old session was copied out; the csd is replayed. */
++static void test_upswitch_recreates_session(NvVideoDevice *dev)
++{
++    reset_stub();
++    TestPool pool(8);
++    Decoder *d = make(dev, NV_VIDEO_CODEC_HEVC); /* max 1920x1088 */
++    std::vector<Output> out;
++    std::vector<uint8_t> ps = {'P', 0x40};
++    CHECK(d->queue(ps.data(), ps.size(), 0, false, true, &pool, &out) == Status::Ok);
++    CHECK(q(d, unit(KEY | SHOW, 1280, 720, 0), 1, pool, out) == Status::Ok);
++    CHECK(q(d, unit(SHOW, 1280, 720, 1), 2, pool, out) == Status::Ok);
++    for (auto &o : out)
++        if (!o.empty)
++            pool.give_back(o);
++    out.clear();
++    const unsigned created = g_stub.sessions_created, decodes = g_stub.decode_calls;
++    CHECK(q(d, unit(KEY | SHOW, 3840, 2160, 0), 3, pool, out) == Status::Ok);
++    CHECK(g_stub.sessions_created == created + 1 && g_stub.sessions_destroyed == 1);
++    CHECK(g_stub.outstanding_at_destroy == 0);
++    /* resize attempt + drain + replayed csd + the unit again */
++    CHECK(g_stub.decode_calls == decodes + 4);
++    /* the two 720p pictures came out of the old session, in order, before the new size */
++    CHECK(out.size() >= 2 && out[0].index == 1 && out[1].index == 2 && !out[0].empty && !out[1].empty);
++    for (auto &o : out)
++        if (!o.empty)
++            pool.give_back(o);
++    out.clear();
++    CHECK(d->queue(nullptr, 0, 4, true, false, &pool, &out) == Status::Ok);
++    CHECK(out.size() == 2 && out[0].index == 3 && !out[0].empty && out[0].size_changed &&
++          out[0].picture.width == 3840 && out[1].eos);
++    out.clear();
++    delete d;
++
++    /* the drain waits for a buffer: Again, and the same unit completes the switch later */
++    reset_stub();
++    TestPool small(1);
++    d = make(dev, NV_VIDEO_CODEC_VP9);
++    CHECK(q(d, unit(KEY | SHOW, 1280, 720), 0, small, out) == Status::Ok);
++    CHECK(out.size() == 1 && !out[0].empty);
++    Output held = out[0];
++    out.clear();
++    CHECK(q(d, unit(SHOW, 1280, 720), 1, small, out) == Status::Ok); /* picture waits for a buffer */
++    CHECK(out.empty());
++    CHECK(q(d, unit(KEY | SHOW, 2560, 1440), 2, small, out) == Status::Again);
++    CHECK(g_stub.sessions_created == 1);
++    small.give_back(held);
++    CHECK(q(d, unit(KEY | SHOW, 2560, 1440), 2, small, out) == Status::Ok);
++    CHECK(g_stub.sessions_created == 2 && out.size() == 1 && out[0].index == 1 && !out[0].empty);
++    small.give_back(out[0]);
++    out.clear();
++    CHECK(d->drain(&small, &out) == Status::Ok);
++    CHECK(out.size() == 1 && out[0].index == 2 && out[0].picture.width == 2560);
++    delete d;
++}
++
++/* ABI 2: an H.264/HEVC unit that produces no picture (pic_output_flag = 0) is finished at once */
++static void test_unit_without_picture_retires(NvVideoDevice *dev)
++{
++    reset_stub();
++    TestPool pool(8);
++    Decoder *d = make(dev, NV_VIDEO_CODEC_HEVC);
++    std::vector<Output> out;
++    CHECK(q(d, unit(KEY | SHOW, 1280, 720, 0), 0, pool, out) == Status::Ok);
++    CHECK(q(d, unit(16, 1280, 720, 1), 1, pool, out) == Status::Ok);
++    CHECK(out.size() == 1 && out[0].index == 1 && out[0].empty);
++    delete d;
++}
++
++static bool near(float a, float b) { return a > b - 1e-4f && a < b + 1e-4f; }
++
++/* Coded values -> Codec2 units: x265's master-display example
++ * G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1) and the same display
++ * in AV1's fixed-point units (SVT-AV1 --mastering-display "G(0.265,0.69)B(0.15,0.06)
++ * R(0.68,0.32)WP(0.3127,0.329)L(1000,0.0001)") give the same C2 values. */
++static void test_hdr_units()
++{
++    NvVideoHdrMetadata m{};
++    m.has_mastering_display = 1;
++    m.mastering_display = {{13250, 7500, 34000}, {34500, 3000, 16000}, 15635, 16450, 10000000, 1};
++    m.has_content_light_level = 1;
++    m.max_content_light_level = 1000;
++    m.max_pic_average_light_level = 400;
++    HdrStatic h = hdr_static(NV_VIDEO_CODEC_HEVC, m);
++    CHECK(h.present && near(h.red[0], 0.68f) && near(h.red[1], 0.32f) && near(h.green[0], 0.265f) &&
++          near(h.green[1], 0.69f) && near(h.blue[0], 0.15f) && near(h.blue[1], 0.06f) &&
++          near(h.white[0], 0.3127f) && near(h.white[1], 0.329f) && near(h.max_luminance, 1000.0f) &&
++          near(h.min_luminance, 0.0001f) && h.max_cll == 1000 && h.max_fall == 400);
++    NvVideoHdrMetadata a{};
++    a.has_mastering_display = 1;
++    a.mastering_display = {{44564, 17367, 9830}, {20972, 45220, 3932}, 20493, 21561, 256000, 2};
++    h = hdr_static(NV_VIDEO_CODEC_AV1, a);
++    CHECK(h.present && near(h.red[0], 0.68f) && near(h.green[1], 0.69f) && near(h.blue[0], 0.15f) &&
++          near(h.white[0], 0.3127f) && near(h.max_luminance, 1000.0f) && near(h.min_luminance, 0.000122f) &&
++          h.max_cll == 0);
++    CHECK(!hdr_static(NV_VIDEO_CODEC_AV1, NvVideoHdrMetadata{}).present);
++}
++
++/* HDR static metadata travels with the picture's output */
++static void test_hdr_metadata_on_output(NvVideoDevice *dev)
++{
++    reset_stub();
++    g_stub.hdr.has_mastering_display = 1;
++    g_stub.hdr.mastering_display.max_luminance = 10000000;
++    g_stub.hdr.has_content_light_level = 1;
++    g_stub.hdr.max_content_light_level = 1000;
++    TestPool pool(8);
++    Decoder *d = make(dev, NV_VIDEO_CODEC_VP9);
++    std::vector<Output> out;
++    CHECK(q(d, unit(KEY | SHOW, 640, 360), 0, pool, out) == Status::Ok);
++    CHECK(out.size() == 1 && out[0].hdr.has_mastering_display && out[0].hdr.mastering_display.max_luminance == 10000000 &&
++          out[0].hdr.max_content_light_level == 1000);
++    delete d;
++}
++
+ static void test_backpressure(NvVideoDevice *dev)
+ {
+     reset_stub();
+@@ -358,6 +474,10 @@ int main()
+     test_h264_reorder_and_eos(dev);
+     test_flush_seek(dev);
+     test_resolution_change_and_10bit(dev);
++    test_upswitch_recreates_session(dev);
++    test_unit_without_picture_retires(dev);
++    test_hdr_metadata_on_output(dev);
++    test_hdr_units();
+     test_backpressure(dev);
+     test_device_lost(dev);
+     test_fence_passthrough(dev);
+diff --git a/nvidia-prolapse/media/test/nv_video_stub.cpp b/nvidia-prolapse/media/test/nv_video_stub.cpp
+index 213f360..82bfba4 100644
+--- a/nvidia-prolapse/media/test/nv_video_stub.cpp
++++ b/nvidia-prolapse/media/test/nv_video_stub.cpp
+@@ -3,10 +3,13 @@
+  * can be tested on the host without a GPU. It models the documented behaviour only:
+  * display-order output, hidden frames + show_existing (VP9/AV1), POC reordering
+  * (H.264/HEVC), a bounded number of unreleased pictures (-> NV_VIDEO_E_AGAIN),
+- * keyframe-after-flush, END_OF_STREAM drain, copy_out validation, device loss.
++ * keyframe-after-flush, END_OF_STREAM drain, copy_out validation, device loss, the ABI 2
++ * picture count returned by nv_video_decode and NV_VIDEO_E_RESIZE at a keyframe larger than
++ * the session.
+  *
+  * Stub unit format (8 bytes): 'N', flags, w lo, w hi, h lo, h hi, poc, bit depth
+- *   flags bit0 key, bit1 show, bit2 show_existing (shows the oldest hidden frame), bit3 corrupt
++ *   flags bit0 key, bit1 show, bit2 show_existing (shows the oldest hidden frame), bit3 corrupt,
++ *   bit4 (H.264/HEVC) decoded but never output (pic_output_flag = 0)
+  */
+ #include "nv_video_stub.h"
+ 
+@@ -30,6 +33,8 @@ struct NvVideoSession {
+     unsigned outstanding = 0;
+     uint64_t next_id = 1;
+     bool need_key = true;
++    bool resize = false;
++    uint32_t req_w = 0, req_h = 0;
+ };
+ 
+ extern "C" {
+@@ -101,6 +106,11 @@ int nv_video_decode(NvVideoSession *s, const uint8_t *d, size_t len, uint64_t ts
+         set_err("stub: channel error");
+         return NV_VIDEO_E_DEVICE_LOST;
+     }
++    if (len && s->resize) {
++        set_err("stub: session needs re-creation");
++        return NV_VIDEO_E_INVALID;
++    }
++    int shown = 0;
+     if (len) {
+         if (len < 8 || d[0] != 'N') {
+             if (len >= 1 && d[0] == 'P') /* parameter set unit (codec config) */
+@@ -132,12 +142,22 @@ int nv_video_decode(NvVideoSession *s, const uint8_t *d, size_t len, uint64_t ts
+         p.keyframe = fl & 1;
+         p.reserved[0] = d[6];
+         if (p.width > s->info.max_width || p.height > s->info.max_height) {
++            if (fl & 1) {
++                s->resize = true;
++                s->req_w = p.width;
++                s->req_h = p.height;
++                set_err("stub: keyframe larger than the session");
++                return NV_VIDEO_E_RESIZE;
++            }
+             set_err("stub: stream larger than the session");
+             return NV_VIDEO_E_UNSUPPORTED;
+         }
+         if (reorders(s)) {
+-            s->reorder.push_back(p);
+-            reorder_out(s, g_stub.reorder_depth);
++            if (!(fl & 16)) {
++                s->reorder.push_back(p);
++                reorder_out(s, g_stub.reorder_depth);
++                shown = 1;
++            }
+         } else if (fl & 4) {
+             if (s->hidden.empty()) {
+                 set_err("stub: show_existing without a hidden frame");
+@@ -147,8 +167,10 @@ int nv_video_decode(NvVideoSession *s, const uint8_t *d, size_t len, uint64_t ts
+             s->hidden.pop_front();
+             h.timestamp = ts;
+             s->ready.push_back(h);
++            shown = 1;
+         } else if (fl & 2) {
+             s->ready.push_back(p);
++            shown = 1;
+         } else {
+             s->hidden.push_back(p);
+         }
+@@ -157,6 +179,23 @@ int nv_video_decode(NvVideoSession *s, const uint8_t *d, size_t len, uint64_t ts
+         reorder_out(s, 0);
+         s->hidden.clear();
+     }
++    return shown;
++}
++
++int nv_video_required_size(NvVideoSession *s, uint32_t *w, uint32_t *h)
++{
++    if (!s->resize) {
++        set_err("stub: no resize pending");
++        return NV_VIDEO_E_INVALID;
++    }
++    *w = s->req_w;
++    *h = s->req_h;
++    return 0;
++}
++
++int nv_video_picture_hdr(NvVideoSession *, uint64_t, NvVideoHdrMetadata *m)
++{
++    *m = g_stub.hdr;
+     return 0;
+ }
+ 
+@@ -180,6 +219,7 @@ int nv_video_flush(NvVideoSession *s)
+     s->hidden.clear();
+     s->reorder.clear();
+     s->need_key = true;
++    s->resize = false;
+     return 0;
+ }
+ 
+diff --git a/nvidia-prolapse/media/test/nv_video_stub.h b/nvidia-prolapse/media/test/nv_video_stub.h
+index 2cf93fe..9235865 100644
+--- a/nvidia-prolapse/media/test/nv_video_stub.h
++++ b/nvidia-prolapse/media/test/nv_video_stub.h
+@@ -16,6 +16,7 @@ struct StubControl {
+     unsigned outstanding_at_destroy = 0;
+     uint32_t last_copy_format = 0;
+     std::vector<uint8_t> last_codec_config;
++    NvVideoHdrMetadata hdr{}; /* what nv_video_picture_hdr reports for every picture */
+ };
+ extern StubControl g_stub;
+ #endif
+-- 
+2.56.0
+

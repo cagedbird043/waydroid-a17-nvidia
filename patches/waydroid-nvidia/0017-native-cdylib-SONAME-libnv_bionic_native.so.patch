@@ -1,0 +1,30 @@
+From 0c82a0b1c9589e0521a2f3565f9a95e3486dd8f9 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sun, 25 Oct 2026 04:10:24 +0800
+Subject: [PATCH 17/17] =?utf-8?q?native=EF=BC=9Acdylib=20=E5=B8=A6?=
+ =?utf-8?q?=E4=B8=8A=20SONAME=20libnv=5Fbionic=5Fnative.so?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+A17 vendor 树用 Soong 编 Codec2 服务，Soong 按完整中间路径链接预编译库；
+没有 SONAME 时 NEEDED 会记成那条路径。
+---
+ nvidia-prolapse/driver-source/native/build.rs | 5 +++++
+ 1 file changed, 5 insertions(+)
+ create mode 100644 nvidia-prolapse/driver-source/native/build.rs
+
+diff --git a/nvidia-prolapse/driver-source/native/build.rs b/nvidia-prolapse/driver-source/native/build.rs
+new file mode 100644
+index 0000000..6abf2ae
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/build.rs
+@@ -0,0 +1,5 @@
++// The cdylib carries DT_SONAME libnv_bionic_native.so, so a client linked by path (Soong links a prebuilt
++// shared library by its full intermediate path) still records NEEDED libnv_bionic_native.so.
++fn main() {
++    println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libnv_bionic_native.so");
++}
+-- 
+2.56.0
+

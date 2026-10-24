@@ -82,7 +82,7 @@ You need podman and plenty of disk space: about 100 GB of source plus build outp
 
 1. Build the container: `podman build --build-arg ROOT="$PWD" -t localhost/waydroid-a17-build container`. `scripts/build.sh` mounts the project at the same path inside the container, because the Mesa cross build uses lld from the tree.
 2. `scripts/sync.sh` syncs LineageOS 24.0 and the ATV manifest into `src/`, then runs `apply-waydroid-patches`.
-3. Apply `git am patches/<repo>/*.patch` on the base of each repository below, and copy `nvidia-product/` to `src/vendor/nvidia-prolapse`.
+3. Apply `git am patches/<repo>/*.patch` on the base of each repository below, then run `scripts/stage-product.sh`: it copies `nvidia-product/` to `src/vendor/nvidia-prolapse`, together with the pinned native bundle and the sources of the Codec2 NVDEC service, which is built in the Android 17 tree.
 4. `scripts/build.sh lineage_nvidia_waydroid_x86_64-cp2a-userdebug vendorimage`
 
 To test a single module, build it (for example `hwcomposer.waydroid`), copy the file from `out/.../vendor/` into the same path under `/var/lib/waydroid/overlay/vendor/`, and restart the session.
@@ -97,14 +97,14 @@ To test a single module, build it (for example `hwcomposer.waydroid`), copy the 
 | `external/wayland-protocols` | https://android.googlesource.com/platform/external/wayland-protocols | AOSP | `2dabfe6879b2` | 3 |
 | `device/waydroid/waydroid` | https://github.com/WayDroid-ATV/android_device_waydroid_waydroid | lineage-24.0 | `ce2f57ee2768` | 4 |
 | `vendor/waydroid/init` | https://github.com/WayDroid-ATV/android_vendor_waydroid_init | lineage-24.0 | `e97b43d97f70` | 2 |
-| `waydroid-nvidia` | https://github.com/Shiro836/waydroid-nvidia | public-test | `29ffa3a237b0` | 13 |
+| `waydroid-nvidia` | https://github.com/Shiro836/waydroid-nvidia | public-test | `29ffa3a237b0` | 17 |
 
 ### Repository layout
 
 | Path | Contents |
 |---|---|
 | `patches/<repo>/` | Local commits on each source repository (`git format-patch`) |
-| `nvidia-product/` | The `vendor/nvidia-prolapse` product layer, from waydroid-nvidia v0.2.0-rc10, adapted to Android 17 |
+| `nvidia-product/` | The `vendor/nvidia-prolapse` product layer, from waydroid-nvidia v0.2.0-rc10, adapted to Android 17; the Codec2 NVDEC service is built from source against the Android 17 libraries |
 | `container/` | Build container |
 | `scripts/` | Sync, patch, build and benchmark scripts, written for the author's directory layout |
 | `host/` | systemd service that loads KernelSU at boot; the KWin placement script |
@@ -203,7 +203,7 @@ waydroid session start
 
 1. 编译容器：`podman build --build-arg ROOT="$PWD" -t localhost/waydroid-a17-build container`。`scripts/build.sh` 把项目目录按原路径挂进容器，因为 Mesa 交叉编译要用树里的 lld。
 2. `scripts/sync.sh`：同步 LineageOS 24.0 和 ATV manifest 到 `src/`，再执行 `apply-waydroid-patches`。
-3. 在下表各仓库的基线上 `git am patches/<仓库>/*.patch`，把 `nvidia-product/` 复制到 `src/vendor/nvidia-prolapse`。
+3. 在下表各仓库的基线上 `git am patches/<仓库>/*.patch`，再运行 `scripts/stage-product.sh`：它把 `nvidia-product/` 复制到 `src/vendor/nvidia-prolapse`，同时放入钉选的 native bundle 和 Codec2 NVDEC 服务的源码（该服务在 Android 17 树里编译）。
 4. `scripts/build.sh lineage_nvidia_waydroid_x86_64-cp2a-userdebug vendorimage`
 
 只想测一个模块时，单独编它（例如 `hwcomposer.waydroid`），把 `out/.../vendor/` 下的文件放进 `/var/lib/waydroid/overlay/vendor/` 的相同路径，重启会话即可。
@@ -218,14 +218,14 @@ waydroid session start
 | `external/wayland-protocols` | https://android.googlesource.com/platform/external/wayland-protocols | AOSP | `2dabfe6879b2` | 3 |
 | `device/waydroid/waydroid` | https://github.com/WayDroid-ATV/android_device_waydroid_waydroid | lineage-24.0 | `ce2f57ee2768` | 4 |
 | `vendor/waydroid/init` | https://github.com/WayDroid-ATV/android_vendor_waydroid_init | lineage-24.0 | `e97b43d97f70` | 2 |
-| `waydroid-nvidia` | https://github.com/Shiro836/waydroid-nvidia | public-test | `29ffa3a237b0` | 13 |
+| `waydroid-nvidia` | https://github.com/Shiro836/waydroid-nvidia | public-test | `29ffa3a237b0` | 17 |
 
 ### 目录
 
 | 路径 | 内容 |
 |---|---|
 | `patches/<仓库>/` | 各源码仓库上的本地提交（`git format-patch`） |
-| `nvidia-product/` | `vendor/nvidia-prolapse` product 层，来自 waydroid-nvidia v0.2.0-rc10，已适配 Android 17 |
+| `nvidia-product/` | `vendor/nvidia-prolapse` product 层，来自 waydroid-nvidia v0.2.0-rc10，已适配 Android 17；Codec2 NVDEC 服务从源码编译，链接 Android 17 的库 |
 | `container/` | 编译容器 |
 | `scripts/` | 同步、打补丁、编译、跑分脚本，按作者本机的目录布局写的 |
 | `host/` | 宿主机开机加载 KernelSU 的 systemd 服务；记住窗口位置的 KWin 脚本 |

@@ -35,39 +35,9 @@ endef
 
 $(eval $(call nvp-prebuilt-lib,nvprolapse_vulkan.nvidia,vulkan.nvidia.so,hw,$(NVP_NATIVE)/vendor_extra/%LIB%/hw/vulkan.nvidia.so,))
 $(eval $(call nvp-prebuilt-lib,nvprolapse_libvulkan_nouveau,libvulkan_nouveau.so,,$(NVP_NATIVE)/vendor_extra/%LIB%/libvulkan_nouveau.so,))
-$(eval $(call nvp-prebuilt-lib,nvprolapse_libnv_bionic_native,libnv_bionic_native.so,,$(NVP_NATIVE)/vendor_extra/%LIB%/libnv_bionic_native.so,))
 $(eval $(call nvp-prebuilt-lib,nvprolapse_libdrm.so.2,libdrm.so.2,,$(NVP_NATIVE)/vendor_extra/%LIB%/libdrm.so.2,))
 $(eval $(call nvp-prebuilt-lib,nvprolapse_libgallium_dri_nvrm,libgallium_dri_nvrm.so,,$(NVP_NATIVE)/vendor_extra/%LIB%/libgallium_dri_nvrm.so,))
 $(foreach l,EGL GLESv1_CM GLESv2,\
   $(eval $(call nvp-prebuilt-lib,nvprolapse_lib$(l)_nvrm,lib$(l)_nvrm.so,egl,$(NVP_NATIVE)/vendor/%LIB%/egl/lib$(l)_nvrm.so,))\
   $(eval $(call nvp-prebuilt-lib,nvprolapse_lib$(l)_angle,lib$(l)_angle.so,egl,$(NVP_ANGLE)/vendor/%LIB%/egl/lib$(l)_angle.so,lib$(l)_angle)))
 $(eval $(call nvp-prebuilt-lib,nvprolapse_libgbm_mesa_wrapper,libgbm_mesa_wrapper.so,,$(NVP_NATIVE)/vendor_extra/%LIB%/libgbm_mesa_wrapper.so,libgbm_mesa_wrapper))
-
-# Codec2 NVDEC service (binary from the bundle; rc/VINTF/seccomp from nvidia-prolapse/media/odm/etc, copied to
-# prebuilts/media by the product stage). Its HIDL/Codec2 runtime libraries are the tree's vendor variants (installed to
-# /vendor/lib64 via LOCAL_REQUIRED_MODULES), not the bundle's standalone builds.
-include $(CLEAR_VARS)
-LOCAL_MODULE := android.hardware.media.c2@1.2-service-nvprolapse
-LOCAL_MODULE_CLASS := EXECUTABLES
-LOCAL_ODM_MODULE := true
-LOCAL_MODULE_RELATIVE_PATH := hw
-LOCAL_MULTILIB := 64
-LOCAL_SRC_FILES := $(NVP_NATIVE)/odm/bin/hw/android.hardware.media.c2@1.2-service-nvprolapse
-LOCAL_INIT_RC := prebuilts/media/odm/etc/init/android.hardware.media.c2@1.2-service-nvprolapse.rc
-LOCAL_VINTF_FRAGMENTS := prebuilts/media/odm/etc/vintf/manifest/android.hardware.media.c2@1.2-nvprolapse.xml
-LOCAL_CHECK_ELF_FILES := false
-LOCAL_STRIP_MODULE := false
-LOCAL_REQUIRED_MODULES := \
-    android.hardware.media.c2@1.0.vendor \
-    android.hardware.media.c2@1.1.vendor \
-    android.hardware.media.c2@1.2.vendor \
-    libcodec2_hidl@1.0.vendor \
-    libcodec2_hidl@1.1.vendor \
-    libcodec2_hidl@1.2.vendor \
-    libcodec2_hidl_plugin \
-    libcodec2_vndk.vendor \
-    libstagefright_bufferpool@2.0.1.vendor \
-    libhwminijail
-LOCAL_LICENSE_KINDS := legacy_notice
-LOCAL_LICENSE_CONDITIONS := notice
-include $(BUILD_PREBUILT)
