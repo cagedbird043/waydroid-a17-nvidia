@@ -24,6 +24,7 @@ Waydroid with Android 17 (LineageOS 24.0), hardware acceleration on NVIDIA GPUs,
 - **NVIDIA acceleration**: ANGLE → NVK (dual graphics queues) → NVIDIA kernel driver. HWUI renders with Vulkan (skiavk). H.264, HEVC, VP9 and AV1 are decoded on NVDEC.
 - **Multi-window**: after `waydroid prop set persist.waydroid.multi_windows true`, every Android app gets its own KDE window. KWin draws the title bar and handles moving, resizing and closing. `waydroid show-full-ui` opens the Android desktop in one KDE window; when it is closed, apps return to their own windows.
 - **Window positions**: the optional KWin script `host/kwin-waydroid-placement` reopens each app window where it was last closed. Positions are stored in `~/.config/kwin-waydroid-placement.conf` and survive logout.
+- **Mouse as touch**: some apps (Play Store and other Jetpack Compose UIs) ignore mouse drags. `waydroid prop set persist.waydroid.fake_touch "com.android.vending,..."` turns a left-button drag in the listed apps into a one-finger touch; a trailing `*` matches a package prefix and `*` alone matches every app. Changes apply on the next click.
 - **Host input method**: type into Android with fcitx5, ibus and other host IMEs through Wayland `text-input-v3`. The candidate window follows the cursor. On the Android side, the IME `WaydroidHostIme` ships in vendor and is enabled on first boot.
 - **Clipboard**: two-way sync with the host through `ext-data-control`, independent of window focus.
 - **Sound**: output through the host's PulseAudio. The Android media volume defaults to maximum, so the host controls the volume.
@@ -90,7 +91,7 @@ To test a single module, build it (for example `hwcomposer.waydroid`), copy the 
 
 | Repository | Upstream | Branch | Base | Patches |
 |---|---|---|---|---|
-| `hardware/waydroid` | https://github.com/WayDroid-ATV/android_hardware_waydroid | lineage-23.0 (ATV manifest) | `3af187c1de51` | 29 |
+| `hardware/waydroid` | https://github.com/WayDroid-ATV/android_hardware_waydroid | lineage-23.0 (ATV manifest) | `3af187c1de51` | 30 |
 | `external/minigbm` | https://github.com/WayDroid-ATV/android_external_minigbm | lineage-24.0 | `5f5797cacd14` | 9 |
 | `hardware/interfaces` | https://github.com/WayDroid-ATV/android_hardware_interfaces | lineage-24.0 | `1b0bcde9a85b` | 1 |
 | `external/wayland-protocols` | https://android.googlesource.com/platform/external/wayland-protocols | AOSP | `2dabfe6879b2` | 3 |
@@ -144,6 +145,7 @@ Waydroid 整合版：Android 17（LineageOS 24.0）+ NVIDIA 显卡硬件加速 +
 - **NVIDIA 加速**：ANGLE → NVK（双图形队列）→ NVIDIA 内核驱动。HWUI 用 Vulkan 渲染（skiavk）。H.264、HEVC、VP9、AV1 由 NVDEC 硬解。
 - **多窗口**：执行 `waydroid prop set persist.waydroid.multi_windows true` 后，每个 Android 应用一个 KDE 窗口，标题栏、拖动、缩放、关闭都由 KWin 处理。`waydroid show-full-ui` 在一个 KDE 窗口里打开 Android 桌面，关掉后应用回到各自的窗口。
 - **记住窗口位置**：可选的 KWin 脚本 `host/kwin-waydroid-placement` 让应用窗口重开时回到上次关闭的位置。位置存在 `~/.config/kwin-waydroid-placement.conf`，注销后仍在。
+- **鼠标当触摸**：有些应用（Play 商店等 Jetpack Compose 界面）不响应鼠标拖动。`waydroid prop set persist.waydroid.fake_touch "com.android.vending,..."` 让列出的应用里鼠标左键拖动变成单指触摸；结尾带 `*` 按包名前缀匹配，只写 `*` 匹配所有应用。改完下次点击就生效。
 - **宿主输入法**：fcitx5、ibus 等宿主输入法经 Wayland `text-input-v3` 直接在 Android 里输入，候选框跟随光标。Android 侧是预装在 vendor 的输入法 `WaydroidHostIme`，首次开机自动启用。
 - **剪贴板**：经 `ext-data-control` 与主机双向同步，不依赖窗口焦点。
 - **声音**：经主机 PulseAudio 输出。Android 媒体音量默认最大，音量由主机控制。
@@ -210,7 +212,7 @@ waydroid session start
 
 | 仓库 | 上游 | 分支 | 基线 | 补丁数 |
 |---|---|---|---|---|
-| `hardware/waydroid` | https://github.com/WayDroid-ATV/android_hardware_waydroid | lineage-23.0 (ATV manifest) | `3af187c1de51` | 29 |
+| `hardware/waydroid` | https://github.com/WayDroid-ATV/android_hardware_waydroid | lineage-23.0 (ATV manifest) | `3af187c1de51` | 30 |
 | `external/minigbm` | https://github.com/WayDroid-ATV/android_external_minigbm | lineage-24.0 | `5f5797cacd14` | 9 |
 | `hardware/interfaces` | https://github.com/WayDroid-ATV/android_hardware_interfaces | lineage-24.0 | `1b0bcde9a85b` | 1 |
 | `external/wayland-protocols` | https://android.googlesource.com/platform/external/wayland-protocols | AOSP | `2dabfe6879b2` | 3 |

@@ -1,0 +1,195 @@
+From f98d8eb0fbd444ccfa08fd8ba0522db33f26d2e0 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sun, 25 Oct 2026 00:44:58 +0800
+Subject: [PATCH] =?utf-8?q?hwcomposer=EF=BC=9Apersist.waydroid.fake=5Ftouc?=
+ =?utf-8?q?h=20=E6=8A=8A=E6=8C=87=E5=AE=9A=E5=BA=94=E7=94=A8=E9=87=8C?=
+ =?utf-8?q?=E7=9A=84=E9=BC=A0=E6=A0=87=E5=B7=A6=E9=94=AE=E6=8B=96=E5=8A=A8?=
+ =?utf-8?q?=E8=BD=AC=E6=88=90=E5=8D=95=E6=8C=87=E8=A7=A6=E6=91=B8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hwcomposer/wayland-hwc.cpp | 124 ++++++++++++++++++++++++++++++++++++-
+ hwcomposer/wayland-hwc.h   |   2 +
+ 2 files changed, 125 insertions(+), 1 deletion(-)
+
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index 6a76cdb..fc0bba4 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -2362,6 +2362,9 @@ static void gesture_swipe_update(struct wl_conn* conn, uint32_t axis, int value)
+ static void gesture_swipe_end(struct wl_conn* conn);
+ static void pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32_t time,
+                                   wl_fixed_t sx, wl_fixed_t sy);
++enum class FakeTouch { Down, Move, Up };
++static bool fake_touch_wanted(struct wl_conn *conn, struct wl_surface *surface);
++static void fake_touch_write(struct wl_conn *conn, FakeTouch phase);
+ 
+ static void
+ pointer_handle_enter(void *data, struct wl_pointer *pointer,
+@@ -2398,7 +2401,11 @@ pointer_handle_leave(void *data, struct wl_pointer *,
+                      uint32_t, struct wl_surface *)
+ {
+     struct wl_conn *conn = (struct wl_conn *)data;
+-    struct display *display = conn->dpy;
++    /* The left button is still down: lift the finger it stands in for. */
++    if (conn->fake_touch_down) {
++        fake_touch_write(conn, FakeTouch::Up);
++        conn->fake_touch_down = false;
++    }
+     conn->pointer_surface = NULL;
+ }
+ 
+@@ -2433,6 +2440,13 @@ pointer_handle_motion(void *data, struct wl_pointer *,
+     x += off.x;
+     y += off.y;
+ 
++    if (conn->fake_touch_down) {
++        conn->ptrPrvX = x;
++        conn->ptrPrvY = y;
++        fake_touch_write(conn, FakeTouch::Move);
++        return;
++    }
++
+     ADD_EVENT(EV_ABS, ABS_X, x);
+     ADD_EVENT(EV_ABS, ABS_Y, y);
+     ADD_EVENT(EV_REL, REL_X, x - conn->ptrPrvX);
+@@ -2504,6 +2518,22 @@ pointer_handle_button(void *data, struct wl_pointer *,
+     if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+         reassert_task_focus(conn, conn->pointer_surface, "click");
+ 
++    /* persist.waydroid.fake_touch: in the listed apps the left button acts
++     * as a finger, so a drag scrolls views that ignore mouse drags (Compose). */
++    if (button == BTN_LEFT) {
++        if (state == WL_POINTER_BUTTON_STATE_PRESSED &&
++            fake_touch_wanted(conn, conn->pointer_surface)) {
++            conn->fake_touch_down = true;
++            fake_touch_write(conn, FakeTouch::Down);
++            return;
++        }
++        if (state == WL_POINTER_BUTTON_STATE_RELEASED && conn->fake_touch_down) {
++            conn->fake_touch_down = false;
++            fake_touch_write(conn, FakeTouch::Up);
++            return;
++        }
++    }
++
+     if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+         ALOGE("%s:%d error in touch clock_gettime: %s",
+               __FILE__, __LINE__, strerror(errno));
+@@ -2687,6 +2717,98 @@ clear_touch_ids(const struct wl_conn *conn)
+     }
+ }
+ 
++static constexpr int kFakeTouchId = -1;
++
++static bool
++fake_touch_wanted(struct wl_conn *conn, struct wl_surface *surface)
++{
++    char prop[PROPERTY_VALUE_MAX];
++    if (property_get("persist.waydroid.fake_touch", prop, "") <= 0)
++        return false;
++
++    struct display *display = conn->dpy;
++    std::string pkg;
++    {
++        std::scoped_lock lock(display->windowsMutex);
++        struct window *window = window_for_surface(conn, surface);
++        if (!window)
++            return false;
++        pkg = window->appID;
++        /* The desktop window shows whichever task has focus. */
++        if (pkg == "Waydroid") {
++            pkg.clear();
++            for (const auto &[tid, task] : display->tasks) {
++                if (task.focused) {
++                    pkg = task.appID;
++                    break;
++                }
++            }
++        }
++    }
++    if (pkg.empty())
++        return false;
++
++    /* Comma-separated package names; a trailing '*' matches a prefix. */
++    std::string_view list(prop);
++    while (!list.empty()) {
++        size_t comma = list.find(',');
++        std::string_view entry = list.substr(0, comma);
++        list = comma == std::string_view::npos ? std::string_view() : list.substr(comma + 1);
++        while (!entry.empty() && entry.front() == ' ')
++            entry.remove_prefix(1);
++        while (!entry.empty() && entry.back() == ' ')
++            entry.remove_suffix(1);
++        if (entry.empty())
++            continue;
++        if (entry.back() == '*') {
++            if (std::string_view(pkg).starts_with(entry.substr(0, entry.size() - 1)))
++                return true;
++        } else if (entry == pkg) {
++            return true;
++        }
++    }
++    return false;
++}
++
++/* One finger at the pointer position (ptrPrvX/Y, already in display space). */
++static void
++fake_touch_write(struct wl_conn *conn, FakeTouch phase)
++{
++    struct display *display = conn->dpy;
++    struct input_event event[6];
++    struct timespec rt;
++    unsigned int n = 0;
++
++    if (ensure_pipe(display, INPUT_TOUCH))
++        return;
++
++    int slot = phase == FakeTouch::Down ? create_touch_id(conn, kFakeTouchId)
++             : phase == FakeTouch::Up   ? flush_touch_id(conn, kFakeTouchId)
++                                        : get_touch_id(conn, kFakeTouchId);
++    if (slot == -1)
++        return;
++
++    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
++        ALOGE("%s:%d error in touch clock_gettime: %s",
++              __FILE__, __LINE__, strerror(errno));
++    }
++
++    ADD_EVENT(EV_ABS, ABS_MT_SLOT, slot);
++    if (phase == FakeTouch::Up) {
++        ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, -1);
++    } else {
++        ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, slot);
++        ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, conn->ptrPrvX);
++        ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, conn->ptrPrvY);
++        ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
++    }
++    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
++
++    ssize_t res = write(display->input_fd[INPUT_TOUCH], event, n * sizeof(event[0]));
++    if (res < (ssize_t)(n * sizeof(event[0])))
++        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
++}
++
+ static void
+ touch_handle_down(void *data, struct wl_touch *,
+           uint32_t serial, uint32_t, struct wl_surface *surface,
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index fb338d2..5b400e3 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -313,6 +313,8 @@ struct wl_conn {
+     int gesturePosY = 0;
+     int gestureLength = -1;
+     double rel_acc_x = 0;
++    /* The left button is down and acting as a finger (persist.waydroid.fake_touch). */
++    bool fake_touch_down = false;
+     double rel_acc_y = 0;
+ 
+     /*
+-- 
+2.56.0
+
