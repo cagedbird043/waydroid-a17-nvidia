@@ -22,12 +22,12 @@
 
 ## 功能
 
-1. **重负载实测**：3DMark Wild Life Extreme（Vulkan，4K）12287–13096 分、约 74 FPS，无 Xid，连续多遍稳定（需下面的 NVK 修复）。Basemark GPU（Vulkan 1.0、4K、Medium、离屏、Z Prepass 关）：宿主官方驱动 35657（BC7），Waydroid 29369（ETC2），约 82%。还没测真实 3D 游戏。
-2. **Vulkan 1.0 应用创建窗口即崩**：A17 loader 的 R8G8B8 swapchain 检查直接调用 1.1 的 `GetPhysicalDeviceImageFormatProperties2` 原始指针，1.0 实例为空。gralloc 不再声称 BGR888 可作 GPU 渲染目标（`patches/external_minigbm/0009`），loader 就不进这个分支；已经 overlay 验证（原版 loader 下 Basemark Vulkan 跑完），下次发版打进 vendor。loader 本身的修复已提交 LineageOS Gerrit（[509993](https://review.lineageos.org/c/LineageOS/android_frameworks_native/+/509993)）并报给 Google（[b/577380015](https://issuetracker.google.com/issues/577380015)），等审核。
+1. **重负载实测**：3DMark Wild Life Extreme（Vulkan，4K）12287–13096 分、约 74 FPS，无 Xid，同一进程连续多遍稳定。Basemark GPU（Vulkan 1.0、4K、Medium、离屏、Z Prepass 关）：宿主官方驱动 35657（BC7），Waydroid 29369（ETC2），约 82%。还没测真实 3D 游戏。
+2. **跟进 libvulkan 上游修复**：A17 loader 的 R8G8B8 swapchain 检查直接调用 1.1 的 `GetPhysicalDeviceImageFormatProperties2` 原始指针，1.0 实例为空即崩；本仓库靠 gralloc 不声称 BGR888 可渲染（`patches/external_minigbm/0009`）绕开。loader 修复已提交 LineageOS Gerrit（[509993](https://review.lineageos.org/c/LineageOS/android_frameworks_native/+/509993)）并报给 Google（[b/577380015](https://issuetracker.google.com/issues/577380015)），等审核。
 
 ## 不做
 
-- **整版跟进 waydroid-nvidia**：本仓库是分叉（自编双队列 NVK、主机侧补丁、自编 vendor），不随上游 rc 版本 rebase。上游有用的修复读懂后移植过来；NVIDIA 驱动升级后门禁不过时先看上游怎么修的。待移植候选（rc11，`7670f54` 及之前）：Codec2 视频中途换分辨率不再断播、VP9 segmentation 与 NVIDIA 一致。NVK 遇到 2D 图像的 3D 视图不再中止进程（上游 `3152d37`，本地 `7b39af9`）：已编译，本机经 vendor overlay 验证（3DMark Wild Life Extreme 同一进程第二次加载场景不再在 `nil_image_view_descriptor` abort），下次发版打进 native bundle。ATV 出新 system 镜像时单独评估。
+- **整版跟进 waydroid-nvidia**：本仓库是分叉（自编双队列 NVK、主机侧补丁、自编 vendor），不随上游 rc 版本 rebase。上游有用的修复读懂后移植过来；NVIDIA 驱动升级后门禁不过时先看上游怎么修的。待移植候选（rc11，`7670f54` 及之前）：Codec2 视频中途换分辨率不再断播、VP9 segmentation 与 NVIDIA 一致。ATV 出新 system 镜像时单独评估。
 
 - **32 位 ARM（`armeabi-v7a`）**：现在的应用基本都有 arm64 版本（Play 早已要求 64 位，新手机也已不支持 32 位应用）。ATV A17 镜像只带 arm64 翻译；ATV 的 `vendor_google_proprietary_ndk_translation-prebuilt` 在 `16arm_16arm64` 分支上有 32 位库，但那是 Android 16 的。
 - **桌面窗口和卡片同时开**：两者共用一块 Android 屏幕，只能二选一。卡片加主机菜单里的 Android 应用启动项已经覆盖日常用法；只有用桌面小部件、或个别应用当卡片用有问题时才需要桌面窗口，临时切过去即可。

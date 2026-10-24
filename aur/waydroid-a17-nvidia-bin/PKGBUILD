@@ -5,13 +5,14 @@
 # https://github.com/cagedbird043/waydroid-a17-nvidia (A17 vendor support, KernelSU seccomp, hwcomposer
 # clipboard, host folder sharing), the nvidia-prolapse vendor image built from that repository
 # (NVK + ANGLE, NVDEC, freeform cards, host IME), the native bundle it was built against (rc10 with a
-# dual-queue NVK) and a KWin script that reopens cards where they were closed.
+# dual-queue NVK that also carries the upstream fix for 3D views of 2D images) and a KWin script that
+# reopens cards where they were closed.
 # The Android system image is not included: waydroid-nvidia-setup downloads it (see post_install).
 
 pkgname=waydroid-a17-nvidia-bin
-pkgver=20261024.4
+pkgver=20261024.5
 pkgrel=1
-_tag=a17-20261024-4
+_tag=a17-20261024-5
 _wn_sha=29ffa3a237b0d79a751748bd9bb82c50dd577808      # waydroid-nvidia v0.2.0-rc10 release notes commit
 _wn_tag=v0.2.0-rc10
 _waydroid_sha=a33a5c0b31d89d6ce687381104b30aff4dd2d330

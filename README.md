@@ -96,7 +96,7 @@ To test a single module, build it (for example `hwcomposer.waydroid`), copy the 
 | `external/wayland-protocols` | https://android.googlesource.com/platform/external/wayland-protocols | AOSP | `2dabfe6879b2` | 3 |
 | `device/waydroid/waydroid` | https://github.com/WayDroid-ATV/android_device_waydroid_waydroid | lineage-24.0 | `ce2f57ee2768` | 4 |
 | `vendor/waydroid/init` | https://github.com/WayDroid-ATV/android_vendor_waydroid_init | lineage-24.0 | `e97b43d97f70` | 2 |
-| `waydroid-nvidia` | https://github.com/Shiro836/waydroid-nvidia | public-test | `29ffa3a237b0` | 12 |
+| `waydroid-nvidia` | https://github.com/Shiro836/waydroid-nvidia | public-test | `29ffa3a237b0` | 13 |
 
 ### Repository layout
 
@@ -216,7 +216,7 @@ waydroid session start
 | `external/wayland-protocols` | https://android.googlesource.com/platform/external/wayland-protocols | AOSP | `2dabfe6879b2` | 3 |
 | `device/waydroid/waydroid` | https://github.com/WayDroid-ATV/android_device_waydroid_waydroid | lineage-24.0 | `ce2f57ee2768` | 4 |
 | `vendor/waydroid/init` | https://github.com/WayDroid-ATV/android_vendor_waydroid_init | lineage-24.0 | `e97b43d97f70` | 2 |
-| `waydroid-nvidia` | https://github.com/Shiro836/waydroid-nvidia | public-test | `29ffa3a237b0` | 12 |
+| `waydroid-nvidia` | https://github.com/Shiro836/waydroid-nvidia | public-test | `29ffa3a237b0` | 13 |
 
 ### 目录
 

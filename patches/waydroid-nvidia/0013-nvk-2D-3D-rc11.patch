@@ -1,0 +1,356 @@
+From 7b39af993bf858df82ab8a93d4202b96d5a78a2f Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 24 Oct 2026 03:07:54 +0300
+Subject: [PATCH] =?utf-8?q?nvk=EF=BC=9A2D=20=E5=9B=BE=E5=83=8F=E7=9A=84=20?=
+ =?utf-8?q?3D=20=E8=A7=86=E5=9B=BE=E4=B8=8D=E5=86=8D=E8=AE=A9=E8=BF=9B?=
+ =?utf-8?q?=E7=A8=8B=E4=B8=AD=E6=AD=A2=EF=BC=88=E7=A7=BB=E6=A4=8D=E4=B8=8A?=
+ =?utf-8?q?=E6=B8=B8=20rc11=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+3DMark Wild Life Extreme 第二次加载场景时，对 32x32 的 2D 图像建 VK_IMAGE_VIEW_TYPE_3D 视图。
+这是无效用法，NVIDIA 官方驱动接受，nil 的 normalize_extent 却断言 image.dim == 3D，
+panic 出不了 extern "C" 而中止进程。单采样、单层的 2D 图像按深度 1 的 3D 图像描述
+（内存排布相同），并只警告一次；其他无法这样描述的情况返回 VK_ERROR_UNKNOWN 并写明原因。
+
+build.py 的冲突：NVK_PATCH_LIST 同时保留本分支的 nvk-rm-graphics-multiqueue.patch，
+新补丁排在它后面。已在 mesa-26.2.5（ddaf85e）上按顺序试打全部 16 个 NVK 补丁，无冲突；未编译。
+
+(cherry picked from commit 3152d37cc42b0732e00f969985cfed0c9acaaf19)
+---
+ .../driver-source/native/mesa/README.md       |  12 ++
+ .../driver-source/native/mesa/build.py        |   5 +-
+ .../native/mesa/nvk-3d-view-of-2d-image.patch |  93 ++++++++++
+ .../mesa/tests/nvk-3d-view-of-2d-image.c      | 173 ++++++++++++++++++
+ 4 files changed, 282 insertions(+), 1 deletion(-)
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nvk-3d-view-of-2d-image.patch
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/tests/nvk-3d-view-of-2d-image.c
+
+diff --git a/nvidia-prolapse/driver-source/native/mesa/README.md b/nvidia-prolapse/driver-source/native/mesa/README.md
+index fedc0c8..0b733b6 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/README.md
++++ b/nvidia-prolapse/driver-source/native/mesa/README.md
+@@ -129,6 +129,18 @@ doesn't return the modifier's byte layout to the CPU, so these images get no hos
+ memory type (the proprietary 580 driver offers none either: memoryTypeBits 0x82 on GP104);
+ system-memory types stay. Turing and later are unchanged (generic kind 0x06; BAR1 reads back
+ exactly on TU106 and GB202).
++`nvk-3d-view-of-2d-image.patch`: a `VK_IMAGE_VIEW_TYPE_3D` view of a `VK_IMAGE_TYPE_2D` image is
++invalid usage that NVIDIA's driver accepts (615.78.08 returns `VK_SUCCESS`); 3DMark Wild Life
++Extreme creates one on its second scene load in one process. nil's `normalize_extent`
++(`descriptor.rs:261`) asserts `image.dim == ImageDim::_3D`, and the panic aborts the process because
++it cannot leave the `extern "C"` `nil_image_view_descriptor`. NVK now hands nil the selected layer as
++a 3D image of depth 1 (same memory layout: one slice per level, `z_log2 = 0`), the mirror of its own
++`image_3d_view_as_2d_array()`, and logs the invalid usage once. Only a single-sampled single layer
++qualifies; any other 3D view of a non-3D image (multisampled, several layers, 1D) fails
++`vkCreateImageView` with a logged reason and `VK_ERROR_UNKNOWN` (as `nvk_image.c` reports invalid image
++parameters) instead of reaching nil's assert, which release builds keep. Upstream Mesa main (2026-10-23)
++still asserts. Reproducer: `tests/nvk-3d-view-of-2d-image.c` (aborts before; after: the 3DMark view is
++created and a 3D view of a 4x multisampled image returns an error; the stock ICDs accept both).
+ `nvk-angle-nan-preserve-min-max.patch`: driconf `nvk_force_nan_preserve_min_max` (RADV's
+ `radv_force_nan_preserve_min_max` mechanism -> spirv `workarounds.force_nan_preserve_min_max`),
+ set for engine `^ANGLE$` in `00-nvk-defaults.conf` and folded into the compiler flags (bit 15).
+diff --git a/nvidia-prolapse/driver-source/native/mesa/build.py b/nvidia-prolapse/driver-source/native/mesa/build.py
+index 09aadba..e1671a3 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/build.py
++++ b/nvidia-prolapse/driver-source/native/mesa/build.py
+@@ -145,7 +145,7 @@ NVK_PATCHES = ("build-compat.patch", "rm-integration.patch", "pascal-a-clear.pat
+                "mesa-disk-cache-create-with-path.patch", "mesa-disk-cache-keep-file-backend.patch",
+                "mesa-disk-cache-evict-invalid-item.patch", "nvk-android-app-disk-cache.patch",
+                "nvk-shader-upload-publish.patch", "nvk-shader-prefetch-in-range.patch",
+-               "nvk-prevolta-modifier-memory-types.patch")
++               "nvk-prevolta-modifier-memory-types.patch", "nvk-3d-view-of-2d-image.patch")
+ 
+ GL_TRIPLES = {"android": "x86_64-linux-android", "android32": "i686-linux-android"}
+ # Android: distinct library names so the image's own Mesa (libEGL_mesa.so,
+@@ -196,6 +196,9 @@ NVK_PATCH_LIST = [
+     HERE / "nvk-prevolta-modifier-memory-types.patch",
+     # RM creates an independent channel group and ring for every VkQueue.
+     HERE / "nvk-rm-graphics-multiqueue.patch",
++    # A 3D view of a 2D image (invalid usage NVIDIA's driver accepts) is
++    # described as a depth-1 3D image instead of tripping nil's assert.
++    HERE / "nvk-3d-view-of-2d-image.patch",
+ ]
+ 
+ def prepared_stamp(source, inputs):
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-3d-view-of-2d-image.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-3d-view-of-2d-image.patch
+new file mode 100644
+index 0000000..0b1a30e
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-3d-view-of-2d-image.patch
+@@ -0,0 +1,93 @@
++nvk: describe a 3D view of a 2D image as a depth-1 3D image
++
++VK_IMAGE_VIEW_TYPE_3D of a VK_IMAGE_TYPE_2D image is invalid usage, but NVIDIA's
++Vulkan driver accepts it and 3DMark Wild Life Extreme creates one on its second
++scene load. nil's normalize_extent (descriptor.rs:261) asserts image.dim == 3D;
++the panic cannot leave extern "C" nil_image_view_descriptor and aborts.
++Mirror image_3d_view_as_2d_array(): hand nil a single-sampled layer as a 3D
++image of depth 1 (same memory layout), with a one-time warning naming the
++invalid usage. Any other 3D view of a non-3D image (multisampled, more than one
++layer, 1D) fails with a logged reason and VK_ERROR_UNKNOWN, as nvk_image.c does
++for invalid image parameters, instead of reaching nil's assert.
++Reproducer: native/mesa/tests/nvk-3d-view-of-2d-image.c.
++
++--- a/src/nouveau/vulkan/nvk_image_view.c
+++++ b/src/nouveau/vulkan/nvk_image_view.c
++@@ -87,6 +87,53 @@
++    view->base_level = 0;
++ }
++ 
+++/* VK_IMAGE_VIEW_TYPE_3D of a VK_IMAGE_TYPE_2D image is invalid usage (the
+++ * image/view type compatibility table in the "Image Views" chapter allows
+++ * only 2D, 2D_ARRAY, CUBE and CUBE_ARRAY views of a 2D image), but NVIDIA's
+++ * Vulkan driver (615.78.08) returns VK_SUCCESS for it, and 3DMark Wild Life
+++ * Extreme creates such a view on its second scene load in one process.
+++ * nil's descriptor builder asserts on it (descriptor.rs normalize_extent),
+++ * which aborts the process, so describe the selected layer as what it is in
+++ * memory: a 3D image of depth 1.  A single-sampled 2D level has z_log2 = 0
+++ * tiling and one slice per level, which is exactly the layout of a depth-1
+++ * 3D image, so the texture header addresses the same texels the 2D view
+++ * would.  The mirror of image_3d_view_as_2d_array() above.  Only a
+++ * single-sampled layer qualifies (image_2d_layer_viewable_as_3d()); any other
+++ * 3D view of a non-3D image fails vkCreateImageView with a named error
+++ * instead of reaching nil's assert, which also fires in release builds.
+++ */
+++static bool
+++image_2d_layer_viewable_as_3d(const struct nil_image *image,
+++                              const struct nil_view *view)
+++{
+++   return image->dim == NIL_IMAGE_DIM_2D &&
+++          image->extent_px.depth == 1 &&
+++          image->sample_layout == NIL_SAMPLE_LAYOUT_1X1 &&
+++          view->view_type == NIL_VIEW_TYPE_3D &&
+++          view->array_len == 1;
+++}
+++
+++static void
+++image_2d_viewed_as_3d(struct nil_image *image,
+++                      struct nil_view *view,
+++                      uint64_t *base_addr)
+++{
+++   assert(image->dim == NIL_IMAGE_DIM_2D);
+++   assert(image->extent_px.depth == 1);
+++   assert(image->sample_layout == NIL_SAMPLE_LAYOUT_1X1);
+++   assert(view->view_type == NIL_VIEW_TYPE_3D);
+++   assert(view->array_len == 1);
+++
+++   mesa_logw_once("vkCreateImageView: VK_IMAGE_VIEW_TYPE_3D of a "
+++                  "VK_IMAGE_TYPE_2D image is invalid usage; describing "
+++                  "the layer as a 3D image of depth 1");
+++
+++   *base_addr += (uint64_t)view->base_array_layer * image->array_stride_B;
+++   image->dim = NIL_IMAGE_DIM_3D;
+++   image->extent_px.array_len = 1;
+++   view->base_array_layer = 0;
+++}
+++
++ VkResult
++ nvk_image_view_init(struct nvk_device *dev,
++                     struct nvk_image_view *view,
++@@ -186,6 +233,23 @@
++          nil_view.view_type != NIL_VIEW_TYPE_3D)
++          image_3d_view_as_2d_array(&nil_image, &nil_view, &base_addr);
++ 
+++      if (nil_view.view_type == NIL_VIEW_TYPE_3D &&
+++          nil_image.dim != NIL_IMAGE_DIM_3D) {
+++         if (!image_2d_layer_viewable_as_3d(&nil_image, &nil_view)) {
+++            mesa_loge("vkCreateImageView: VK_IMAGE_VIEW_TYPE_3D of a "
+++                      "non-3D image (image dim %u, %u layer(s) viewed, "
+++                      "%s) is invalid usage that cannot be described as "
+++                      "a depth-1 3D image",
+++                      (unsigned)nil_image.dim, nil_view.array_len,
+++                      nil_image.sample_layout == NIL_SAMPLE_LAYOUT_1X1 ?
+++                      "single-sampled" : "multisampled");
+++            nvk_image_view_finish(dev, view);
+++            return vk_errorf(dev, VK_ERROR_UNKNOWN,
+++                             "Invalid image view creation parameters");
+++         }
+++         image_2d_viewed_as_3d(&nil_image, &nil_view, &base_addr);
+++      }
+++
++       view->planes[view_plane].sample_layout = nil_image.sample_layout;
++ 
++       if (view->vk.usage & (VK_IMAGE_USAGE_SAMPLED_BIT |
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/nvk-3d-view-of-2d-image.c b/nvidia-prolapse/driver-source/native/mesa/tests/nvk-3d-view-of-2d-image.c
+new file mode 100644
+index 0000000..35fe1b3
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/nvk-3d-view-of-2d-image.c
+@@ -0,0 +1,173 @@
++/* VK_IMAGE_VIEW_TYPE_3D view of a 2D image.
++ *
++ * 3DMark Wild Life Extreme (Android, 2.7.5093) creates this view on its second
++ * scene load in one process: the GPU particle system binds a 32x32
++ * VK_FORMAT_R8G8B8A8_SRGB 2D image (6 mips, 1 layer, TRANSFER_DST|SAMPLED,
++ * optimal tiling) to a 3D texture slot and asks for
++ *   { viewType = VK_IMAGE_VIEW_TYPE_3D, format = R8G8B8A8_SRGB,
++ *     identity swizzle, COLOR, levels 0..6, layers 0..1 }.
++ * The first load created a real 3D image (128x128x128 R8G8B8A8_UNORM) for that
++ * slot; the second load creates none and passes the 2D image instead.
++ *
++ * The Vulkan spec forbids this view (image/view type compatibility table in
++ * "Image Views": a VK_IMAGE_TYPE_2D image allows 2D, 2D_ARRAY, CUBE and
++ * CUBE_ARRAY views only). NVIDIA's own Vulkan driver accepts it. Mesa 26.2.5
++ * nil (src/nouveau/nil/descriptor.rs:261, normalize_extent) asserts
++ * `image.dim == ImageDim::_3D`; the panic cannot unwind out of the extern "C"
++ * nil_image_view_descriptor and the process aborts.
++ *
++ * Case 2 asks for a 3D view of a 4x multisampled 2D image, which cannot be
++ * described as a depth-1 3D image: the driver must not abort (NVK returns
++ * VK_ERROR_UNKNOWN and logs why; any result is accepted).
++ *
++ * Exit status: 0 = case 1 created its view and neither case killed the
++ * process; 1 = case 1's vkCreateImageView returned an error; the pre-fix NVK
++ * aborts in case 1 (SIGABRT, "assertion failed: image.dim == ImageDim::_3D").
++ *
++ * Real GPU. The device is selected by vendorID 0x10de and driverID
++ * (MESA_NVK, or NVIDIA_PROPRIETARY for the stock comparison), never by a node
++ * path. Build/run (repository root):
++ *   cc -std=c11 -Wall -Wextra -Werror -I<mesa>/include \
++ *     nvidia-prolapse/driver-source/native/mesa/tests/nvk-3d-view-of-2d-image.c -ldl \
++ *     -o nvk-3d-view-of-2d-image
++ *   LD_LIBRARY_PATH=<rust lib dir> ./nvk-3d-view-of-2d-image <nvk-host>/src/nouveau/vulkan/libvulkan_nouveau.so
++ *   ./nvk-3d-view-of-2d-image libGLX_nvidia.so.0     (stock comparison)
++ */
++#include <dlfcn.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <vulkan/vulkan.h>
++
++#define VKCHECK(call) do { VkResult r_ = (call); if (r_ != VK_SUCCESS) { \
++   fprintf(stderr, "FATAL %s:%d %s -> %d\n", __FILE__, __LINE__, #call, r_); exit(2); } } while (0)
++
++static PFN_vkCreateImage p_CreateImage;
++static PFN_vkDestroyImage p_DestroyImage;
++static PFN_vkGetImageMemoryRequirements p_GetImageMemoryRequirements;
++static PFN_vkAllocateMemory p_AllocateMemory;
++static PFN_vkFreeMemory p_FreeMemory;
++static PFN_vkBindImageMemory p_BindImageMemory;
++static PFN_vkCreateImageView p_CreateImageView;
++static PFN_vkDestroyImageView p_DestroyImageView;
++
++/* create + bind the image, create the view on it, destroy everything; returns vkCreateImageView's result */
++static VkResult
++one_view(VkDevice dev, VkPhysicalDevice pd, PFN_vkGetPhysicalDeviceMemoryProperties gpdmp,
++         const VkImageCreateInfo *ci, VkImageViewCreateInfo *vci)
++{
++   VkImage img;
++   VKCHECK(p_CreateImage(dev, ci, NULL, &img));
++   VkMemoryRequirements req;
++   p_GetImageMemoryRequirements(dev, img, &req);
++   VkPhysicalDeviceMemoryProperties mp;
++   gpdmp(pd, &mp);
++   uint32_t type = 0;
++   while (type < mp.memoryTypeCount && !(req.memoryTypeBits & (1u << type)))
++      type++;
++   VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
++                                .memoryTypeIndex = type };
++   VkDeviceMemory mem;
++   VKCHECK(p_AllocateMemory(dev, &mai, NULL, &mem));
++   VKCHECK(p_BindImageMemory(dev, img, mem, 0));
++   vci->image = img;
++   VkImageView view = VK_NULL_HANDLE;
++   VkResult r = p_CreateImageView(dev, vci, NULL, &view);
++   if (r == VK_SUCCESS)
++      p_DestroyImageView(dev, view, NULL);
++   p_DestroyImage(dev, img, NULL);
++   p_FreeMemory(dev, mem, NULL);
++   return r;
++}
++
++int
++main(int argc, char **argv)
++{
++   if (argc != 2) {
++      fprintf(stderr, "usage: %s path/to/vulkan-icd.so\n", argv[0]);
++      return 2;
++   }
++   void *icd = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
++   if (!icd) {
++      fprintf(stderr, "FATAL dlopen %s: %s\n", argv[1], dlerror());
++      return 2;
++   }
++   PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(icd, "vk_icdGetInstanceProcAddr");
++   if (!gipa) {
++      fprintf(stderr, "FATAL %s has no vk_icdGetInstanceProcAddr\n", argv[1]);
++      return 2;
++   }
++   PFN_vkCreateInstance create_instance = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
++   VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_1 };
++   VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
++   VkInstance inst;
++   VKCHECK(create_instance(&ici, NULL, &inst));
++#define I(name) PFN_vk##name i_##name = (PFN_vk##name)gipa(inst, "vk" #name)
++   I(EnumeratePhysicalDevices); I(GetPhysicalDeviceProperties2); I(GetPhysicalDeviceMemoryProperties);
++   I(CreateDevice); I(GetDeviceProcAddr); I(DestroyInstance);
++#undef I
++   uint32_t n = 8;
++   VkPhysicalDevice pdevs[8];
++   VKCHECK(i_EnumeratePhysicalDevices(inst, &n, pdevs));
++   VkPhysicalDevice pd = VK_NULL_HANDLE;
++   for (uint32_t i = 0; i < n && !pd; i++) {
++      VkPhysicalDeviceDriverProperties drv = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
++      VkPhysicalDeviceProperties2 pp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv };
++      i_GetPhysicalDeviceProperties2(pdevs[i], &pp);
++      if (pp.properties.vendorID == 0x10de &&
++          (drv.driverID == VK_DRIVER_ID_MESA_NVK || drv.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY)) {
++         pd = pdevs[i];
++         printf("device: %s (%s %s)\n", pp.properties.deviceName, drv.driverName, drv.driverInfo);
++      }
++   }
++   if (!pd) {
++      fprintf(stderr, "FATAL no NVIDIA device with driverID MESA_NVK or NVIDIA_PROPRIETARY\n");
++      return 2;
++   }
++   float prio = 1.0f;
++   VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueCount = 1,
++                                   .pQueuePriorities = &prio };
++   VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
++                              .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci };
++   VkDevice dev;
++   VKCHECK(i_CreateDevice(pd, &dci, NULL, &dev));
++#define D(name) p_##name = (PFN_vk##name)i_GetDeviceProcAddr(dev, "vk" #name); \
++   if (!p_##name) { fprintf(stderr, "FATAL no vk" #name "\n"); return 2; }
++   D(CreateImage) D(DestroyImage) D(GetImageMemoryRequirements) D(AllocateMemory) D(FreeMemory)
++   D(BindImageMemory) D(CreateImageView) D(DestroyImageView)
++   PFN_vkDestroyDevice p_DestroyDevice = (PFN_vkDestroyDevice)i_GetDeviceProcAddr(dev, "vkDestroyDevice");
++#undef D
++
++   /* 1: the image and view 3DMark uses: 32x32 R8G8B8A8_SRGB, full mip chain, sampled; must succeed */
++   VkImageCreateInfo ci = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_SRGB, .extent = { 32, 32, 1 }, .mipLevels = 6, .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++      .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++   };
++   VkImageViewCreateInfo vci = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .viewType = VK_IMAGE_VIEW_TYPE_3D,
++      .format = VK_FORMAT_R8G8B8A8_SRGB,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 6, 0, 1 },
++   };
++   VkResult r1 = one_view(dev, pd, i_GetPhysicalDeviceMemoryProperties, &ci, &vci);
++   printf("case 1: VIEW_TYPE_3D of a 2D 32x32 R8G8B8A8_SRGB image, 6 levels -> %d\n", r1);
++
++   /* 2: a 3D view of a 4x multisampled 2D image cannot be a depth-1 3D image: any outcome but an abort is
++    * accepted (NVK returns an error and logs the reason; the stock driver's answer is printed) */
++   ci.mipLevels = 1;
++   ci.samples = VK_SAMPLE_COUNT_4_BIT;
++   ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++   vci.subresourceRange.levelCount = 1;
++   VkResult r2 = one_view(dev, pd, i_GetPhysicalDeviceMemoryProperties, &ci, &vci);
++   printf("case 2: VIEW_TYPE_3D of a 4x multisampled 2D 32x32 image -> %d (process alive)\n", r2);
++
++   p_DestroyDevice(dev, NULL);
++   i_DestroyInstance(inst, NULL);
++   if (r1 != VK_SUCCESS) {
++      printf("FAIL nvk-3d-view-of-2d-image: case 1 vkCreateImageView -> %d\n", r1);
++      return 1;
++   }
++   printf("PASS nvk-3d-view-of-2d-image\n");
++   return 0;
++}
+-- 
+2.56.0
+
