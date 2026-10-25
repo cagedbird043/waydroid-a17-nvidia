@@ -1,0 +1,69 @@
+From fc21b296bc478144de017e968f701d179479b7cd Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sun, 25 Oct 2026 17:58:57 +0800
+Subject: [PATCH 32/32] =?utf-8?q?hwcomposer=EF=BC=9A=E5=AE=BF=E4=B8=BB?=
+ =?utf-8?q?=E6=97=A0=E8=A7=A6=E6=91=B8=E5=B1=8F=E6=97=B6=E4=B9=9F=E5=90=8C?=
+ =?utf-8?q?=E6=AD=A5=E8=A7=A6=E6=91=B8=E8=AE=BE=E5=A4=87=E7=9A=84=E5=9D=90?=
+ =?utf-8?q?=E6=A0=87=E8=8C=83=E5=9B=B4?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+publish_display_size 原先只在 ctl 连接有 wl_touch 时才更新
+waydroid.display_width/height 并重建触摸管道。宿主没有触摸屏时，
+freeform 把显示从 1489 改到 1899 高后，触摸设备的 Y 范围仍停在
+1489，fake_touch 和触控板捏合发出的触摸事件被按比例压缩，落到
+点击位置上方，表现为 Play 商店里鼠标点不动。
+---
+ hwcomposer/wayland-hwc.cpp | 30 +++++++++++++++---------------
+ 1 file changed, 15 insertions(+), 15 deletions(-)
+
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index fc0bba4..ea25187 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -396,26 +396,26 @@ request_frame(struct display *display)
+ }
+ 
+ /* Tell InputFlinger the display size: the touch device takes its range from
+- * these properties when its pipe is recreated. */
++ * these properties when its pipe is recreated. The pipe also carries the
++ * touchpad's pinch gestures and persist.waydroid.fake_touch, so it needs the
++ * new range even when the host seat has no touchscreen. */
+ static void
+ publish_display_size(struct display *display) {
+-    if (display->ctl->touch) {
+-        char property[PROPERTY_VALUE_MAX];
+-        int width = floor(display->width * display->scale);
+-        int height = floor(display->height * display->scale);
++    char property[PROPERTY_VALUE_MAX];
++    int width = floor(display->width * display->scale);
++    int height = floor(display->height * display->scale);
+ 
+-        if (property_get("persist.waydroid.width_padding", property, nullptr) > 0)
+-            width -= atoi(property);
+-        std::string width_str = std::to_string(width);
+-        property_set("waydroid.display_width", width_str.c_str());
++    if (property_get("persist.waydroid.width_padding", property, nullptr) > 0)
++        width -= atoi(property);
++    std::string width_str = std::to_string(width);
++    property_set("waydroid.display_width", width_str.c_str());
+ 
+-        if (property_get("persist.waydroid.height_padding", property, nullptr) > 0)
+-            height -= atoi(property);
+-        std::string height_str = std::to_string(height);
+-        property_set("waydroid.display_height", height_str.c_str());
++    if (property_get("persist.waydroid.height_padding", property, nullptr) > 0)
++        height -= atoi(property);
++    std::string height_str = std::to_string(height);
++    property_set("waydroid.display_height", height_str.c_str());
+ 
+-        reset_input_pipe(display, INPUT_TOUCH);
+-    }
++    reset_input_pipe(display, INPUT_TOUCH);
+ }
+ 
+ void
+-- 
+2.56.0
+

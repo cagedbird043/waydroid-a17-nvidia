@@ -1,0 +1,178 @@
+From b169ca930020cd9d66d0f541498c9e7493f566f5 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sun, 25 Oct 2026 14:52:48 +0800
+Subject: [PATCH 31/32] =?utf-8?q?hwcomposer=EF=BC=9A=E5=8D=A1=E7=89=87?=
+ =?utf-8?q?=E6=A8=A1=E5=BC=8F=E4=B8=8B=E5=90=88=E6=88=90=E5=99=A8=E5=AF=BC?=
+ =?utf-8?q?=E5=85=A5=E4=B8=8D=E4=BA=86=E7=9A=84=E5=9B=BE=E5=B1=82=EF=BC=88?=
+ =?utf-8?q?SurfaceView=20=E7=9A=84=20NV12=20=E8=A7=86=E9=A2=91=EF=BC=89?=
+ =?utf-8?q?=E4=BA=A4=E7=BB=99=20SurfaceFlinger=20=E5=90=88=E6=88=90?=
+ =?utf-8?q?=EF=BC=8C=E5=86=8D=E6=8A=8A=E5=AE=A2=E6=88=B7=E7=AB=AF=E7=9B=AE?=
+ =?utf-8?q?=E6=A0=87=E4=B8=AD=E5=AF=B9=E5=BA=94=E5=8C=BA=E5=9F=9F=E8=B4=B4?=
+ =?utf-8?q?=E5=88=B0=E8=AF=A5=E5=8D=A1=E7=89=87=EF=BC=8C=E4=BF=AE=E5=A4=8D?=
+ =?utf-8?q?=E8=A7=86=E9=A2=91=E4=BD=8D=E7=BD=AE=E9=80=8F=E6=98=8E?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hwcomposer/hwcomposer.cpp         |  8 ++--
+ hwcomposer/modes/multi-window.cpp | 79 +++++++++++++++++++++++++++++--
+ hwcomposer/modes/multi-window.h   |  9 ++++
+ 3 files changed, 89 insertions(+), 7 deletions(-)
+
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index 838b644..0ca6c86 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -136,10 +136,10 @@ namespace {
+              * whose buffer the compositor cannot import must never reach
+              * create_immed — INVALID_WL_BUFFER is a fatal protocol error that
+              * kills the wayland connection (seen with LINEAR CPU buffers on
+-             * NVIDIA/KWin). The compositing modes route such a layer through
+-             * SurfaceFlinger at prepare time; multi-window mode has no client
+-             * target, so the buffer is copied into wl_shm instead of leaving
+-             * the window without a buffer (black). */
++             * NVIDIA/KWin). Every composing mode routes such a layer through
++             * SurfaceFlinger at prepare time; one that still arrives here (the
++             * layer list changed between prepare and set) is copied into
++             * wl_shm instead of leaving the window without a buffer (black). */
+             const bool undisplayable = layer->compositionType != HWC_FRAMEBUFFER_TARGET
+                 && !(layer->flags & HWC_IS_CURSOR_LAYER)
+                 && layer->handle
+diff --git a/hwcomposer/modes/multi-window.cpp b/hwcomposer/modes/multi-window.cpp
+index 3822c55..85ae20a 100644
+--- a/hwcomposer/modes/multi-window.cpp
++++ b/hwcomposer/modes/multi-window.cpp
+@@ -111,9 +111,24 @@ bool multi_window_mode::can_handle_layer(const hwc_layer_1& layer) {
+     return layer.compositionType == HWC_OVERLAY && !(layer.flags & HWC_SKIP_LAYER);
+ }
+ 
+-int multi_window_mode::prepare(hwc_layer_1* hwc_layer, size_t) {
+-    if (hwc_layer->compositionType == HWC_FRAMEBUFFER) {
+-        hwc_layer->compositionType = HWC_OVERLAY;
++int multi_window_mode::setup_prepare(waydroid_hwc_composer_device_1 *pdev, hwc_display_contents_1_t *contents) {
++    client_composed.assign(contents->numHwLayers, false);
++    for (size_t i = 0; i < contents->numHwLayers; ++i) {
++        const auto &layer = contents->hwLayers[i];
++        /* Same admission check as the compositing modes: attaching such a
++         * buffer is a fatal protocol error, and wl_shm has no YUV format. */
++        client_composed[i] = layer.handle
++            && layer.compositionType != HWC_FRAMEBUFFER_TARGET
++            && !(layer.flags & HWC_IS_CURSOR_LAYER)
++            && !pdev->gralloc_handler.displayable_buffer(pdev->display->ctl.get(), layer.handle);
++    }
++    return 0;
++}
++
++int multi_window_mode::prepare(hwc_layer_1* hwc_layer, size_t i) {
++    if (hwc_layer->compositionType == HWC_FRAMEBUFFER || hwc_layer->compositionType == HWC_OVERLAY) {
++        hwc_layer->compositionType = i < client_composed.size() && client_composed[i]
++                ? HWC_FRAMEBUFFER : HWC_OVERLAY;
+     }
+     // TODO: Handle HWC_SIDEBAND
+     return 0;
+@@ -121,9 +136,65 @@ int multi_window_mode::prepare(hwc_layer_1* hwc_layer, size_t) {
+ 
+ int multi_window_mode::setup_set(waydroid_hwc_composer_device_1* pdev, hwc_display_contents_1_t* contents) {
+     layer_infos.setup(pdev, contents->hwLayers, contents->numHwLayers);
++    client_target = nullptr;
++    for (size_t i = 0; i < contents->numHwLayers; ++i) {
++        if (contents->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET) {
++            client_target = &contents->hwLayers[i];
++            client_target_index = i;
++            break;
++        }
++    }
+     return 0;
+ }
+ 
++/* A layer SurfaceFlinger composed: its card gets the matching part of the
++ * client target, at the layer's place in the stack. SurfaceFlinger draws only
++ * the client-composed layers into the target, so the part holds just them. */
++int multi_window_mode::show_client_composed(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t i) {
++    if (hwc_layer->acquireFenceFd != -1) {
++        close(hwc_layer->acquireFenceFd);
++        hwc_layer->acquireFenceFd = -1;
++    }
++    window *window = get_window(pdev, layer_infos[i]);
++    if (!window)
++        return 0;
++    /* SurfaceFlinger's first client-composed present has no target buffer yet. */
++    if (!client_target || !client_target->handle) {
++        static int missing = 0;
++        if ((missing++ % 300) == 0)
++            ALOGW("client-composed layer %zu but no client target buffer (%d times)", i, missing);
++        return 0;
++    }
++
++    const hwc_rect_t &tf = client_target->displayFrame;
++    const hwc_frect_t &tc = client_target->sourceCropf;
++    const hwc_rect_t &lf = hwc_layer->displayFrame;
++    const hwc_rect_t f = {
++        std::max(lf.left, tf.left), std::max(lf.top, tf.top),
++        std::min(lf.right, tf.right), std::min(lf.bottom, tf.bottom) };
++    if (f.right <= f.left || f.bottom <= f.top || tf.right <= tf.left || tf.bottom <= tf.top)
++        return 0;
++    const float sx = (tc.right - tc.left) / (tf.right - tf.left);
++    const float sy = (tc.bottom - tc.top) / (tf.bottom - tf.top);
++
++    hwc_layer_1 part = *client_target;
++    part.displayFrame = f;
++    part.sourceCropf = {
++        tc.left + (f.left - tf.left) * sx, tc.top + (f.top - tf.top) * sy,
++        tc.left + (f.right - tf.left) * sx, tc.top + (f.bottom - tf.top) * sy };
++    part.surfaceDamage = { 0, nullptr };
++    /* The target is waited on once, by its first part; it has signalled for
++     * every later one. */
++    client_target->acquireFenceFd = -1;
++
++    if (window->is_freeform_card()) {
++        auto content = task_content.find(window->taskID);
++        if (content != task_content.end())
++            freeform_observe_content(window, content->second.area, content->second.fullscreen);
++    }
++    return apply_hwc_layer_to_window(pdev, &part, client_target_index, window);
++}
++
+ /* What WMShell laid out, read off this frame: a freeform task's caption
+  * ("Caption of Task=<id>") sits on top of its bounds and the app's windows fill
+  * the rest, so the content area runs from the caption's bottom edge to the
+@@ -248,6 +319,8 @@ int multi_window_mode::cleanup_stale_windows(waydroid_hwc_composer_device_1* pde
+ }
+ 
+ int multi_window_mode::handle_layer(waydroid_hwc_composer_device_1* pdev, hwc_layer_1* hwc_layer, size_t i) {
++    if (hwc_layer->compositionType == HWC_FRAMEBUFFER && !(hwc_layer->flags & HWC_SKIP_LAYER))
++        return show_client_composed(pdev, hwc_layer, i);
+     if (!can_handle_layer(*hwc_layer)) {
+         if (!(hwc_layer->flags & HWC_SKIP_LAYER) && hwc_layer->compositionType != HWC_FRAMEBUFFER_TARGET) {
+             // TODO: Support HWC_BACKGROUND
+diff --git a/hwcomposer/modes/multi-window.h b/hwcomposer/modes/multi-window.h
+index 7aa3057..cf9dedd 100644
+--- a/hwcomposer/modes/multi-window.h
++++ b/hwcomposer/modes/multi-window.h
+@@ -37,13 +37,22 @@ class multi_window_mode : public waydroid_mode {
+     };
+     std::map<std::string, observed_task> task_content;
+ 
++    /* Layers the compositor cannot import (NV12 video on a SurfaceView): they
++     * are left to SurfaceFlinger, and each card shows its part of the client
++     * target in their place. Indexed like hwLayers; filled in setup_prepare. */
++    std::vector<bool> client_composed;
++    hwc_layer_1 *client_target {};
++    size_t client_target_index {};
++
+     void observe_freeform(waydroid_hwc_composer_device_1 *pdev, hwc_display_contents_1_t *contents);
+ 
+     window *get_window(waydroid_hwc_composer_device_1 *pdev, layer_info &layer_info);
+     window *keyboard_host(waydroid_hwc_composer_device_1 *pdev);
++    int show_client_composed(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t i);
+     static bool can_handle_layer(const hwc_layer_1& layer);
+ 
+   public:
++    int setup_prepare(waydroid_hwc_composer_device_1 *pdev, hwc_display_contents_1_t *contents) override;
+     int prepare(hwc_layer_1 *, size_t) override;
+ 
+     int setup_set(waydroid_hwc_composer_device_1 *pdev, hwc_display_contents_1_t *contents) final;
+-- 
+2.56.0
+
