@@ -21,7 +21,30 @@ cc_prebuilt_library_shared {
     check_elf_files: false,
 }
 
-// Codec2 NVDEC decoder service on /odm. Built here, against this tree's vendor HIDL and Codec2 libraries: their
+// NVENC encoder core (mickys/nvenc, MIT, media-src/core/nvenc/README.md) with its RM services on
+// libnv_bionic_native: C, built as its own library so the service's -Werror stays on our code only.
+cc_library_static {
+    name: "libnvc2_nvenc_core",
+    device_specific: true,
+    compile_multilib: "64",
+    srcs: [
+        "media-src/core/nvenc/rm_shim.c",
+        "media-src/core/nvenc/mickys/*.c",
+    ],
+    export_include_dirs: [
+        "media-src/core/nvenc",
+        "media-src/core/nvenc/mickys",
+        "media-src/core/nvenc/include",
+        "media-src/core/nvenc/include/sdk",
+    ],
+    cflags: [
+        "-Wall",
+        "-Wno-unused-function",
+    ],
+    shared_libs: ["libnv_bionic_native"],
+}
+
+// Codec2 NVDEC decoder / NVENC encoder service on /odm. Built here, against this tree's vendor HIDL and Codec2 libraries: their
 // ABI is Android 17's (no Waydroid host-hwbinder patch in libhwbinder), so a service compiled against the
 // Waydroid LineageOS 20 headers would run with a shifted IBinder vtable and a wrong Parcel size. The native
 // bundle ships this module's output as payload/odm/bin/hw/<name>.
@@ -39,9 +62,12 @@ cc_binary {
     srcs: [
         "media-src/core/nvc2_caps.cpp",
         "media-src/core/nvc2_decoder.cpp",
+        "media-src/core/nvc2_encoder.cpp",
         "media-src/c2/NvC2Component.cpp",
+        "media-src/c2/NvC2Encoder.cpp",
         "media-src/c2/service.cpp",
     ],
+    static_libs: ["libnvc2_nvenc_core"],
     local_include_dirs: [
         "media-src/core",
         "media-src/c2",

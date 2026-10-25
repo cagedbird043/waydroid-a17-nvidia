@@ -3,16 +3,16 @@
 #
 # Ships the host side of waydroid-nvidia (Shiro836/waydroid-nvidia v0.2.0-rc10) with the patches of
 # https://github.com/cagedbird043/waydroid-a17-nvidia (A17 vendor support, KernelSU seccomp, hwcomposer
-# clipboard, host folder sharing, the rc11 video and NVK fixes), the nvidia-prolapse vendor image built from that
-# repository (NVK + ANGLE, NVDEC, freeform cards, host IME), the native bundle it was built against (dual-queue NVK,
-# Rust RM with the rc11 video decoder, Codec2 service built against Android 17) and a KWin script that reopens
-# cards where they were closed.
+# clipboard, host folder sharing, the rc11 video and NVK fixes, NVENC encoders), the nvidia-prolapse vendor image
+# built from that repository (NVK + ANGLE, NVDEC, NVENC, freeform cards, host IME), the native bundle it was built
+# against (dual-queue NVK, Rust RM with the rc11 video decoder and the NVENC encoder, Codec2 service built against
+# Android 17) and a KWin script that reopens cards where they were closed.
 # The Android system image is not included: waydroid-nvidia-setup downloads it (see post_install).
 
 pkgname=waydroid-a17-nvidia-bin
-pkgver=20261025.1
+pkgver=20261025.2
 pkgrel=1
-_tag=a17-20261025-1
+_tag=a17-20261025-2
 _wn_sha=29ffa3a237b0d79a751748bd9bb82c50dd577808      # waydroid-nvidia v0.2.0-rc10 release notes commit
 _wn_tag=v0.2.0-rc10
 _waydroid_sha=a33a5c0b31d89d6ce687381104b30aff4dd2d330

@@ -2,10 +2,10 @@
 
 当前状态、测试结果和移植记录见 `reports/porting.md`。
 
-## 现状（2026-10-24）
+## 现状（2026-10-25）
 
 - system：ATV LineageOS 24.0 GAPPS 版 `20261017`，Play 商店已认证。
-- vendor：自编 nvidia-prolapse；ANGLE → NVK，HWUI skiavk，NVDEC 硬解。
+- vendor：自编 nvidia-prolapse；ANGLE → NVK，HWUI skiavk，NVDEC 硬解，NVENC 硬编（H.264/HEVC/AV1，Chrome WebCodecs 与 WebRTC 已实测）。
 - 多窗口（`persist.waydroid.multi_windows=true`）：freeform 卡片 + 带 KDE 边框的桌面窗口。
 - 宿主输入法：text-input-v3 → `WaydroidHostIme`。
 - 剪贴板：ext-data-control，主机复制经输入法推送进 Android；主机侧 Python 剪贴板服务已删除。
@@ -43,5 +43,5 @@
 - 清空 Waydroid data 后要重新放 `/data/adb/ksud`、装管理器（`kernelsu/README.md` 第 5 步），并重新 `waydroid prop set persist.waydroid.multi_windows true`。
 - `nvidia/waydroid-nvidia` 中 `eec39aa` 及之前的提交不能重写：native bundle 的 BUILD-RECORD 记着从 `eec39aa` 编出，`install.sh --source` 要求本地源码是它的后代。
 - 只重编 NVK 和 Rust RM（几十秒，增量）：在 `nvidia/waydroid-nvidia` 下 `podman run --rm --userns=keep-id --network=none -v $PWD:/work -w /work -e HOME=/work/build/.buildenv-home -e CARGO_HOME=/work/build/.buildenv-home/cargo localhost/nvk-native-a17 python3 nvidia-prolapse/driver-source/native/mesa/build.py --target android --rust-profile release -j 14`（32 位用 `--target android32`）；产物 `build/nvk-{android,android32}/src/nouveau/vulkan/libvulkan_nouveau.so` 和 `build/nv-rm-rust/{x86_64,i686}-linux-android/release/libnv_bionic_native.so`，测试时装进 overlay 的 `vendor/lib64/`、`vendor/lib/`。
-- Codec2 NVDEC 服务在 A17 树里编（`nvidia-product/vendor/nvidia-prolapse/Android.bp`，源码由 `scripts/stage-product.sh` 放进 `media-src/`）：`scripts/build.sh lineage_nvidia_waydroid_x86_64-cp2a-userdebug android.hardware.media.c2@1.2-service-nvprolapse`。native bundle 的 `payload/odm/bin/hw/` 放这个产物（门禁要求镜像里的服务与 bundle 逐字节一致），所以改了服务要编两遍：先编服务、放进 bundle、更新钉选，再编 vendorimage。安卓内测试用 `nvidia-prolapse/media` 的 `make c2-smoke`，推到 `/data/local/tmp` 后 `c2_smoke <视频.mp4>`。
+- Codec2 NVDEC/NVENC 服务在 A17 树里编（`nvidia-product/vendor/nvidia-prolapse/Android.bp`，源码由 `scripts/stage-product.sh` 放进 `media-src/`）：`scripts/build.sh lineage_nvidia_waydroid_x86_64-cp2a-userdebug android.hardware.media.c2@1.2-service-nvprolapse`。native bundle 的 `payload/odm/bin/hw/` 放这个产物（门禁要求镜像里的服务与 bundle 逐字节一致），所以改了服务要编两遍：先编服务、放进 bundle、更新钉选，再编 vendorimage。安卓内测试用 `nvidia-prolapse/media` 的 `make c2-smoke`，推到 `/data/local/tmp` 后 `c2_smoke <视频.mp4>`；编码用 `make c2-enc-smoke`，`c2_enc_smoke <编码器名> <mime> <宽> <高> <输入.nv12> <输出> [kbps]`。
 - 调试：`setprop waydroid.dump_hal 1`（下一帧打印图层、任务、窗口）；`waydroid prop set persist.waydroid.clipboard_debug true` 后重启会话（logcat `hwcomposer` 的 `clipboard:` 行）。

@@ -1,0 +1,169 @@
+From e053374b7b307dae1b98071afb5963103c5c5aa6 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sun, 25 Oct 2026 20:50:17 +0800
+Subject: [PATCH 20/20] =?utf-8?q?waydroid=EF=BC=9A[properties]=20=E4=B8=AD?=
+ =?utf-8?q?=E8=AE=BE=E7=BD=AE=E7=BC=96=E7=A0=81=E5=BC=80=E5=85=B3=20persis?=
+ =?utf-8?q?t.waydroid.nvidia=5Fvideo=5Fencode=20=E5=90=8C=E6=A0=B7?=
+ =?utf-8?q?=E6=8B=92=E7=BB=9D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ waydroid/0001-lxc-nvidia-native-mounts.patch | 24 ++++++++++++--------
+ waydroid/README.md                           |  4 ++--
+ waydroid/nvidia_native.py                    | 20 +++++++++-------
+ waydroid/test_nvidia_native.py               | 12 ++++++----
+ 4 files changed, 35 insertions(+), 25 deletions(-)
+
+diff --git a/waydroid/0001-lxc-nvidia-native-mounts.patch b/waydroid/0001-lxc-nvidia-native-mounts.patch
+index 83ab093..9c0df0c 100644
+--- a/waydroid/0001-lxc-nvidia-native-mounts.patch
++++ b/waydroid/0001-lxc-nvidia-native-mounts.patch
+@@ -213,10 +213,10 @@ index b70dcf1..8a40c5a 100644
+      tools.helpers.run.user(args, command, output="background")
+ diff --git a/tools/helpers/nvidia_native.py b/tools/helpers/nvidia_native.py
+ new file mode 100755
+-index 0000000..907b25c
++index 0000000..dca0130
+ --- /dev/null
+ +++ b/tools/helpers/nvidia_native.py
+-@@ -0,0 +1,1850 @@
++@@ -0,0 +1,1854 @@
+ +#!/usr/bin/env python3
+ +# waydroid-nvidia-prolapse: LXC mount entries and property rules for NVIDIA-native mode.
+ +# SPDX-License-Identifier: GPL-3.0-or-later
+@@ -747,7 +747,7 @@ index 0000000..907b25c
+ +
+ +def check_properties(props, dm):
+ +    """Raise OSError if waydroid.cfg [properties] sets a mode-derived property (or, in the native
+-+    modes, the runtime-only decode route switch)."""
+++    modes, a runtime-only decode/encode route switch)."""
+ +    derived = [key for key in derived_properties() if key in props]
+ +    if derived:
+ +        want = ", ".join("{}={}".format(k, v if v is not None else "(absent)") for k, v in mode_properties(dm))
+@@ -755,13 +755,14 @@ index 0000000..907b25c
+ +                      "[waydroid] {}/{} (and, for the Codec2 listing, from the root's media record): this mode "
+ +                      "writes {}. Delete them from {} [properties] and re-run 'waydroid upgrade -o' ({} does "
+ +                      "both)".format(dm.mode, ", ".join(derived), MODE_KEY, GL_KEY, want, CFG_PATH, SWITCH_TOOL))
+-+    if dm.native and DECODE_ROUTE_PROPERTY in props:
+++    routes = [key for key in ROUTE_PROPERTIES if key in props] if dm.native else []
+++    if routes:
+ +        # persist.* set at runtime is saved in the guest's /data/property and loaded after
+ +        # waydroid_base.prop, so a [properties] entry would be silently shadowed by it.
+-+        raise OSError("NVIDIA native mode: waydroid.cfg [properties] sets {0}; that switch is runtime-only. "
+-+                      "Delete it from /var/lib/waydroid/waydroid.cfg, re-run 'waydroid upgrade -o', and use "
+-+                      "'waydroid prop set {0} on|off' (applies live, persists across restarts).".format(
+-+                          DECODE_ROUTE_PROPERTY))
+++        raise OSError("NVIDIA native mode: waydroid.cfg [properties] sets {0}; these switches are runtime-only. "
+++                      "Delete them from /var/lib/waydroid/waydroid.cfg, re-run 'waydroid upgrade -o', and use "
+++                      "'waydroid prop set <property> on|off' (applies live, persists across restarts).".format(
+++                          ", ".join(routes)))
+ +
+ +
+ +def check_base_prop(path, dm):
+@@ -1242,9 +1243,12 @@ index 0000000..907b25c
+ +# back ahead of c2.android.* and keep both behind the hardware decoders. Measured 2026-10-14 in the
+ +# guest (process-local MediaCodecList): vp9/av1/hevc/avc -> c2.nvprolapse.* first, software types
+ +# (aac, mp3, mpeg4, vp8) -> OMX.google.* first as with ccodec=0, c2.android.* listed last.
+-+# Runtime route switch read by the Codec2 service on every list/create (nvidia-prolapse/media
+-+# c2/NvC2Component.h kRouteProp): unset/on -> c2.nvprolapse.*, off -> the image's software decoders.
+++# Runtime route switches read by the Codec2 service on every list/create (nvidia-prolapse/media
+++# c2/NvC2Component.h kRouteProp, c2/NvC2Encoder.h kEncodeRouteProp): unset/on -> c2.nvprolapse.*,
+++# off -> the image's software decoders/encoders.
+ +DECODE_ROUTE_PROPERTY = "persist.waydroid.nvidia_video_decode"
+++ENCODE_ROUTE_PROPERTY = "persist.waydroid.nvidia_video_encode"
+++ROUTE_PROPERTIES = (DECODE_ROUTE_PROPERTY, ENCODE_ROUTE_PROPERTY)
+ +MEDIA_BASE_PROPERTIES = (
+ +    ("debug.stagefright.ccodec", "4"),
+ +    ("debug.stagefright.omx_default_rank.sw-audio", "4"),    # below c2.android.* audio (8)
+diff --git a/waydroid/README.md b/waydroid/README.md
+index e4b3c3f..be67fc5 100644
+--- a/waydroid/README.md
++++ b/waydroid/README.md
+@@ -77,8 +77,8 @@ waydroid prop set persist.waydroid.nvidia_video_encode off   # software encoders
+ waydroid prop set persist.waydroid.nvidia_video_encode on    # NVENC (default)
+ ```
+ 
+-Use `waydroid prop set`, not `[properties]`. Running apps pick up the change on their next codec; apps started
+-afterwards see the new codec list. `logcat -s nvc2 nvc2-enc` shows the service's log.
++Use `waydroid prop set`, not `[properties]` (those entries are refused). Running apps pick up the change on their
++next codec; apps started afterwards see the new codec list. `logcat -s nvc2 nvc2-enc` shows the service's log.
+ 
+ ## Shared folders
+ 
+diff --git a/waydroid/nvidia_native.py b/waydroid/nvidia_native.py
+index 907b25c..dca0130 100755
+--- a/waydroid/nvidia_native.py
++++ b/waydroid/nvidia_native.py
+@@ -528,7 +528,7 @@ def apply_mode_properties(props, dm):
+ 
+ def check_properties(props, dm):
+     """Raise OSError if waydroid.cfg [properties] sets a mode-derived property (or, in the native
+-    modes, the runtime-only decode route switch)."""
++    modes, a runtime-only decode/encode route switch)."""
+     derived = [key for key in derived_properties() if key in props]
+     if derived:
+         want = ", ".join("{}={}".format(k, v if v is not None else "(absent)") for k, v in mode_properties(dm))
+@@ -536,13 +536,14 @@ def check_properties(props, dm):
+                       "[waydroid] {}/{} (and, for the Codec2 listing, from the root's media record): this mode "
+                       "writes {}. Delete them from {} [properties] and re-run 'waydroid upgrade -o' ({} does "
+                       "both)".format(dm.mode, ", ".join(derived), MODE_KEY, GL_KEY, want, CFG_PATH, SWITCH_TOOL))
+-    if dm.native and DECODE_ROUTE_PROPERTY in props:
++    routes = [key for key in ROUTE_PROPERTIES if key in props] if dm.native else []
++    if routes:
+         # persist.* set at runtime is saved in the guest's /data/property and loaded after
+         # waydroid_base.prop, so a [properties] entry would be silently shadowed by it.
+-        raise OSError("NVIDIA native mode: waydroid.cfg [properties] sets {0}; that switch is runtime-only. "
+-                      "Delete it from /var/lib/waydroid/waydroid.cfg, re-run 'waydroid upgrade -o', and use "
+-                      "'waydroid prop set {0} on|off' (applies live, persists across restarts).".format(
+-                          DECODE_ROUTE_PROPERTY))
++        raise OSError("NVIDIA native mode: waydroid.cfg [properties] sets {0}; these switches are runtime-only. "
++                      "Delete them from /var/lib/waydroid/waydroid.cfg, re-run 'waydroid upgrade -o', and use "
++                      "'waydroid prop set <property> on|off' (applies live, persists across restarts).".format(
++                          ", ".join(routes)))
+ 
+ 
+ def check_base_prop(path, dm):
+@@ -1023,9 +1024,12 @@ def media_enabled(manifest):
+ # back ahead of c2.android.* and keep both behind the hardware decoders. Measured 2026-10-14 in the
+ # guest (process-local MediaCodecList): vp9/av1/hevc/avc -> c2.nvprolapse.* first, software types
+ # (aac, mp3, mpeg4, vp8) -> OMX.google.* first as with ccodec=0, c2.android.* listed last.
+-# Runtime route switch read by the Codec2 service on every list/create (nvidia-prolapse/media
+-# c2/NvC2Component.h kRouteProp): unset/on -> c2.nvprolapse.*, off -> the image's software decoders.
++# Runtime route switches read by the Codec2 service on every list/create (nvidia-prolapse/media
++# c2/NvC2Component.h kRouteProp, c2/NvC2Encoder.h kEncodeRouteProp): unset/on -> c2.nvprolapse.*,
++# off -> the image's software decoders/encoders.
+ DECODE_ROUTE_PROPERTY = "persist.waydroid.nvidia_video_decode"
++ENCODE_ROUTE_PROPERTY = "persist.waydroid.nvidia_video_encode"
++ROUTE_PROPERTIES = (DECODE_ROUTE_PROPERTY, ENCODE_ROUTE_PROPERTY)
+ MEDIA_BASE_PROPERTIES = (
+     ("debug.stagefright.ccodec", "4"),
+     ("debug.stagefright.omx_default_rank.sw-audio", "4"),    # below c2.android.* audio (8)
+diff --git a/waydroid/test_nvidia_native.py b/waydroid/test_nvidia_native.py
+index d07b42e..76f6256 100644
+--- a/waydroid/test_nvidia_native.py
++++ b/waydroid/test_nvidia_native.py
+@@ -813,12 +813,14 @@ class DriverModeTest(unittest.TestCase):
+                     for needle in (key, mode, "nvidia_driver_mode", "Delete them", "upgrade -o", "dev/driver-mode"):
+                         self.assertIn(needle, msg)
+ 
+-    def test_decode_route_property_refused_in_native_modes(self):
++    def test_route_properties_refused_in_native_modes(self):
+         for mode in ("nvidia-prolapse", "glibc-shim"):
+-            with self.subTest(mode=mode):
+-                with self.assertRaises(OSError) as cm:
+-                    nn.check_properties({nn.DECODE_ROUTE_PROPERTY: "off"}, nn.driver_mode(self.cfg(mode)))
+-                self.assertIn("waydroid prop set", str(cm.exception))
++            for key in (nn.DECODE_ROUTE_PROPERTY, nn.ENCODE_ROUTE_PROPERTY):
++                with self.subTest(mode=mode, key=key):
++                    with self.assertRaises(OSError) as cm:
++                        nn.check_properties({key: "off"}, nn.driver_mode(self.cfg(mode)))
++                    self.assertIn(key, str(cm.exception))
++                    self.assertIn("waydroid prop set", str(cm.exception))
+ 
+     def test_check_base_prop(self):
+         dm = nn.driver_mode(self.cfg("venus"))
+-- 
+2.56.0
+

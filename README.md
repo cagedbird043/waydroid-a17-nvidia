@@ -21,7 +21,7 @@ Waydroid with Android 17 (LineageOS 24.0), hardware acceleration on NVIDIA GPUs,
 
 ### Features
 
-- **NVIDIA acceleration**: ANGLE → NVK (dual graphics queues) → NVIDIA kernel driver. HWUI renders with Vulkan (skiavk). H.264, HEVC, VP9 and AV1 are decoded on NVDEC.
+- **NVIDIA acceleration**: ANGLE → NVK (dual graphics queues) → NVIDIA kernel driver. HWUI renders with Vulkan (skiavk). H.264, HEVC, VP9 and AV1 are decoded on NVDEC; H.264 (Constrained Baseline, Main, High), HEVC and AV1 are encoded on NVENC, which Chrome uses for WebCodecs and WebRTC. `waydroid prop set persist.waydroid.nvidia_video_decode off` or `persist.waydroid.nvidia_video_encode off` switches either side back to the software codecs.
 - **Multi-window**: after `waydroid prop set persist.waydroid.multi_windows true`, every Android app gets its own KDE window. KWin draws the title bar and handles moving, resizing and closing. `waydroid show-full-ui` opens the Android desktop in one KDE window; when it is closed, apps return to their own windows.
 - **Window positions**: the optional KWin script `host/kwin-waydroid-placement` reopens each app window where it was last closed. Positions are stored in `~/.config/kwin-waydroid-placement.conf` and survive logout.
 - **Mouse as touch**: some apps (Play Store and other Jetpack Compose UIs) ignore mouse drags. `waydroid prop set persist.waydroid.fake_touch "com.android.vending,..."` turns a left-button drag in the listed apps into a one-finger touch; a trailing `*` matches a package prefix and `*` alone matches every app. Changes apply on the next click.
@@ -82,7 +82,7 @@ You need podman and plenty of disk space: about 100 GB of source plus build outp
 
 1. Build the container: `podman build --build-arg ROOT="$PWD" -t localhost/waydroid-a17-build container`. `scripts/build.sh` mounts the project at the same path inside the container, because the Mesa cross build uses lld from the tree.
 2. `scripts/sync.sh` syncs LineageOS 24.0 and the ATV manifest into `src/`, then runs `apply-waydroid-patches`.
-3. Apply `git am patches/<repo>/*.patch` on the base of each repository below, then run `scripts/stage-product.sh`: it copies `nvidia-product/` to `src/vendor/nvidia-prolapse`, together with the pinned native bundle and the sources of the Codec2 NVDEC service, which is built in the Android 17 tree.
+3. Apply `git am patches/<repo>/*.patch` on the base of each repository below, then run `scripts/stage-product.sh`: it copies `nvidia-product/` to `src/vendor/nvidia-prolapse`, together with the pinned native bundle and the sources of the Codec2 NVDEC/NVENC service, which is built in the Android 17 tree.
 4. `scripts/build.sh lineage_nvidia_waydroid_x86_64-cp2a-userdebug vendorimage`
 
 To test a single module, build it (for example `hwcomposer.waydroid`), copy the file from `out/.../vendor/` into the same path under `/var/lib/waydroid/overlay/vendor/`, and restart the session.
@@ -104,7 +104,7 @@ To test a single module, build it (for example `hwcomposer.waydroid`), copy the 
 | Path | Contents |
 |---|---|
 | `patches/<repo>/` | Local commits on each source repository (`git format-patch`) |
-| `nvidia-product/` | The `vendor/nvidia-prolapse` product layer, from waydroid-nvidia v0.2.0-rc10, adapted to Android 17; the Codec2 NVDEC service is built from source against the Android 17 libraries |
+| `nvidia-product/` | The `vendor/nvidia-prolapse` product layer, from waydroid-nvidia v0.2.0-rc10, adapted to Android 17; the Codec2 NVDEC/NVENC service is built from source against the Android 17 libraries |
 | `container/` | Build container |
 | `scripts/` | Sync, patch, build and benchmark scripts, written for the author's directory layout |
 | `host/` | systemd service that loads KernelSU at boot; the KWin placement script |
@@ -121,6 +121,7 @@ Original scripts, documentation and code in this repository are under the [MIT](
 - [Shiro836/waydroid-nvidia](https://github.com/Shiro836/waydroid-nvidia): the nvidia-prolapse mode, the NVK and Rust RM native driver bundle, ANGLE, the NVDEC Codec2 component, and most of the hwcomposer fixes. This project would not exist without it.
 - [WayDroid-ATV](https://github.com/WayDroid-ATV) (supechicken): the Android 17 system image and device tree, and KernelSU support for Waydroid ([supechicken/KernelSU](https://github.com/supechicken/KernelSU)).
 - [Waydroid](https://github.com/waydroid/waydroid), [LineageOS](https://lineageos.org), [KernelSU](https://github.com/tiann/KernelSU), [Mesa](https://mesa3d.org) (NVK), [ANGLE](https://chromium.googlesource.com/angle/angle).
+- [mickys/nvenc](https://github.com/mickys/nvenc) (MIT): the NVENC encoder core, and [NVIDIA/open-gpu-doc](https://github.com/NVIDIA/open-gpu-doc) for the NVENC class headers.
 - The authors of the wayland-protocols `text-input-v3` and `ext-data-control-v1`.
 
 ---
@@ -142,7 +143,7 @@ Waydroid 整合版：Android 17（LineageOS 24.0）+ NVIDIA 显卡硬件加速 +
 
 ### 功能
 
-- **NVIDIA 加速**：ANGLE → NVK（双图形队列）→ NVIDIA 内核驱动。HWUI 用 Vulkan 渲染（skiavk）。H.264、HEVC、VP9、AV1 由 NVDEC 硬解。
+- **NVIDIA 加速**：ANGLE → NVK（双图形队列）→ NVIDIA 内核驱动。HWUI 用 Vulkan 渲染（skiavk）。H.264、HEVC、VP9、AV1 由 NVDEC 硬解；H.264（Constrained Baseline、Main、High）、HEVC、AV1 由 NVENC 硬编，Chrome 的 WebCodecs 和 WebRTC 会用它。`waydroid prop set persist.waydroid.nvidia_video_decode off` 或 `persist.waydroid.nvidia_video_encode off` 可分别切回软件编解码。
 - **多窗口**：执行 `waydroid prop set persist.waydroid.multi_windows true` 后，每个 Android 应用一个 KDE 窗口，标题栏、拖动、缩放、关闭都由 KWin 处理。`waydroid show-full-ui` 在一个 KDE 窗口里打开 Android 桌面，关掉后应用回到各自的窗口。
 - **记住窗口位置**：可选的 KWin 脚本 `host/kwin-waydroid-placement` 让应用窗口重开时回到上次关闭的位置。位置存在 `~/.config/kwin-waydroid-placement.conf`，注销后仍在。
 - **鼠标当触摸**：有些应用（Play 商店等 Jetpack Compose 界面）不响应鼠标拖动。`waydroid prop set persist.waydroid.fake_touch "com.android.vending,..."` 让列出的应用里鼠标左键拖动变成单指触摸；结尾带 `*` 按包名前缀匹配，只写 `*` 匹配所有应用。改完下次点击就生效。
@@ -203,7 +204,7 @@ waydroid session start
 
 1. 编译容器：`podman build --build-arg ROOT="$PWD" -t localhost/waydroid-a17-build container`。`scripts/build.sh` 把项目目录按原路径挂进容器，因为 Mesa 交叉编译要用树里的 lld。
 2. `scripts/sync.sh`：同步 LineageOS 24.0 和 ATV manifest 到 `src/`，再执行 `apply-waydroid-patches`。
-3. 在下表各仓库的基线上 `git am patches/<仓库>/*.patch`，再运行 `scripts/stage-product.sh`：它把 `nvidia-product/` 复制到 `src/vendor/nvidia-prolapse`，同时放入钉选的 native bundle 和 Codec2 NVDEC 服务的源码（该服务在 Android 17 树里编译）。
+3. 在下表各仓库的基线上 `git am patches/<仓库>/*.patch`，再运行 `scripts/stage-product.sh`：它把 `nvidia-product/` 复制到 `src/vendor/nvidia-prolapse`，同时放入钉选的 native bundle 和 Codec2 NVDEC/NVENC 服务的源码（该服务在 Android 17 树里编译）。
 4. `scripts/build.sh lineage_nvidia_waydroid_x86_64-cp2a-userdebug vendorimage`
 
 只想测一个模块时，单独编它（例如 `hwcomposer.waydroid`），把 `out/.../vendor/` 下的文件放进 `/var/lib/waydroid/overlay/vendor/` 的相同路径，重启会话即可。
@@ -225,7 +226,7 @@ waydroid session start
 | 路径 | 内容 |
 |---|---|
 | `patches/<仓库>/` | 各源码仓库上的本地提交（`git format-patch`） |
-| `nvidia-product/` | `vendor/nvidia-prolapse` product 层，来自 waydroid-nvidia v0.2.0-rc10，已适配 Android 17；Codec2 NVDEC 服务从源码编译，链接 Android 17 的库 |
+| `nvidia-product/` | `vendor/nvidia-prolapse` product 层，来自 waydroid-nvidia v0.2.0-rc10，已适配 Android 17；Codec2 NVDEC/NVENC 服务从源码编译，链接 Android 17 的库 |
 | `container/` | 编译容器 |
 | `scripts/` | 同步、打补丁、编译、跑分脚本，按作者本机的目录布局写的 |
 | `host/` | 宿主机开机加载 KernelSU 的 systemd 服务；记住窗口位置的 KWin 脚本 |
@@ -242,4 +243,5 @@ waydroid session start
 - [Shiro836/waydroid-nvidia](https://github.com/Shiro836/waydroid-nvidia)：nvidia-prolapse 模式、NVK 与 Rust RM 原生驱动包、ANGLE、NVDEC Codec2 组件，以及大部分 hwcomposer 修正。没有它就没有这个项目。
 - [WayDroid-ATV](https://github.com/WayDroid-ATV)（supechicken）：Android 17 system 镜像与设备树；KernelSU 的 Waydroid 支持（[supechicken/KernelSU](https://github.com/supechicken/KernelSU)）。
 - [Waydroid](https://github.com/waydroid/waydroid)、[LineageOS](https://lineageos.org)、[KernelSU](https://github.com/tiann/KernelSU)、[Mesa](https://mesa3d.org)（NVK）、[ANGLE](https://chromium.googlesource.com/angle/angle)。
+- [mickys/nvenc](https://github.com/mickys/nvenc)（MIT）：NVENC 编码核心；[NVIDIA/open-gpu-doc](https://github.com/NVIDIA/open-gpu-doc) 提供 NVENC 类头文件。
 - wayland-protocols 中 `text-input-v3`、`ext-data-control-v1` 的作者们。
