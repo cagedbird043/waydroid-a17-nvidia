@@ -1,2 +1,9 @@
 *.img
 *.zst
+# release assets and makepkg downloads/products
+vendor.img.zst.part*
+vendor.img.zst.sha256
+aur/*/src/
+aur/*/pkg/
+aur/*/*.tar.gz
+aur/*/*.part0*

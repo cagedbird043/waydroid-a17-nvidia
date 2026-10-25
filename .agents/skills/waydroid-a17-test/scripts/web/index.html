@@ -1,0 +1,74 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>waydroid-a17 encode test</title>
+<style>body { font: 15px sans-serif; } pre { white-space: pre-wrap; }</style>
+<h3>WebCodecs + WebRTC hardware encode</h3>
+<pre id="log">running… (about 40 s)</pre>
+<script>
+// Encodes a moving 720p canvas: WebCodecs (prefer-hardware, a key frame requested at frame 30) for each codec,
+// then an 8 s WebRTC loopback per codec. Results are shown here; the service side is logged by
+// `logcat -s nvc2-enc` (one "c2.nvprolapse.<codec>.encoder: WxH, ..." line per encoder opened).
+const log = (s) => { document.getElementById('log').textContent += '\n' + s; };
+const W = 1280, H = 720;
+const canvas = document.createElement('canvas'); canvas.width = W; canvas.height = H;
+const g = canvas.getContext('2d');
+let n = 0;
+const draw = () => {
+  g.fillStyle = `hsl(${(n * 3) % 360},60%,45%)`; g.fillRect(0, 0, W, H);
+  for (let k = 0; k < 150; k++) {
+    g.fillStyle = `rgb(${(k * 37 + n) % 255},${(k * 91) % 255},${(k * 13 + n * 3) % 255})`;
+    g.fillRect((k * 61 + n * 9) % W, (k * 29 + n * 4) % H, 32, 32);
+  }
+  n++;
+};
+setInterval(draw, 33);
+
+async function webcodecs(codec) {
+  const cfg = { codec, width: W, height: H, bitrate: 3_000_000, framerate: 30, hardwareAcceleration: 'prefer-hardware' };
+  const r = { codec, supported: (await VideoEncoder.isConfigSupported(cfg)).supported };
+  if (!r.supported) return r;
+  let out = 0, keys = 0, bytes = 0; const errs = [];
+  const enc = new VideoEncoder({ output: (c) => { out++; bytes += c.byteLength; if (c.type === 'key') keys++; },
+                                 error: (e) => errs.push(String(e)) });
+  enc.configure(cfg);
+  for (let i = 0; i < 60; i++) {
+    draw();
+    const f = new VideoFrame(canvas, { timestamp: i * 33333 });
+    enc.encode(f, { keyFrame: i === 30 }); f.close();
+    while (enc.encodeQueueSize > 4) await new Promise((res) => setTimeout(res, 1));
+  }
+  await enc.flush(); enc.close();
+  return Object.assign(r, { out, keys, kbps: Math.round(bytes * 8 / 2 / 1000), errs });
+}
+
+async function rtc(mime) {
+  const stream = canvas.captureStream(30);
+  const pick = RTCRtpSender.getCapabilities('video').codecs.filter((c) => c.mimeType === mime);
+  if (!pick.length) return { mime, error: 'not offered' };
+  const a = new RTCPeerConnection(), b = new RTCPeerConnection();
+  a.onicecandidate = (e) => e.candidate && b.addIceCandidate(e.candidate);
+  b.onicecandidate = (e) => e.candidate && a.addIceCandidate(e.candidate);
+  const tr = a.addTransceiver(stream.getVideoTracks()[0], { direction: 'sendonly' });
+  tr.setCodecPreferences(pick);
+  const p = tr.sender.getParameters(); p.encodings[0].maxBitrate = 2_500_000; await tr.sender.setParameters(p);
+  await a.setLocalDescription(); await b.setRemoteDescription(a.localDescription);
+  await b.setLocalDescription(); await a.setRemoteDescription(b.localDescription);
+  await new Promise((res) => setTimeout(res, 8000));
+  const r = { mime };
+  for (const s of (await a.getStats()).values()) if (s.type === 'outbound-rtp')
+    Object.assign(r, { encoded: s.framesEncoded, size: `${s.frameWidth}x${s.frameHeight}`, fps: s.framesPerSecond,
+                       kbps: Math.round(s.bytesSent * 8 / 8000), limit: s.qualityLimitationReason });
+  for (const s of (await b.getStats()).values()) if (s.type === 'inbound-rtp') r.decoded = s.framesDecoded;
+  a.close(); b.close(); stream.getTracks().forEach((t) => t.stop());
+  return r;
+}
+
+(async () => {
+  for (const c of ['avc1.42001f', 'avc1.640028', 'hvc1.1.6.L93.B0', 'av01.0.04M.08'])
+    log('webcodecs ' + JSON.stringify(await webcodecs(c).catch((e) => ({ codec: c, error: String(e) }))));
+  for (const m of ['video/H264', 'video/H265', 'video/AV1'])
+    log('webrtc ' + JSON.stringify(await rtc(m).catch((e) => ({ mime: m, error: String(e) }))));
+  log('DONE');
+})();
+</script>
