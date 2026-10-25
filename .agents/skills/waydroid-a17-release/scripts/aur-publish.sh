@@ -12,7 +12,10 @@ gh release view "$TAG" >/dev/null
 cd "$A"
 rm -rf src pkg "waydroid-a17-nvidia-$TAG.tar.gz" vendor-"$TAG".img.zst.part* \
     "waydroid-a17-nvidia-native-x86_64-$TAG.tar.zst" ./*.pkg.tar.zst
-updpkgsums
+# GitHub release downloads drop now and then (TLS EOF); files already fetched are kept between attempts
+ok=
+for _ in 1 2 3 4 5; do updpkgsums && { ok=1; break; }; sleep 15; done
+[ -n "$ok" ] || { echo "aur-publish: downloads kept failing" >&2; exit 1; }
 makepkg -fC > /tmp/wd-makepkg.log 2>&1 || { tail -20 /tmp/wd-makepkg.log; exit 1; }
 makepkg --printsrcinfo > .SRCINFO
 rm -rf src pkg
