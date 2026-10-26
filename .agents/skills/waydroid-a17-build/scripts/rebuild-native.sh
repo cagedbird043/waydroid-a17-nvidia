@@ -10,10 +10,11 @@ REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 WS=${WAYDROID_A17_WS:-$(dirname "$REPO")}
 W=$WS/nvidia/waydroid-nvidia
 cd "$W"
-NDK=$W/build/hwcomposer-work/ndk/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin
+# The checkout is mounted at /work: the Mesa worktrees, meson build trees and build records all store /work paths.
+NDK=/work/build/hwcomposer-work/ndk/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin
 run() {
-    podman run --rm --userns=keep-id -v "$W:$W" -w "$W" -e HOME="$W/build/.buildenv-home" \
-        -e CARGO_HOME="$W/build/.buildenv-home/cargo" -e PROLAPSE_ROOT="$W" \
+    podman run --rm --userns=keep-id -v "$W:/work" -w /work -e HOME=/work/build/.buildenv-home \
+        -e CARGO_HOME=/work/build/.buildenv-home/cargo -e PROLAPSE_ROOT=/work \
         -e CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$NDK/x86_64-linux-android33-clang" \
         -e CARGO_TARGET_I686_LINUX_ANDROID_LINKER="$NDK/i686-linux-android33-clang" \
         localhost/nvk-native-a17 bash -c "$1"
@@ -33,7 +34,7 @@ run "set -e; for t in android android32; do python3 $B --target \$t --rust-profi
 run "set -e; for t in android android32; do python3 $B --gl --target \$t --skip-prepare --download-deps --rust-profile release -j 14; done" \
     > /tmp/nvrm-build.log 2>&1 || { tail -20 /tmp/nvrm-build.log; exit 1; }
 rm -f nvidia-prolapse/media/out/android/nvc2-xmlgen
-run "make -s -C nvidia-prolapse/media xmlgen-android NV_VIDEO_ANDROID_LIB='-L$W/build/nv-rm-rust/x86_64-linux-android/release -lnv_bionic_native'"
+run "make -s -C nvidia-prolapse/media xmlgen-android NV_VIDEO_ANDROID_LIB='-L/work/build/nv-rm-rust/x86_64-linux-android/release -lnv_bionic_native'"
 for t in android android32; do
     python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print(sys.argv[2], "nvrm head", r["driver_source_head"][:12], "dirty", r["driver_source_dirty"], "rust", r["rust"]["sha256"][:12])' \
         "build/nvrm-$t/nvrm-build.json" "$t"

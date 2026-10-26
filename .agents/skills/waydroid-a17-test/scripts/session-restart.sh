@@ -5,7 +5,8 @@ set -uo pipefail
 waydroid session stop >/dev/null 2>&1
 sleep 3
 : > /tmp/wd-session-mw.log
-setsid -f sh -c 'waydroid session start > /tmp/wd-session-mw.log 2>&1'
+# the detached shell must not keep the caller's stdout open, or `session-restart.sh | tail` never returns
+setsid -f sh -c 'waydroid session start > /tmp/wd-session-mw.log 2>&1' </dev/null >/dev/null 2>&1
 for _ in $(seq 1 90); do
     grep -qE 'ready|OSError' /tmp/wd-session-mw.log && break
     sleep 2
