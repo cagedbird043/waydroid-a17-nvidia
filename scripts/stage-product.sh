@@ -53,5 +53,5 @@ src=$TREE/vendor/nvidia-prolapse/media-src
 mkdir -p "$src/core" "$src/c2" "$src/video"
 rsync -rlp --checksum --delete "$WN/media/core/" "$src/core/"
 rsync -rlp --checksum --delete "$WN/media/c2/" "$src/c2/"
-rsync -rlp --checksum --delete "$WN/driver-source/native/video/nv_video.h" "$WN/driver-source/native/video/nv_venc.h" "$src/video/"
+rsync -rlp --checksum --delete "$WN/driver-source/native/video/nv_video.h" "$WN/driver-source/native/video/nv_venc.h" "$WN/driver-source/native/video/nv_c2_caps.h" "$src/video/"
 echo "product layer staged: $version build_record=$rec_sha"

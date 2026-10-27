@@ -45,6 +45,22 @@ $S/rebuild-native.sh            # Rust RM → NVK → nvrm（32/64 位）→ nvc
 $S/rebuild-native.sh --rust-only   # 只编 Rust 库，测试用，不能发版
 ```
 
+`nvc2-xmlgen` 是 RM crate 的 `xmlgen-cli` 非默认 feature bin，仅动态调用 RM C ABI。
+RM 先编好，再用 Make 的 Cargo 适配目标（每次由 Cargo 判断增量）：
+
+```bash
+make -C "$WS/nvidia/waydroid-nvidia/nvidia-prolapse/media" xmlgen \
+  RUST_PROFILE=release CARGO_TARGET_DIR="$WS/nvidia/waydroid-nvidia/build/nv-rm-rust" \
+  NV_C2_RM_LIB_DIR="$WS/nvidia/waydroid-nvidia/build/nv-rm-rust/release"
+# bionic：同一目标目录，选 Android RM，并显式传 NDK C linker（不是 clang++）
+make -C "$WS/nvidia/waydroid-nvidia/nvidia-prolapse/media" xmlgen-android \
+  RUST_PROFILE=release CARGO_TARGET_DIR="$WS/nvidia/waydroid-nvidia/build/nv-rm-rust" \
+  NV_C2_RM_LIB_DIR="$WS/nvidia/waydroid-nvidia/build/nv-rm-rust/x86_64-linux-android/release" \
+  RUST_LINKER="$WS/nvidia/waydroid-nvidia/build/hwcomposer-work/ndk/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android33-clang"
+```
+
+两目标均检查 ELF64、RM 动态依赖与 caps/XML 导入；Android 产物还要求 linker64，禁止 GNU libc 与开发机 RUNPATH。
+
 nvrm 记录它链接的 Rust 库哈希，门禁拿它和 payload 里的 `libnv_bionic_native.so` 比；只换 Rust 库不重编 nvrm，
 `waydroid-nvidia-setup` 会报 `nvrm (x86_64) was linked against libnv_bionic_native.so …`。
 

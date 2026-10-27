@@ -33,8 +33,7 @@ run "set -e; for t in android android32; do python3 $B --target \$t --rust-profi
     || { tail -20 /tmp/nvk-build.log; exit 1; }
 run "set -e; for t in android android32; do python3 $B --gl --target \$t --skip-prepare --download-deps --rust-profile release -j 14; done" \
     > /tmp/nvrm-build.log 2>&1 || { tail -20 /tmp/nvrm-build.log; exit 1; }
-rm -f nvidia-prolapse/media/out/android/nvc2-xmlgen
-run "make -s -C nvidia-prolapse/media xmlgen-android NV_VIDEO_ANDROID_LIB='-L/work/build/nv-rm-rust/x86_64-linux-android/release -lnv_bionic_native'"
+run "make -s -C nvidia-prolapse/media xmlgen-android RUST_PROFILE=release NV_C2_RM_LIB_DIR=/work/build/nv-rm-rust/x86_64-linux-android/release CARGO_TARGET_DIR=/work/build/nv-rm-rust RUST_LINKER=$NDK/x86_64-linux-android33-clang"
 for t in android android32; do
     python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print(sys.argv[2], "nvrm head", r["driver_source_head"][:12], "dirty", r["driver_source_dirty"], "rust", r["rust"]["sha256"][:12])' \
         "build/nvrm-$t/nvrm-build.json" "$t"
