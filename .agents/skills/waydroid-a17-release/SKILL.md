@@ -17,7 +17,7 @@ tag `a17-YYYYMMDD-N`（同一天第 N 版），pkgver `YYYYMMDD.N`。native bund
 3. **提交版本号**：`$R/package.sh <tag>` 第一次会改 PKGBUILD 的 `_tag`/`pkgver` 后退出；把它和第 1、2 步的改动
    一起提交为 `发版 <tag>：<一句话>`（正文列要点）。
 4. **打包**：`$R/package.sh <tag>`：压缩分块镜像、打 bundle、放进 `aur/waydroid-a17-nvidia-bin/`、`makepkg`。
-   分块数必须等于 PKGBUILD `source` 里的 part 数（脚本会检查）。
+   分块默认 5 MiB，数量必须等于 PKGBUILD `_vendor_parts`（脚本会检查）；仅重切已有压缩镜像可用 `package.sh <tag> --resplit`，不重建镜像或 native bundle。`VENDOR_PART_SIZE` 可指定分块大小。
 5. **安装 + 门禁**：`$R/install-gate.sh <pkgver>`。要看到 `Release gate PASS: 22 cases + media` 和
    `Installed the nvidia-prolapse vendor image <bundle 名>`。
 6. **回归**（`waydroid-a17-test` skill）：会话起来、GLES 是 ANGLE/NVK、`codec-smoke.sh`、`web-encode-test.sh`，
@@ -27,14 +27,14 @@ tag `a17-YYYYMMDD-N`（同一天第 N 版），pkgver `YYYYMMDD.N`。native bund
    断了就对同一个文件重跑 `--clobber`：
    ```bash
    gh release create <tag> --draft --title "vendor <tag>" --notes-file <说明>
-   for f in vendor.img.zst.part0* vendor.img.zst.sha256 waydroid-a17-nvidia-native-x86_64.tar.zst; do
+   for f in vendor.img.zst.part[0-9][0-9] vendor.img.zst.sha256 waydroid-a17-nvidia-native-x86_64.tar.zst; do
        gh release upload <tag> "$f" --clobber
    done
    gh release edit <tag> --draft=false --latest
    ```
    说明格式见 [references/release-notes.md](references/release-notes.md)。发布前用
    `gh api repos/cagedbird043/waydroid-a17-nvidia/releases --jq '.[] | select(.draft) | .assets[] | "\(.digest) \(.name)"'`
-   对照本地 `sha256sum`，7 个都要有。
+   对照本地 `sha256sum`，资产数须为 `_vendor_parts + 2`（分块、校验表、native bundle）。
 9. **AUR**：`$R/aur-publish.sh <tag>`（Release 必须已发布）：Release 资产的校验和取 GitHub API 记录的 `digest`，
    不下载；tag/commit 源码包由 GitHub 现打，哈希与本地 `git archive` 不同，下载后计算。然后生成 `.SRCINFO`，
    提交 `AUR：<tag> 的校验和与 .SRCINFO` 并推送本仓库和 AUR。

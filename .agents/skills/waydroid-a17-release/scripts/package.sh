@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Build the release assets and a local AUR package from them, without downloading anything we publish.
-#   vendor.img -> vendor.img.zst (zstd -19) -> 50 MiB parts + vendor.img.zst.sha256 (parts, archive, image)
+#   vendor.img -> vendor.img.zst (zstd -19) -> small numbered parts + checksums
 #   pinned native bundle -> waydroid-a17-nvidia-native-x86_64.tar.zst (reproducible tar)
 #   places the assets under the PKGBUILD's source names, updpkgsums, makepkg
 # The release commit must exist already and carry _tag/pkgver: the repository tarball is `git archive HEAD`,
 # which is what GitHub serves for the tag once it is pushed. A first run with a new tag bumps the PKGBUILD and
 # stops so the bump goes into that commit.
-# Usage: package.sh <tag, e.g. a17-20261025-2>
+# Usage: package.sh <tag> [--resplit] (reuse the existing compressed image and native archive)
 set -euo pipefail
 TAG=${1:?usage: package.sh <tag>}
+RESPLIT=${2:-}
+[[ -z $RESPLIT || $RESPLIT == --resplit ]] || { echo "package: unknown option $RESPLIT" >&2; exit 2; }
 [[ $TAG =~ ^a17-([0-9]{8})-([0-9]+)$ ]] || { echo "package: tag must look like a17-YYYYMMDD-N" >&2; exit 2; }
 PKGVER=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}
 REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -24,14 +26,20 @@ if ! grep -qx "_tag=$TAG" "$A/PKGBUILD"; then
 fi
 [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "package: commit the publish changes first" >&2; exit 1; }
 
-rm -f vendor.img.zst vendor.img.zst.part* vendor.img.zst.sha256 waydroid-a17-nvidia-native-x86_64.tar.zst
-zstd -q -19 -T0 "$IMG" -o vendor.img.zst
-split -b 50M -d -a 2 vendor.img.zst vendor.img.zst.part
+if [ "$RESPLIT" = --resplit ]; then
+    [ -f vendor.img.zst ] && [ -f waydroid-a17-nvidia-native-x86_64.tar.zst ] || exit 1
+    zstd -dq -c vendor.img.zst | cmp - "$IMG"
+else
+    rm -f vendor.img.zst waydroid-a17-nvidia-native-x86_64.tar.zst
+    zstd -q -19 -T0 "$IMG" -o vendor.img.zst
+    (cd "$NB" && tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 --zstd \
+        -cf "$REPO/waydroid-a17-nvidia-native-x86_64.tar.zst" .)
+fi
+rm -f vendor.img.zst.part* vendor.img.zst.sha256
+split -b "${VENDOR_PART_SIZE:-5M}" -d -a 2 vendor.img.zst vendor.img.zst.part
 { sha256sum vendor.img.zst.part*; sha256sum vendor.img.zst; sha256sum "$IMG" | sed 's|  .*|  vendor.img|'; } > vendor.img.zst.sha256
-(cd "$NB" && tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 --zstd \
-    -cf "$REPO/waydroid-a17-nvidia-native-x86_64.tar.zst" .)
-parts=$(ls vendor.img.zst.part* | wc -l)
-listed=$(grep -c 'vendor-$_tag.img.zst.part0[0-9]::' "$A/PKGBUILD")
+parts=$(find . -maxdepth 1 -name 'vendor.img.zst.part[0-9][0-9]' -printf x | wc -c)
+listed=$(cd "$A" && bash -c 'source ./PKGBUILD; printf "%s\n" "$_vendor_parts"')
 [ "$parts" = "$listed" ] || { echo "package: $parts image parts, the PKGBUILD lists $listed; fix its source array" >&2; exit 1; }
 
 rm -f "$A"/vendor-a17-*.img.zst.part* "$A"/waydroid-a17-nvidia-a17-*.tar.gz \

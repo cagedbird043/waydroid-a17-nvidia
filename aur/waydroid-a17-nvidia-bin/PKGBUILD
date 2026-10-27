@@ -16,6 +16,7 @@ _tag=a17-20261028-1
 _wn_sha=29ffa3a237b0d79a751748bd9bb82c50dd577808      # waydroid-nvidia v0.2.0-rc10 release notes commit
 _wn_tag=v0.2.0-rc10
 _waydroid_sha=a33a5c0b31d89d6ce687381104b30aff4dd2d330
+_vendor_parts=45
 pkgdesc="Waydroid for Android 17 (WayDroid-ATV) with NVIDIA acceleration: NVK + ANGLE vendor image, freeform cards, host IME and clipboard"
 arch=('x86_64')
 url="https://github.com/cagedbird043/waydroid-a17-nvidia"
@@ -49,12 +50,12 @@ source=(
   "$_wn_rel/waydroid-nvidia-guest-android-x86_64-$_wn_tag.tar.zst"
   "$_wn_rel/waydroid-nvidia-guest-prebuilts-$_wn_tag.tar.zst"
   "waydroid-a17-nvidia-native-x86_64-$_tag.tar.zst::$_rel/waydroid-a17-nvidia-native-x86_64.tar.zst"
-  "vendor-$_tag.img.zst.part00::$_rel/vendor.img.zst.part00"
-  "vendor-$_tag.img.zst.part01::$_rel/vendor.img.zst.part01"
-  "vendor-$_tag.img.zst.part02::$_rel/vendor.img.zst.part02"
-  "vendor-$_tag.img.zst.part03::$_rel/vendor.img.zst.part03"
-  "vendor-$_tag.img.zst.part04::$_rel/vendor.img.zst.part04"
 )
+for (( _part=0; _part<_vendor_parts; _part++ )); do
+  printf -v _suffix '%02d' "$_part"
+  source+=("vendor-$_tag.img.zst.part$_suffix::$_rel/vendor.img.zst.part$_suffix")
+done
+unset _part _suffix
 noextract=(
   "waydroid-nvidia-host-x86_64-$_wn_tag.tar.zst"
   "waydroid-nvidia-guest-android-x86_64-$_wn_tag.tar.zst"
@@ -62,17 +63,17 @@ noextract=(
   "waydroid-a17-nvidia-native-x86_64-$_tag.tar.zst"
 )
 sha256sums=('4dc67241bf35189d4490306611f7f52e49117d04511a60999e96328f010dd84f'
-            '5b2fd3c6690caeeada63c8582b5caeab4f7965f62e79ee83bb1891665639343c'
+            'c5e13dc3f4b150a752e38e57f3e52145836c5b75a59389363d6a7db2d39388e1'
             'e7817beac7e26f7d54b2d9f49c847dab8e137c92e403825829e7abbd0b63c411'
             '124106f95e1b35c75eed8a966ab66284760fd6d02c79ad9fadd88355d4e3a2d7'
             '5fa325de02c2ef9c13f972efba98e27cdf4d2d48c0a33cf9a884ade8eaa74c50'
             '3fe5822ca2b9ed3aa6fcd9c9627679a04592837b947d7754911c3ab4c1007ec2'
-            '634cf0d822b0145f9ce579cde883c1d3d30389b2c947a7fbea9156244d68eb6b'
-            'e52c03717c71ec6c413112db57b4b576f32f5d07f7ced116679f27362b588568'
-            '7699ce13946c39989c63274a3f8f8209b9d27322ce570111791ba42c2a1d8a04'
-            '309feb968cda089f8f6e021db2b302393fc97c515d90e1809d1970d00a845e8e'
-            '265cbbde69cebccdaa0d12e4998ddf0c328abea52bebc15e1e086e7ec3564a64'
-            '28244cb24b424d9bcea206984be35fbe04ad4c7de2b04f8f7c139b199b9cb50b')
+            '1b745453643406bc2c8a29fc435276ff4a8bdc3631776d268e1b4c9a72b69139'
+            'af00bb5cd559e7df62f931d9661ba0d447e8d55d5c1be23c57e0f2f621fed90c'
+            '5f451c511d08cba7205553794d44ca73a7ddbf9124d600210b027613cae5100d'
+            'e41e7f607643cf0b1d874d7b717568616a96d93de8da47b961fc489afffd4ea4'
+            '1073b873ad90c0a092979872e0c5d21e983c1f501d010ca2c0dbaa130f4a11e6'
+            'cda2ae017747145c314afb37b300a03ffb76a854d6bc7b0c8e56810860f5c22e')
 
 prepare() {
   local wn="$srcdir/waydroid-nvidia-$_wn_sha" a17="$srcdir/waydroid-a17-nvidia-$_tag" p
@@ -101,7 +102,7 @@ build() {
   # the native bundle the vendor image names in ro.vendor.nvidia_prolapse.build_record
   rm -rf native && mkdir native
   bsdtar -C native -xf "waydroid-a17-nvidia-native-x86_64-$_tag.tar.zst"
-  cat vendor-$_tag.img.zst.part0[0-4] | zstd -dq -o vendor.img -f
+  cat vendor-$_tag.img.zst.part[0-9][0-9] | zstd -dq -o vendor.img -f
   rm -rf vendor-ota && mkdir vendor-ota
   python "waydroid-nvidia-$_wn_sha/packaging/vendor-ota.py" vendor.img native/BUILD-RECORD.json vendor-ota \
     --tag "$_wn_tag-a17" --repo cagedbird043/waydroid-a17-nvidia
