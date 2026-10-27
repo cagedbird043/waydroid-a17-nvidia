@@ -1,0 +1,29 @@
+From ea0a08a08211e556cedb5e423c4e96649d127d46 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Wed, 28 Oct 2026 01:51:31 +0800
+Subject: [PATCH] =?utf-8?q?=E6=89=93=E5=8C=85=E6=97=B6=E5=AE=89=E8=A3=85?=
+ =?utf-8?q?=E9=97=A8=E7=A6=81=E4=BE=9D=E8=B5=96=E7=9A=84=20XML=20=E7=94=9F?=
+ =?utf-8?q?=E6=88=90=E5=99=A8=20ELF=20=E6=A3=80=E6=9F=A5=E8=84=9A=E6=9C=AC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ packaging/native/install-native.sh | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/packaging/native/install-native.sh b/packaging/native/install-native.sh
+index b2c16e2..22c092f 100755
+--- a/packaging/native/install-native.sh
++++ b/packaging/native/install-native.sh
+@@ -37,6 +37,7 @@ files=(
+     packaging/native/release_gate.py
+     packaging/native/vendor_image.py
+     nvidia-prolapse/media/stage-odm.sh
++    nvidia-prolapse/media/tools/check-xmlgen-elf.py
+     nvidia-prolapse/media/test/validate_xml.py
+ )
+ for f in "${files[@]}"; do
+-- 
+2.56.0
+

@@ -48,6 +48,7 @@ tag `a17-YYYYMMDD-N`（同一天第 N 版），pkgver `YYYYMMDD.N`。native bund
 | `the installed package carries release bundle …, the vendor image …` | 包更新后没跑 setup | `sudo waydroid-nvidia-setup` |
 | `has no ELF64 …/linker64` | AUR prepare 的 `git apply` 在 git 仓库里静默跳过 | PKGBUILD 里保留 `GIT_CEILING_DIRECTORIES` |
 | 服务不一致 / `media/xmlgen-check` 失败 | 镜像里的服务或 XML 与 bundle 不同 | 按两遍流程重编，不要手改 bundle |
+| `can't open file …/media/tools/check-xmlgen-elf.py` | 包漏装 media 门禁共用的 ELF 检查脚本 | `install-native.sh` 文件列表安装该脚本，重打包后重新安装门禁 |
 | 下载上游 rc10 资产 TLS 失败 | 网络 | package.sh 会从 `$WS/nvidia/release/` 拷本地副本 |
 
 ## 规矩
