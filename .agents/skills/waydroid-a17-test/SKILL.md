@@ -39,6 +39,12 @@ CODEC_SMOKE_OUT=/tmp/codec-evidence $T/codec-smoke.sh
 编码器开关 `persist.waydroid.nvidia_video_encode`、解码器开关 `persist.waydroid.nvidia_video_decode`（`waydroid prop set`）。
 脚本按组件名创建解码器，保留每个客户端及 FFmpeg/ffprobe 退出码，严格要求四解码各 60 帧/0 坏缓冲、三编码各 60 入/60 出、宿主 ffprobe 各 60 帧且 FFmpeg 无错误。另跑运行中 flush 后完整重播、有未完成工作时销毁、128 字节 0xff 坏码流输入（须零图像，收到 EOS 或明确错误）。反向门禁：`CODEC_SMOKE_FAULT=client-failure|wrong-name|truncated|bad-buffer`（逐一运行，均应非零；bad-buffer 为客户端首张图像的空缓冲故障注入）。输出目录保留原始日志与退出码。宿主 C 编码计时用 `M/test/enc-benchmark.py OUT`，330 帧去前 30、五次交替顺序，生成逐帧 CSV 与统计 JSON。
 
+VP9 多显示帧回归：`make -C "$WS/nvidia/waydroid-nvidia/nvidia-prolapse/media" superframe-test` 生成 `out/host/superframe/{vp9.mp4,pair.bin}`，
+并在宿主验证 59 输入、60 帧及 incomplete/final 事件。将两文件与新客户端放进 guest 同一目录后运行：
+`./c2_smoke vp9.mp4 c2.nvprolapse.vp9.decoder superframe pair.bin`、
+`./c2_surface_smoke vp9.mp4 c2.nvprolapse.vp9.decoder pair.bin`。
+两者必须报告 `superframe: 2 outputs at shared PTS, total=60`；Surface 还须 59 输入、60 输出、60 图像、EOS、0 错误。
+
 ### Surface 与 seccomp 窗口
 
 ```bash
