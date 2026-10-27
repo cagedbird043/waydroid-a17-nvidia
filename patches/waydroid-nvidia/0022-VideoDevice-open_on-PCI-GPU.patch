@@ -1,0 +1,35 @@
+From 2e121cdc4d005792cd0cd98b974196057ce358f2 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Mon, 26 Oct 2026 13:15:18 +0800
+Subject: [PATCH 22/37] =?utf-8?q?=E8=A7=86=E9=A2=91=EF=BC=9AVideoDevice::o?=
+ =?utf-8?q?pen=5Fon=20=E6=8C=89=20PCI=20=E5=9C=B0=E5=9D=80=E6=89=93?=
+ =?utf-8?q?=E5=BC=80=E6=8C=87=E5=AE=9A=20GPU?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ nvidia-prolapse/driver-source/native/src/video/mod.rs | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/mod.rs b/nvidia-prolapse/driver-source/native/src/video/mod.rs
+index ddb3dde..26435f2 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/mod.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/mod.rs
+@@ -680,7 +680,12 @@ fn parse_pci(s: &str) -> VResult<[u32; 4]> {
+ 
+ impl VideoDevice {
+     pub fn open() -> VResult<Self> {
+-        let (device, pci) = open_rm(None)?;
++        Self::open_on(None)
++    }
++
++    /// Open the GPU at `pci` (domain, bus, device, function); `None` selects as [`Self::open`].
++    pub fn open_on(pci: Option<[u32; 4]>) -> VResult<Self> {
++        let (device, pci) = open_rm(pci)?;
+         let classes = device.classes()?;
+         let nvdec_class = NVDEC_CLASSES
+             .iter()
+-- 
+2.56.0
+

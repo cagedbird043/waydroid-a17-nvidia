@@ -1,0 +1,69 @@
+From 77b072ca9bdb1743b35e1edea32ed8204c640850 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Tue, 27 Oct 2026 01:58:20 +0800
+Subject: [PATCH 31/37] =?utf-8?q?=E8=A7=86=E9=A2=91=EF=BC=9A=E6=96=B0?=
+ =?utf-8?q?=E5=A2=9E=E7=B3=BB=E7=BB=9F=E5=86=85=E5=AD=98=E8=AF=BB=E5=9B=9E?=
+ =?utf-8?q?=E7=BC=93=E5=86=B2=20allocate=5Freadback=EF=BC=8CCPU=20?=
+ =?utf-8?q?=E8=AF=BB=E5=9B=9E=E4=B8=8D=E5=86=8D=E7=BB=8F=20VRAM=20BAR?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ nvidia-prolapse/driver-source/native/src/rm.rs     |  7 +++++++
+ .../driver-source/native/src/video/session.rs      | 14 ++++++++++++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/nvidia-prolapse/driver-source/native/src/rm.rs b/nvidia-prolapse/driver-source/native/src/rm.rs
+index ca49feb..15d2fbf 100644
+--- a/nvidia-prolapse/driver-source/native/src/rm.rs
++++ b/nvidia-prolapse/driver-source/native/src/rm.rs
+@@ -1252,6 +1252,13 @@ impl Mapping {
+         }
+         Ok(())
+     }
++    /// The whole mapping as bytes. Only for CPU-cached system memory whose writers (the GPU)
++    /// have completed; device memory must be read with [`Mapping::read_bytes`] instead.
++    pub(crate) fn system_bytes(&self) -> Result<&[u8]> {
++        self.live()?;
++        // SAFETY: the mapping is live and owns `size` bytes; callers synchronise with the writer.
++        Ok(unsafe { std::slice::from_raw_parts(self.pointer.as_ptr() as *const u8, self.size) })
++    }
+     /// Bulk copy out of the mapping (bounds-checked, byte granular).
+     pub(crate) fn read_bytes(&self, offset: usize, out: &mut [u8]) -> Result<()> {
+         self.live()?;
+diff --git a/nvidia-prolapse/driver-source/native/src/video/session.rs b/nvidia-prolapse/driver-source/native/src/video/session.rs
+index 0184273..3ebfe1a 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/session.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/session.rs
+@@ -1087,6 +1087,15 @@ impl Session {
+         Ok(OutputAllocation { fd, memory })
+     }
+ 
++    /// PRIME-shareable CPU-cached system memory for copy-engine output that the CPU reads back
++    /// (device memory would be read through the uncached BAR). Map it with
++    /// [`OutputAllocation::map`] once and read [`OutputMapping::bytes`] after `copy_out_wait`.
++    pub fn allocate_readback(&self, size: usize) -> VResult<OutputAllocation> {
++        let memory = self.device.allocate_aligned(size, 4096, false, true)?;
++        let fd = crate::external::export(&memory, self.drm.as_fd())?;
++        Ok(OutputAllocation { fd, memory })
++    }
++
+     /// Complete a copy-out before the CPU maps its destination.
+     pub fn copy_out_wait(&mut self, id: u64, target: &Target) -> VResult<()> {
+         if let Some(fence) = self.copy_out(id, target)? {
+@@ -1163,6 +1172,11 @@ pub struct OutputMapping {
+     mapping: Mapping,
+ }
+ impl OutputMapping {
++    /// The mapped bytes of an allocation from [`Session::allocate_readback`], valid once the
++    /// copy engine's work on it has completed.
++    pub fn bytes(&self) -> VResult<&[u8]> {
++        Ok(self.mapping.system_bytes()?)
++    }
+     pub fn read_bytes(&self, offset: usize, out: &mut [u8]) -> VResult<()> {
+         Ok(self.mapping.read_bytes(offset, out)?)
+     }
+-- 
+2.56.0
+

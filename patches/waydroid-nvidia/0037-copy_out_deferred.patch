@@ -1,0 +1,37 @@
+From f68c50229411c3fcf9ede453d0ea8a51a693f624 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Tue, 27 Oct 2026 16:59:21 +0800
+Subject: [PATCH 37/37] =?utf-8?q?=E8=A7=86=E9=A2=91=EF=BC=9A=E6=96=B0?=
+ =?utf-8?q?=E5=A2=9E=20copy=5Fout=5Fdeferred?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+提交 copy-out 并返回 fence，不等待，也不先在 CPU 上确认解码状态；调用方等
+fence 后再用 wait_picture 检查状态。供 rustnv 在 worker 上提交导出拷贝。
+---
+ nvidia-prolapse/driver-source/native/src/video/session.rs | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/session.rs b/nvidia-prolapse/driver-source/native/src/video/session.rs
+index c2f62d5..30dceba 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/session.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/session.rs
+@@ -1160,6 +1160,14 @@ impl Session {
+         }
+         self.wait_picture(id)
+     }
++
++    /// Queue a copy-out ordered after the decode (on the GPU with a native 64-bit timeline) and
++    /// return its fence without waiting. The fence may stand for a failed picture: the caller
++    /// checks the engine status with [`Session::wait_picture`] once it needs it. For consumers
++    /// that synchronise through the destination dma-buf's implicit fences.
++    pub fn copy_out_deferred(&mut self, id: u64, target: &Target) -> VResult<Option<OwnedFd>> {
++        self.copy_out_inner(id, target, true)
++    }
+ }
+ 
+ impl Drop for Session {
+-- 
+2.56.0
+

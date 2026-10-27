@@ -1,0 +1,221 @@
+From e21cba88e151a9e27ee6514e7bbafb525080780a Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Mon, 26 Oct 2026 15:01:38 +0800
+Subject: [PATCH 25/37] =?utf-8?q?=E8=A7=86=E9=A2=91=EF=BC=9A=E6=94=BE?=
+ =?utf-8?q?=E5=BC=80=E6=89=80=E6=9C=89=20Turing=20=E5=8F=8A=E6=9B=B4?=
+ =?utf-8?q?=E6=96=B0=E4=BB=A3=E7=9A=84=20NVDEC=20=E7=B1=BB=EF=BC=8C?=
+ =?utf-8?q?=E5=8E=BB=E6=8E=89=E6=9C=AA=E6=B5=8B=E7=B1=BB=E5=BC=80=E5=85=B3?=
+ =?utf-8?q?=EF=BC=9BRM=20=E7=9B=AE=E5=BD=95=E8=87=AA=E5=B8=A6=20LICENSE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+- NVDEC_CLASSES 去掉“已在硬件实测”一列，NV_VIDEO_UNTESTED_CLASSES 删除；
+  各代能力仍按 stock 的代际门控和 BSP caps 判断，未实测类的输出布局警告保留
+- native/LICENSE：MIT 原文与目录内例外，单独发布为 nvrm 时随目录带走
+---
+ nvidia-prolapse/driver-source/native/LICENSE  | 42 ++++++++++++
+ .../driver-source/native/src/video/mod.rs     | 66 ++++++-------------
+ .../driver-source/native/src/video/pretend.rs | 10 ++-
+ .../driver-source/native/src/video/session.rs |  7 +-
+ 4 files changed, 66 insertions(+), 59 deletions(-)
+ create mode 100644 nvidia-prolapse/driver-source/native/LICENSE
+
+diff --git a/nvidia-prolapse/driver-source/native/LICENSE b/nvidia-prolapse/driver-source/native/LICENSE
+new file mode 100644
+index 0000000..9d56a8d
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/LICENSE
+@@ -0,0 +1,42 @@
++nvrm — licensing notice
++=======================
++
++This directory is the native NVIDIA RM backend of waydroid-nvidia
++(nvidia-prolapse/driver-source/native), also published on its own as nvrm.
++Its original work is licensed MIT:
++
++    Copyright (c) 2026 waydroid-nvidia contributors
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice shall be included in
++    all copies or substantial portions of the Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++
++Exceptions (inherit the upstream or stated license):
++
++    mesa/*.patch, mesa/gallium-nvrm/, compiler/   (Mesa adaptation)
++                              MIT (Mesa; see compiler/MESA-MIT.txt)
++    vendor/nvidia/            MIT (NVIDIA open headers, notice in file)
++    licenses/                 notices of ash (MIT/Apache-2.0), tinygrad (MIT)
++                              and NVIDIA's public headers (MIT)
++    src/vp9_tables.rs         values from libvpx (BSD-3-Clause, notice in file)
++    src/video/av1/cdf_defaults.rs
++                              values from Mesa (MIT, AMD; notice in file)
++    src/video/av1/testdata/   Big Buck Bunny (c) 2008 Blender Foundation,
++                              CC-BY 3.0, re-encoded (see README.md there)
++
++No NVIDIA binary is part of this directory. The backend talks to the host's
++installed NVIDIA kernel module at runtime, unmodified.
+diff --git a/nvidia-prolapse/driver-source/native/src/video/mod.rs b/nvidia-prolapse/driver-source/native/src/video/mod.rs
+index 26435f2..70724ea 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/mod.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/mod.rs
+@@ -141,30 +141,24 @@ pub(crate) fn bitstream<T>(m: impl Into<String>) -> VResult<T> {
+     Err(VideoError::Bitstream(m.into()))
+ }
+ 
+-/// NVDEC classes, newest first: (class, chip family, stock capability bit, tested on hardware by this
+-/// library). The bit is the generation bit stock libnvcuvid 615.71.09 sets in its decoder capability word
+-/// for that class (ELF 0x30970); every per-generation branch below tests that word with the masks of [`NvdecGen`]. Classes
+-/// with bit 0 (Volta and older) decode nothing in stock and are refused here too. CFB0 (GB202, local + rental),
++/// NVDEC classes, newest first: (class, chip family, stock capability bit). The bit is the generation bit
++/// stock libnvcuvid 615.71.09 sets in its decoder capability word for that class (ELF 0x30970); every
++/// per-generation branch below tests that word with the masks of [`NvdecGen`]. Classes with bit 0 (Volta and
++/// older) decode nothing in stock and are refused here too. Every Turing+ class is enabled; CFB0 (GB202),
+ /// C9B0 (AD107), C7B0 (GA106) and C4B0 (TU116) ran this library's decoder bit-exact against stock and FFmpeg
+-/// (rental run 20261015-nvdec-xgen3); the rest are refused unless `NV_VIDEO_UNTESTED_CLASSES=1`
+-/// ([`untested_classes_allowed`]).
+-pub const NVDEC_CLASSES: [(u32, &str, u32, bool); 11] = [
+-    (0xd2b0, "Rubin GR10x", 0x0200_0000, false),
+-    (0xceb0, "Blackwell GB10B/GB10C", 0x0100_0000, false),
+-    (0xcfb0, "Blackwell GB20x", 0x0080_0000, true),
+-    (0xd1b0, "Blackwell GB20B/GB20C", 0x0040_0000, false),
+-    (
+-        0xcdb0,
+-        "Blackwell GB10x/GB11x (data centre)",
+-        0x0020_0000,
+-        false,
+-    ),
+-    (0xc9b0, "Ada AD10x", 0x0010_0000, true),
+-    (0xc7b0, "Ampere GA10x", 0x0008_0000, true),
+-    (0xb8b0, "Hopper GH100", 0x0004_0000, false),
+-    (0xc6b0, "Ampere GA100", 0x0002_0000, false),
+-    (0xc4b0, "Turing", 0x0001_0000, true),
+-    (0xc3b0, "Volta", 0, false),
++/// (rental run 20261015-nvdec-xgen3), the others follow the same stock gates unmeasured.
++pub const NVDEC_CLASSES: [(u32, &str, u32); 11] = [
++    (0xd2b0, "Rubin GR10x", 0x0200_0000),
++    (0xceb0, "Blackwell GB10B/GB10C", 0x0100_0000),
++    (0xcfb0, "Blackwell GB20x", 0x0080_0000),
++    (0xd1b0, "Blackwell GB20B/GB20C", 0x0040_0000),
++    (0xcdb0, "Blackwell GB10x/GB11x (data centre)", 0x0020_0000),
++    (0xc9b0, "Ada AD10x", 0x0010_0000),
++    (0xc7b0, "Ampere GA10x", 0x0008_0000),
++    (0xb8b0, "Hopper GH100", 0x0004_0000),
++    (0xc6b0, "Ampere GA100", 0x0002_0000),
++    (0xc4b0, "Turing", 0x0001_0000),
++    (0xc3b0, "Volta", 0),
+ ];
+ 
+ /// Per-generation gates of one NVDEC class: the stock capability bit of [`NVDEC_CLASSES`] tested with the
+@@ -211,23 +205,6 @@ impl NvdecGen {
+     }
+ }
+ 
+-/// Explicit verification opt-in `NV_VIDEO_UNTESTED_CLASSES=1`: NVDEC classes this library never ran on
+-/// hardware are accepted (cross-generation bit-exactness runs on rented GPUs). Announced once on stderr;
+-/// never set in production.
+-pub fn untested_classes_allowed() -> bool {
+-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ON.get_or_init(|| {
+-        let on = std::env::var("NV_VIDEO_UNTESTED_CLASSES").is_ok_and(|v| v == "1");
+-        if on {
+-            eprintln!(
+-                "nv_video: NV_VIDEO_UNTESTED_CLASSES=1: NVDEC classes never run by this library are \
+-                 enabled (verification only, outputs unverified)"
+-            );
+-        }
+-        on
+-    })
+-}
+-
+ /// Append one buffer-address method the way stock's relocation emitter encodes it (ELF
+ /// 0x4a8a0 / 0x4acd0): a NONINC pair (`va >> 8`, `va >> 40`) when the host GPFIFO class
+ /// is newer than C86F (Blackwell) or the address needs more than 40 bits, else one INC dword `va >> 8`
+@@ -554,14 +531,9 @@ impl NvdecEngineCaps {
+ /// 0x2c520) intersected with what this library implements (8-bit H.264
+ /// 4:2:0 up to 4096², HEVC Main/Main 10, VP9 profiles 0/2, AV1 Main 8/10-bit). `engine` is the BSP caps of
+ /// the engine sessions submit to (NVDEC0): stock asks whether *any* present engine qualifies (0x2c420,
+-/// 0x2c470); this library drives NVDEC0 only, so it asks that engine. `supported` also needs a class this
+-/// library ran on hardware, or the `NV_VIDEO_UNTESTED_CLASSES=1` opt-in.
++/// 0x2c470); this library drives NVDEC0 only, so it asks that engine.
+ pub fn caps(codec: u32, class: u32, engine: &NvdecEngineCaps) -> NvVideoCaps {
+     let g = NvdecGen::of(class);
+-    let tested = NVDEC_CLASSES
+-        .iter()
+-        .find(|c| c.0 == class)
+-        .is_some_and(|c| c.3 || untested_classes_allowed());
+     let mut c = NvVideoCaps {
+         codec,
+         ..Default::default()
+@@ -603,7 +575,7 @@ pub fn caps(codec: u32, class: u32, engine: &NvdecEngineCaps) -> NvVideoCaps {
+         }
+         _ => stock = false,
+     }
+-    c.supported = u32::from(stock && tested);
++    c.supported = u32::from(stock);
+     c
+ }
+ 
+diff --git a/nvidia-prolapse/driver-source/native/src/video/pretend.rs b/nvidia-prolapse/driver-source/native/src/video/pretend.rs
+index c6e142a..c60a1b4 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/pretend.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/pretend.rs
+@@ -422,11 +422,9 @@ fn caps_per_generation() {
+     // D1B0: extra setup word not reproduced → refused with a reason.
+     assert!(class_gap(CODEC_HEVC, 0xd1b0).is_some() && class_gap(CODEC_AV1, 0xd1b0).is_none());
+     assert!(ok(CODEC_HEVC, 0xc4b0));
+-    // Classes verified on hardware (CFB0/C9B0/C7B0/C4B0) are enabled without the opt-in; GA100 is not.
+-    if !super::untested_classes_allowed() {
+-        for class in [0xcfb0, 0xc9b0, 0xc7b0, 0xc4b0] {
+-            assert_eq!(caps(CODEC_HEVC, class).supported, 1, "{class:#x}");
+-        }
+-        assert_eq!(caps(CODEC_HEVC, 0xc6b0).supported, 0);
++    // Every Turing+ class decodes without an opt-in, measured on hardware or not; GA100 has no AV1.
++    for class in [0xd2b0, 0xceb0, 0xcfb0, 0xcdb0, 0xc9b0, 0xc7b0, 0xb8b0, 0xc6b0, 0xc4b0] {
++        assert_eq!(caps(CODEC_HEVC, class).supported, 1, "{class:#x}");
+     }
++    assert_eq!(caps(CODEC_AV1, 0xc6b0).supported, 0);
+ }
+diff --git a/nvidia-prolapse/driver-source/native/src/video/session.rs b/nvidia-prolapse/driver-source/native/src/video/session.rs
+index fb411ab..d6577a9 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/session.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/session.rs
+@@ -306,7 +306,6 @@ impl Session {
+         }
+         let caps = super::caps(info.codec, class, &dev.engine0);
+         if caps.supported == 0 {
+-            let known = super::NVDEC_CLASSES.iter().find(|c| c.0 == class);
+             let why = if let Some(gap) = super::class_gap(info.codec, class) {
+                 gap.to_string()
+             } else if !NvdecGen::of(class).turing_plus() {
+@@ -317,12 +316,8 @@ impl Session {
+             } else if info.codec == super::CODEC_AV1 && !NvdecGen::of(class).ga10x_plus() {
+                 "NVDEC AV1 needs GA10x or newer (stock: Turing, GA100 and Hopper have none)"
+                     .to_string()
+-            } else if known.is_some_and(|c| !c.3) {
+-                "this NVDEC class never ran this library's decoder; set NV_VIDEO_UNTESTED_CLASSES=1 \
+-                 only to verify it"
+-                    .to_string()
+             } else {
+-                "unknown NVDEC class".to_string()
++                "codec not implemented by this library".to_string()
+             };
+             return Err(VideoError::Unsupported(format!(
+                 "codec {} on NVDEC class {class:#x}: {why}",
+-- 
+2.56.0
+

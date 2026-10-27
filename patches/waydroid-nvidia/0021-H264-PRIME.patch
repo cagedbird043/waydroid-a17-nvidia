@@ -1,0 +1,423 @@
+From d42b88e1e94993f4a28100c70bb8ca6f51fa35cc Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Mon, 26 Oct 2026 12:52:46 +0800
+Subject: [PATCH 21/37] =?utf-8?q?=E8=A7=86=E9=A2=91=EF=BC=9A=E6=94=AF?=
+ =?utf-8?q?=E6=8C=81=E5=A4=96=E9=83=A8=20H264=20=E5=8F=82=E6=95=B0?=
+ =?utf-8?q?=E5=89=8D=E7=AB=AF=E5=8F=8A=E7=A8=B3=E5=AE=9A=20PRIME=20?=
+ =?utf-8?q?=E8=BE=93=E5=87=BA=E5=88=86=E9=85=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../native/src/video/h264/codec.rs            |  74 ++++++------
+ .../native/src/video/h264/desc.rs             |  20 ++++
+ .../native/src/video/h264/mod.rs              |  58 +---------
+ .../driver-source/native/src/video/session.rs | 107 +++++++++++++++++-
+ .../driver-source/native/video/README.md      |  15 +++
+ 5 files changed, 178 insertions(+), 96 deletions(-)
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/h264/codec.rs b/nvidia-prolapse/driver-source/native/src/video/h264/codec.rs
+index bed59d2..f635ebd 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/h264/codec.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/h264/codec.rs
+@@ -80,6 +80,40 @@ impl H264Decoder {
+             gen: NvdecGen::of(decoder_class),
+         })
+     }
++    /// Build engine commands for an externally constructed picture descriptor.
++    pub fn build_picture(&mut self, ctx: &BuildContext, d: &mut [u8], setup: &[u8], slots: &[Option<u32>; MAX_SLOTS], app_id: u32, control_params: u32) -> VResult<Vec<u32>> {
++        if setup.len() > STATUS as usize { return Err(VideoError::Unsupported("H.264 slice table overlaps engine status".into())); }
++        d[..setup.len()].copy_from_slice(setup);
++        let da = ctx.descriptor;
++        let cur = ctx.surfaces[ctx.current];
++        let mut w = Vec::new();
++        let reloc = |w: &mut Vec<u32>, m: u32, va: u64| ctx.reloc(w, m, va);
++        method(&mut w, 4, 0x200, &[app_id]);
++        method(&mut w, 4, 0x400, &[control_params]);
++        reloc(&mut w, 0x404, da);
++        reloc(&mut w, 0x408, ctx.bitstream);
++        let legacy = app_id == legacy::APP_ID_H264;
++        if legacy { reloc(&mut w, 0x410, da + SLICE_OFFSETS); }
++        for (i, s) in slots.iter().enumerate() {
++            let s = s.map_or(cur, |s| ctx.surfaces[s as usize]);
++            reloc(&mut w, 0x430 + 4 * i as u32, s.luma);
++            reloc(&mut w, 0x474 + 4 * i as u32, s.chroma);
++        }
++        reloc(&mut w, 0x414, self.colmv);
++        reloc(&mut w, 0x424, da + STATUS);
++        method(&mut w, 4, 0x40c, &[ctx.picture_index]);
++        if legacy {
++            reloc(&mut w, 0x500, self.mbhist);
++            reloc(&mut w, 0x418, self.history);
++        } else {
++            reloc(&mut w, 0x680, da + SCALING);
++            reloc(&mut w, 0x4d0, self.filter);
++            if self.gen.ga10x_plus() { reloc(&mut w, 0x4c8, self.intra_top); }
++            if self.gen.blackwell_b() { reloc(&mut w, 0x4dc, self.buf_4dc); }
++        }
++        method(&mut w, 4, 0x300, &[0]);
++        Ok(w)
++    }
+ }
+ 
+ impl CodecDecoder for H264Decoder {
+@@ -175,45 +209,7 @@ impl CodecDecoder for H264Decoder {
+         if job.app_id == desc::APP_ID_NEW_H264 {
+             job.setup.truncate(0x2e0);
+         }
+-        d[..job.setup.len()].copy_from_slice(&job.setup);
+-        let da = ctx.descriptor;
+-        let cur = ctx.surfaces[ctx.current];
+-        let mut w = Vec::new();
+-        // Relocation encoding per host class (stock reloc_4a8a0).
+-        let reloc = |w: &mut Vec<u32>, m: u32, va: u64| ctx.reloc(w, m, va);
+-        method(&mut w, 4, 0x200, &[job.app_id]);
+-        method(&mut w, 4, 0x400, &[job.control_params]);
+-        reloc(&mut w, 0x404, da);
+-        reloc(&mut w, 0x408, ctx.bitstream);
+-        let legacy = job.app_id == legacy::APP_ID_H264;
+-        if legacy {
+-            reloc(&mut w, 0x410, da + SLICE_OFFSETS);
+-        }
+-        for (i, s) in job.slot_surfaces.iter().enumerate() {
+-            let s = s.map_or(cur, |s| ctx.surfaces[s as usize]);
+-            reloc(&mut w, 0x430 + 4 * i as u32, s.luma);
+-            reloc(&mut w, 0x474 + 4 * i as u32, s.chroma);
+-        }
+-        reloc(&mut w, 0x414, self.colmv);
+-        reloc(&mut w, 0x424, da + STATUS);
+-        method(&mut w, 4, 0x40c, &[ctx.picture_index]);
+-        if legacy {
+-            reloc(&mut w, 0x500, self.mbhist);
+-            reloc(&mut w, 0x418, self.history);
+-        } else {
+-            reloc(&mut w, 0x680, da + SCALING);
+-            reloc(&mut w, 0x4d0, self.filter);
+-            // NEW_H264 runs on Blackwell+ only (all GA10x+); 0x4dc on blackwell_b classes only
+-            // (gens.rs DECODE_GATES 0x443bc / 0x43ec5).
+-            if self.gen.ga10x_plus() {
+-                reloc(&mut w, 0x4c8, self.intra_top);
+-            }
+-            if self.gen.blackwell_b() {
+-                reloc(&mut w, 0x4dc, self.buf_4dc);
+-            }
+-        }
+-        method(&mut w, 4, 0x300, &[0]);
+-        Ok(w)
++        self.build_picture(ctx, d, &job.setup, &job.slot_surfaces, job.app_id, job.control_params)
+     }
+     fn finish(
+         &mut self,
+diff --git a/nvidia-prolapse/driver-source/native/src/video/h264/desc.rs b/nvidia-prolapse/driver-source/native/src/video/h264/desc.rs
+index a7ad5f8..d6b83de 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/h264/desc.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/h264/desc.rs
+@@ -108,6 +108,26 @@ pub struct DescInput<'a> {
+     pub poc: [i32; 2],
+ }
+ 
++/// Initial frame reference lists (8.2.4.2), before bitstream list modifications.
++pub fn initial_lists(dpb: &[Option<DescRef>; 16], frame_num: u32, poc: i32, max_frame_num: u32) -> [Vec<u8>; 3] {
++    let mut short = Vec::new();
++    let mut long = Vec::new();
++    for (i, r) in dpb.iter().enumerate().filter_map(|(i, r)| r.map(|r| (i, r))) {
++        if r.long_term { long.push((i as u8, r)); } else { short.push((i as u8, r)); }
++    }
++    long.sort_by_key(|(_, r)| r.frame_idx);
++    short.sort_by_key(|(_, r)| std::cmp::Reverse(if r.frame_idx > frame_num { r.frame_idx as i32 - max_frame_num as i32 } else { r.frame_idx as i32 }));
++    let p = short.iter().chain(&long).map(|(i, _)| *i).collect();
++    let mut before: Vec<_> = short.iter().filter(|(_, r)| !r.non_existing && r.poc[0].min(r.poc[1]) < poc).collect();
++    let mut after: Vec<_> = short.iter().filter(|(_, r)| !r.non_existing && r.poc[0].min(r.poc[1]) > poc).collect();
++    before.sort_by_key(|(_, r)| std::cmp::Reverse(r.poc[0].min(r.poc[1])));
++    after.sort_by_key(|(_, r)| r.poc[0].min(r.poc[1]));
++    let b0: Vec<_> = before.iter().chain(&after).map(|(i, _)| *i).chain(long.iter().map(|(i, _)| *i)).collect();
++    let mut b1: Vec<_> = after.iter().chain(&before).map(|(i, _)| *i).chain(long.iter().map(|(i, _)| *i)).collect();
++    if b1.len() > 1 && b1 == b0 { b1.swap(0, 1); }
++    [p, b0, b1]
++}
++
+ fn put32(d: &mut [u8], o: usize, v: u32) {
+     d[o..o + 4].copy_from_slice(&v.to_le_bytes());
+ }
+diff --git a/nvidia-prolapse/driver-source/native/src/video/h264/mod.rs b/nvidia-prolapse/driver-source/native/src/video/h264/mod.rs
+index f0a85c0..ce590eb 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/h264/mod.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/h264/mod.rs
+@@ -92,9 +92,6 @@ impl RefPic {
+             self.frame_num as i32
+         }
+     }
+-    fn frame_poc(&self) -> i32 {
+-        self.poc[0].min(self.poc[1])
+-    }
+ }
+ 
+ #[derive(Default)]
+@@ -433,55 +430,12 @@ impl Decoder {
+ 
+     /// Initial reference lists (8.2.4.2.1 P frames, 8.2.4.2.3 B frames) as DPB positions.
+     fn initial_lists(&self, cur_frame_num: u32, cur_poc: i32, max_frame_num: u32) -> [Vec<u8>; 3] {
+-        let refs: Vec<(u8, RefPic)> = self
+-            .dpb
+-            .iter()
+-            .enumerate()
+-            .filter_map(|(i, e)| e.map(|r| (i as u8, r)))
+-            .collect();
+-        let mut st: Vec<(u8, RefPic)> = refs
+-            .iter()
+-            .copied()
+-            .filter(|(_, r)| r.long_term_idx.is_none())
+-            .collect();
+-        let mut lt: Vec<(u8, RefPic)> = refs
+-            .iter()
+-            .copied()
+-            .filter(|(_, r)| r.long_term_idx.is_some())
+-            .collect();
+-        lt.sort_by_key(|(_, r)| r.long_term_idx);
+-        st.sort_by_key(|(_, r)| -r.frame_num_wrap(cur_frame_num, max_frame_num));
+-        let p: Vec<u8> = st.iter().chain(lt.iter()).map(|(i, _)| *i).collect();
+-        // Non-existing frames have no POC; they are left out of the B lists.
+-        let mut before: Vec<(u8, RefPic)> = st
+-            .iter()
+-            .copied()
+-            .filter(|(_, r)| !r.non_existing && r.frame_poc() < cur_poc)
+-            .collect();
+-        let mut after: Vec<(u8, RefPic)> = st
+-            .iter()
+-            .copied()
+-            .filter(|(_, r)| !r.non_existing && r.frame_poc() > cur_poc)
+-            .collect();
+-        before.sort_by_key(|(_, r)| -r.frame_poc());
+-        after.sort_by_key(|(_, r)| r.frame_poc());
+-        let ltp: Vec<u8> = lt.iter().map(|(i, _)| *i).collect();
+-        let b0: Vec<u8> = before
+-            .iter()
+-            .chain(after.iter())
+-            .map(|(i, _)| *i)
+-            .chain(ltp.iter().copied())
+-            .collect();
+-        let mut b1: Vec<u8> = after
+-            .iter()
+-            .chain(before.iter())
+-            .map(|(i, _)| *i)
+-            .chain(ltp.iter().copied())
+-            .collect();
+-        if b1.len() > 1 && b1 == b0 {
+-            b1.swap(0, 1);
+-        }
+-        [p, b0, b1]
++        let dpb = std::array::from_fn(|i| self.dpb[i].map(|r| DescRef {
++            slot: r.slot, state: 3, long_term: r.long_term_idx.is_some(),
++            non_existing: r.non_existing, poc: r.poc,
++            frame_idx: r.long_term_idx.unwrap_or(r.frame_num),
++        }));
++        desc::initial_lists(&dpb, cur_frame_num, cur_poc, max_frame_num)
+     }
+ 
+     /// Builds the picture job for one access unit. `surface` is the caller's target surface id
+diff --git a/nvidia-prolapse/driver-source/native/src/video/session.rs b/nvidia-prolapse/driver-source/native/src/video/session.rs
+index ad655a1..fb411ab 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/session.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/session.rs
+@@ -291,6 +291,15 @@ pub struct Stats {
+ 
+ impl Session {
+     pub fn new(dev: &VideoDevice, info: SessionInfo, codec_config: &[u8]) -> VResult<Self> {
++        Self::new_inner(dev, info, codec_config, None)
++    }
++
++    /// Create a session driven by externally supplied picture parameters.
++    pub fn with_codec(dev: &VideoDevice, info: SessionInfo, codec: Box<dyn CodecDecoder>) -> VResult<Self> {
++        Self::new_inner(dev, info, &[], Some(codec))
++    }
++
++    fn new_inner(dev: &VideoDevice, info: SessionInfo, codec_config: &[u8], custom: Option<Box<dyn CodecDecoder>>) -> VResult<Self> {
+         let class = dev.info.nvdec_class;
+         if class == 0 {
+             return Err(VideoError::Unsupported("GPU exposes no NVDEC class".into()));
+@@ -349,7 +358,7 @@ impl Session {
+             };
+             return Err(VideoError::Unsupported(format!("{why}{hint}")));
+         }
+-        let mut codec: Box<dyn CodecDecoder> = match info.codec {
++        let mut codec: Box<dyn CodecDecoder> = if let Some(codec) = custom { codec } else { match info.codec {
+             super::CODEC_VP9 => Box::new(super::vp9::Vp9Decoder::new(
+                 class,
+                 info.max_width,
+@@ -376,7 +385,7 @@ impl Session {
+                 codec_config,
+             )?),
+             c => return Err(VideoError::Unsupported(format!("codec {c} not built in"))),
+-        };
++        }};
+         // The codec decides the engine surface layout from its own bit depth, and the DPB
+         // surfaces below are sized from it: a codec built for another depth would allocate
+         // the wrong sample container silently.
+@@ -928,7 +937,7 @@ impl Session {
+                         &mut w,
+                         4,
+                         0x710,
+-                        &[line_bytes.next_multiple_of(64), dst_rows, 1, 0],
++                        &[dst.pitch[p], dst_rows, 1, 0],
+                     );
+                     method(&mut w, 4, 0x74c, &[0, 0]); // DST_ORIGIN_X/Y
+                 }
+@@ -1007,6 +1016,30 @@ impl Session {
+     pub fn info(&self) -> &SessionInfo {
+         &self.info
+     }
++
++    /// Wait for a picture and check the decoder's completion status.
++    pub fn wait_picture(&mut self, id: u64) -> VResult<()> {
++        let pic = self.pictures.get(&id).ok_or_else(|| VideoError::Invalid(format!("unknown picture id {id}")))?;
++        self.nvdec.wait(&self.drm, pic.decoded_at)?;
++        self.poll_status()
++    }
++
++
++    /// Allocate PRIME-shareable memory for copy-engine output, including CPU readback.
++    pub fn allocate_output(&self, size: usize) -> VResult<OutputAllocation> {
++        let memory = self.device.allocate_vram(size)?;
++        let fd = crate::external::export(&memory, self.drm.as_fd())?;
++        Ok(OutputAllocation { fd, memory })
++    }
++
++    /// Complete a copy-out before the CPU maps its destination.
++    pub fn copy_out_wait(&mut self, id: u64, target: &Target) -> VResult<()> {
++        if let Some(fence) = self.copy_out(id, target)? {
++            wait_sync_file(std::os::fd::AsRawFd::as_raw_fd(&fence), Duration::from_secs(5))
++                .map_err(VideoError::DeviceLost)?;
++        }
++        Ok(())
++    }
+ }
+ 
+ impl Drop for Session {
+@@ -1027,6 +1060,59 @@ impl Drop for Session {
+     }
+ }
+ 
++/// Lightweight PRIME output allocator, independent of decoder channels and DPB pools.
++pub struct OutputAllocator {
++    device: Rc<Device>,
++    drm: std::fs::File,
++}
++impl OutputAllocator {
++    pub fn new(dev: &VideoDevice) -> VResult<Self> {
++        let (device, _) = open_rm(Some(dev.pci))?;
++        let drm = open_render_node(dev.pci)?;
++        Ok(Self { device, drm })
++    }
++
++    /// Initialize the entire allocation before exposing it to an external consumer.
++    pub fn allocate_zeroed(&self, size: usize) -> VResult<OutputAllocation> {
++        if size == 0 {
++            return Err(VideoError::Invalid("empty output allocation".into()));
++        }
++        let memory = self.device.allocate_vram(size)?;
++        let mut mapping = memory.map()?;
++        let zero = vec![0u8; size.min(65536)];
++        let mut offset = 0;
++        while offset < size {
++            let len = zero.len().min(size - offset);
++            mapping.write_bytes(offset, &zero[..len])?;
++            offset += len;
++        }
++        crate::platform::device_full_barrier();
++        let fd = crate::external::export(&memory, self.drm.as_fd())?;
++        Ok(OutputAllocation { fd, memory })
++    }
++}
++
++/// Production copy-out allocation; the fd and mapping keep their own kernel references.
++pub struct OutputAllocation {
++    pub fd: OwnedFd,
++    memory: Rc<Memory>,
++}
++impl OutputAllocation {
++    pub fn map(&self) -> VResult<OutputMapping> {
++        Ok(OutputMapping { mapping: self.memory.map()? })
++    }
++}
++
++/// Bounds-checked CPU view of a completed copy-out allocation.
++pub struct OutputMapping {
++    mapping: Mapping,
++}
++impl OutputMapping {
++    pub fn read_bytes(&self, offset: usize, out: &mut [u8]) -> VResult<()> {
++        Ok(self.mapping.read_bytes(offset, out)?)
++    }
++}
++
+ /// Target description (NvVideoTarget, fds borrowed).
+ pub struct Target {
+     /// Y, CbCr (NV12/P010) or Y, Cb, Cr (FORMAT_YUV420P); [2] unused for the bi-planar formats.
+@@ -1120,9 +1206,15 @@ impl TargetLayout {
+                 )))
+             }
+         };
++        for p in 0..2 {
++            let minimum = if p == 0 { t.width } else { t.width.div_ceil(2) * 2 };
++            if !t.pitch[p].is_multiple_of(64) || t.pitch[p] < minimum.next_multiple_of(64) {
++                return Err(VideoError::Invalid(format!("block-linear plane {p} pitch {} is not a sufficient 64-byte stride", t.pitch[p])));
++            }
++        }
+         Ok(Self {
+             block: Some((h, kinds)),
+-            pitch: [0, 0, 0],
++            pitch: t.pitch,
+             planar: false,
+         })
+     }
+@@ -1144,7 +1236,7 @@ impl TargetLayout {
+         match self.block {
+             None => u64::from(self.pitch[p]) * u64::from(rows.saturating_sub(1)) + u64::from(line),
+             Some((h, _)) => {
+-                u64::from(line.next_multiple_of(64)) * u64::from(rows.next_multiple_of(8 << h))
++                u64::from(self.pitch[p]) * u64::from(rows.next_multiple_of(8 << h))
+             }
+         }
+     }
+@@ -1189,6 +1281,11 @@ mod tests {
+         }
+         let t = TargetLayout::parse(&target(bl(0, 1, 2, 0xfe, 1)), 0xc7b5, 1).unwrap();
+         assert_eq!(t.block, Some((1, [0, 0])));
++        assert_eq!(t.pitch, [256, 256, 0]);
++        assert_eq!(t.plane_bytes(1, 32, 63, 1), 256 * 32);
++        let mut undersized = target(bl(0, 1, 2, 0xfe, 1));
++        undersized.pitch = [32, 32, 0];
++        assert!(TargetLayout::parse(&undersized, 0xc7b5, 1).is_err());
+         assert!(TargetLayout::parse(&target(bl(1, 1, 2, 0xfe, 1)), 0xcab5, 1).is_err()); // compressed
+         assert!(TargetLayout::parse(&target(bl(0, 1, 3, 0xfe, 1)), 0xc7b5, 1).is_err()); // g=3 pre-Blackwell
+         assert!(TargetLayout::parse(&target(0x01 << 56 | 1), 0xcab5, 1).is_err()); // other vendor
+diff --git a/nvidia-prolapse/driver-source/native/video/README.md b/nvidia-prolapse/driver-source/native/video/README.md
+index a3c96c1..3037127 100644
+--- a/nvidia-prolapse/driver-source/native/video/README.md
++++ b/nvidia-prolapse/driver-source/native/video/README.md
+@@ -11,6 +11,21 @@ decode → next_picture → copy_out into a LINEAR NV12 dma-buf → release fenc
+ HDR metadata of every picture that carries any; `NV_VIDEO_MEASURE_ACQUIRE=1` (AVC test)
+ re-passes the previous release fence as the acquire fence and times the copy_out call.
+ 
++## 外部参数前端（VA-API）
++
++Rust 调用方可用 `Session::with_codec` 注入 `CodecDecoder`，由客户端提供已经解析的
++图像参数，复用会话的显存、提交、同步与 copy-out。原有 `Session::new` 和 C ABI 仍接收码流。
++`h264::codec::H264Decoder::build_picture` 复用硬件方法及辅助缓冲区，
++`h264::desc::initial_lists` 供两种前端共用参考列表初始化规则。
++
++`Session::wait_picture` 等待硬件并检查状态；`copy_out_wait` 同步完成输出拷贝。
++`OutputAllocator` 独立于解码会话分配和清零 PRIME 输出显存，使 VA surface 在解码前就能导出，
++且在后续解码时保持相同 backing。调用方必须在消费者读完之后才复用输出；RM 对象仍由所属线程持有。
++
++工作区 `nvidia/vaapi-rust` 提供该前端与硬件回归脚本。2026-10-26 在 RTX 4060 Laptop / 615.78.08
++验证了 Baseline/Main/High 共 666 帧与软件解码逐字节一致，以及 mpv 的 Wayland/EGL 显示。
++原有原生 H.264 码流路径另外通过 60 帧逐字节比对。以上不代表其它 GPU 或驱动版本已验证。
++
+ ## Layers
+ 
+ | File | Role |
+-- 
+2.56.0
+

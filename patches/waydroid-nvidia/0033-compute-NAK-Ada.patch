@@ -1,0 +1,1664 @@
+From 6f99f619269d28fe1609a3c26714657f15767ef5 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Tue, 27 Oct 2026 12:22:32 +0800
+Subject: [PATCH 33/37] =?utf-8?q?=E8=A7=86=E9=A2=91=20compute=20=E5=BC=95?=
+ =?utf-8?q?=E6=93=8E=EF=BC=9A=E6=9E=84=E5=BB=BA=E6=9C=9F=20NAK=20=E9=A2=84?=
+ =?utf-8?q?=E7=BC=96=E8=AF=91=E5=86=85=E6=A0=B8=EF=BC=8CAda=20=E4=B8=8A?=
+ =?utf-8?q?=E5=AE=9E=E6=9C=BA=E8=B7=91=E9=80=9A?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+- NAK 桥：按 SM（75/80/86/89/90/120）构造 Mesa winsys 的设备信息，拆出 nv_nak_build；拒绝带常量数据的着色器
+- 生成器 nv-nak-gen（gen.c）：输出 SASS、元数据、nak_fill_qmd 填好的 QMD 模板，以及程序地址 / cbuf 地址 / 网格的位段；
+  位段逐位从 nak_fill_qmd 测出并用 64 组组合值对照；SLM / CRS / 常量数据非零即失败
+- tools/gen-kernels.py：生成 shaders/sm*/*.bin 与 src/video/kernels.rs，--check 校验可复现
+- src/video/compute.rs：compute 通道、代码堆（256 字节对齐，改写后 instruction invalidate）、launch 槽复用、
+  通道错误经 error notifier 返回；只在已实测的 compute class（Ada 0xc9c0）上启用
+- 测试：QMD 打包与 nak_fill_qmd 逐位一致（QMD 2.2/3.0/4.0/5.0）；实机：已知图案、两个程序交替、
+  同一程序地址改写、10000 次 launch 资源不增、访问未映射地址返回通道错误
+---
+ .../driver-source/native/compiler/README.md   |  26 +-
+ .../driver-source/native/compiler/build.py    |   7 +-
+ .../driver-source/native/compiler/gen.c       | 176 ++++++
+ .../driver-source/native/compiler/meson.build |   7 +
+ .../driver-source/native/compiler/nv_nak.c    |  93 +++-
+ .../driver-source/native/compiler/nv_nak.h    |   3 +-
+ .../native/compiler/nv_nak_build.h            |  17 +
+ .../driver-source/native/shaders/fill.comp    |  11 +
+ .../driver-source/native/shaders/fill.spv     | Bin 0 -> 1312 bytes
+ .../driver-source/native/shaders/mix.comp     |  12 +
+ .../driver-source/native/shaders/mix.spv      | Bin 0 -> 1652 bytes
+ .../native/shaders/sm120/fill.bin             | Bin 0 -> 272 bytes
+ .../native/shaders/sm120/mix.bin              | Bin 0 -> 512 bytes
+ .../native/shaders/sm75/fill.bin              | Bin 0 -> 208 bytes
+ .../driver-source/native/shaders/sm75/mix.bin | Bin 0 -> 432 bytes
+ .../native/shaders/sm80/fill.bin              | Bin 0 -> 208 bytes
+ .../driver-source/native/shaders/sm80/mix.bin | Bin 0 -> 432 bytes
+ .../native/shaders/sm86/fill.bin              | Bin 0 -> 208 bytes
+ .../driver-source/native/shaders/sm86/mix.bin | Bin 0 -> 432 bytes
+ .../native/shaders/sm89/fill.bin              | Bin 0 -> 208 bytes
+ .../driver-source/native/shaders/sm89/mix.bin | Bin 0 -> 432 bytes
+ .../native/shaders/sm90/fill.bin              | Bin 0 -> 208 bytes
+ .../driver-source/native/shaders/sm90/mix.bin | Bin 0 -> 432 bytes
+ .../driver-source/native/src/video/compute.rs | 509 ++++++++++++++++++
+ .../driver-source/native/src/video/kernels.rs | 226 ++++++++
+ .../driver-source/native/src/video/mod.rs     |   2 +
+ .../driver-source/native/tools/gen-kernels.py | 117 ++++
+ 27 files changed, 1180 insertions(+), 26 deletions(-)
+ create mode 100644 nvidia-prolapse/driver-source/native/compiler/gen.c
+ create mode 100644 nvidia-prolapse/driver-source/native/compiler/nv_nak_build.h
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/fill.comp
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/fill.spv
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/mix.comp
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/mix.spv
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm120/fill.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm120/mix.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm75/fill.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm75/mix.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm80/fill.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm80/mix.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm86/fill.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm86/mix.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm89/fill.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm89/mix.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm90/fill.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm90/mix.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/src/video/compute.rs
+ create mode 100644 nvidia-prolapse/driver-source/native/src/video/kernels.rs
+ create mode 100755 nvidia-prolapse/driver-source/native/tools/gen-kernels.py
+
+diff --git a/nvidia-prolapse/driver-source/native/compiler/README.md b/nvidia-prolapse/driver-source/native/compiler/README.md
+index 73059c3..3b16542 100644
+--- a/nvidia-prolapse/driver-source/native/compiler/README.md
++++ b/nvidia-prolapse/driver-source/native/compiler/README.md
+@@ -2,10 +2,12 @@
+ 
+ `nv_nak.c` converts a supplied SPIR-V compute entrypoint into NIR, lowers the
+ native driver's buffer/push-constant ABI, and invokes Mesa's Rust NAK compiler
+-for SM120. It compiles the actual supplied program in-process. There is no
+-fixed-shader matching, PTX compilation, CUDA/NVRTC, or proprietary userspace
+-dependency. The adapter is C because Mesa exposes NIR passes through its C ABI;
+-NAK itself and the native GPU backend are Rust.
++for shader model 75, 80, 86, 89, 90 or 120 (`nv_nak_device` gives NAK the device
++fields Mesa's winsys derives for that SM). It compiles the actual supplied program
++in-process. There is no fixed-shader matching, PTX compilation, CUDA/NVRTC, or
++proprietary userspace dependency. The adapter is C because Mesa exposes NIR passes
++through its C ABI; NAK itself and the native GPU backend are Rust. The runtime
++Vulkan prototype only uses SM120.
+ 
+ ## Build
+ 
+@@ -73,7 +75,7 @@ go through Mesa/NAK; this is not a claim that every such combination has been
+ hardware tested. The runtime checks shader resource requirements separately.
+ Current dispatch has no base-workgroup offset, so base system values lower to
+ zero. `NumWorkgroups`, images/samplers, UBOs, descriptor arrays, specialization
+-constants, other stages and other shader models are unsupported. Buffer length
++constants, constant data and other stages are unsupported. Buffer length
+ records are reserved for later bounds lowering; robustBufferAccess is not
+ implemented by this bridge. Valid Vulkan programs must keep accesses in bounds.
+ 
+@@ -97,6 +99,20 @@ workgroup 64x1x1. Parent driver verification additionally executes these program
+ on the GPU through Vulkan. Compiler-only checks do not establish rendering,
+ Android app sandbox compatibility, or Vulkan conformance.
+ 
++## Kernel generator
++
++`gen.c` (`nv-nak-gen`, host build only) compiles one SPIR-V entrypoint for one
++shader model through the same `nv_nak_build` and prints JSON: the SASS, resource
++metadata, a QMD template filled by Mesa's `nak_fill_qmd`, and the bit runs that
++carry the per-launch program address, cbuf 0 address and grid size. The runs are
++measured from `nak_fill_qmd` one input bit at a time and checked against it on 64
++combined launches; it refuses shaders needing local memory, a CRS stack or constant
++data. `tools/gen-kernels.py` runs it for every kernel in `shaders/` and shader
++model, writing `shaders/sm<sm>/<name>.bin` and `src/video/kernels.rs` for the video
++compute engine (`src/video/compute.rs`); `--check` verifies the committed files are
++byte-identical to a regeneration. Run it inside `localhost/nvk-native-a17` with the
++repository at `/work`, after `compiler/build.py --target host`.
++
+ ## Source anchors and licensing
+ 
+ - Mesa `src/vulkan/runtime/vk_nir.c:157`: SPIR-V entrypoint preparation,
+diff --git a/nvidia-prolapse/driver-source/native/compiler/build.py b/nvidia-prolapse/driver-source/native/compiler/build.py
+index d3e8df5..22a708b 100644
+--- a/nvidia-prolapse/driver-source/native/compiler/build.py
++++ b/nvidia-prolapse/driver-source/native/compiler/build.py
+@@ -57,7 +57,7 @@ def main():
+         run(["git", "-C", SOURCE, "apply", patch])
+     bridge = SOURCE / "src/nouveau/native-bridge"
+     bridge.mkdir(exist_ok=True)
+-    for file in ("nv_nak.h", "nv_nak.c", "check.c", "meson.build"):
++    for file in ("nv_nak.h", "nv_nak_build.h", "nv_nak.c", "check.c", "gen.c", "meson.build"):
+         shutil.copy2(HERE / file, bridge / file)
+ 
+     common = ["-Dvulkan-drivers=nouveau", "-Dgallium-drivers=", "-Dplatforms=", "-Dglx=disabled",
+@@ -107,7 +107,10 @@ endian = 'little'
+         else:
+             run(setup, env=target_env)
+         cc_launcher.record(build)
+-        run(["ninja", "-C", build, "src/nouveau/native-bridge/libnv_native_nak.so", "src/nouveau/native-bridge/nv-nak-check", "-j", args.j, *ninja_load()], env=target_env)
++        targets_built = ["src/nouveau/native-bridge/libnv_native_nak.so", "src/nouveau/native-bridge/nv-nak-check"]
++        if target == "host":  # the kernel generator runs at build time only
++            targets_built.append("src/nouveau/native-bridge/nv-nak-gen")
++        run(["ninja", "-C", build, *targets_built, "-j", args.j, *ninja_load()], env=target_env)
+         print(f"Built {target}: {build}/src/nouveau/native-bridge/libnv_native_nak.so")
+ 
+ if __name__ == "__main__":
+diff --git a/nvidia-prolapse/driver-source/native/compiler/gen.c b/nvidia-prolapse/driver-source/native/compiler/gen.c
+new file mode 100644
+index 0000000..5dc857c
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/compiler/gen.c
+@@ -0,0 +1,176 @@
++/* SPDX-License-Identifier: MIT
++ * Build-time kernel generator: compiles one SPIR-V compute entrypoint for one shader model with
++ * the bridge's ABI (nv_nak.c) and prints, as JSON, everything a runtime without NAK needs to
++ * launch it: the SASS, the resource metadata, and a QMD template filled by Mesa's own
++ * nak_fill_qmd plus the bit runs where the per-launch values (program address, cbuf 0 address,
++ * grid size) go. The runs are measured from nak_fill_qmd one input bit at a time and then
++ * checked against nak_fill_qmd on combined values; the generator fails rather than emit a
++ * kernel needing local memory, a CRS stack or constant data, none of which the runtime provides.
++ *
++ * usage: nv-nak-gen <sm> <entrypoint> <file.spv>
++ */
++#include "nv_nak.h"
++#include "nv_nak_build.h"
++#include "nouveau/compiler/nak.h"
++#include "nouveau/headers/nv_device_info.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CBUF_BYTES 1152
++#define ADDR_LOW 8   /* the runtime places programs and cbufs 256-byte aligned */
++#define ADDR_HIGH 49 /* exclusive: 49-bit GPU virtual addresses */
++
++enum { PROGRAM, CBUF, GRID_X, GRID_Y, GRID_Z, VARIABLES };
++static const char *const names[VARIABLES] = { "program", "cbuf", "grid_x", "grid_y", "grid_z" };
++
++struct launch { uint64_t value[VARIABLES]; };
++
++static const struct nv_device_info *dev;
++static const struct nak_shader_info *info;
++static uint32_t qmd_bytes;
++
++static void fill(const struct launch *l, uint32_t *qmd)
++{
++    struct nak_qmd_info q = {
++        .addr = l->value[PROGRAM],
++        .smem_size = info->cs.smem_size,
++        .global_size = { l->value[GRID_X], l->value[GRID_Y], l->value[GRID_Z] },
++        .num_cbufs = 1,
++        .cbufs = { { .index = 0, .size = CBUF_BYTES, .addr = l->value[CBUF] } },
++    };
++    memset(qmd, 0, NAK_MAX_QMD_SIZE_B);
++    nak_fill_qmd(dev, info, &q, qmd, qmd_bytes);
++}
++
++static int bit(const uint32_t *q, unsigned b) { return q[b / 32] >> (b % 32) & 1; }
++
++/* run[v][k]: QMD bit receiving input bit k of variable v, or -1 when the bit is not carried */
++static int run[VARIABLES][64];
++static unsigned width[VARIABLES];
++
++static void pack(const uint32_t *template, const struct launch *l, uint32_t *qmd)
++{
++    memcpy(qmd, template, NAK_MAX_QMD_SIZE_B);
++    for (unsigned v = 0; v < VARIABLES; v++)
++        for (unsigned k = 0; k < 64; k++)
++            if (l->value[v] >> k & 1) qmd[run[v][k] / 32] |= 1u << (run[v][k] % 32);
++}
++
++static uint64_t lcg(uint64_t *s)
++{
++    *s = *s * 6364136223846793005ull + 1442695040888963407ull;
++    return *s >> 11;
++}
++
++int main(int argc, char **argv)
++{
++    if (argc != 4) { fprintf(stderr, "usage: %s <sm> <entrypoint> <file.spv>\n", argv[0]); return 2; }
++    uint32_t sm = (uint32_t)strtoul(argv[1], NULL, 10);
++    struct nv_device_info device;
++    if (nv_nak_device(sm, &device)) { fprintf(stderr, "unsupported shader model %u\n", sm); return 1; }
++    dev = &device;
++    FILE *f = fopen(argv[3], "rb");
++    if (!f) { perror(argv[3]); return 1; }
++    static uint32_t words[1 << 18];
++    size_t count = fread(words, 4, sizeof(words) / 4, f);
++    fclose(f);
++    char error[512];
++    uint32_t constant_bytes = 0;
++    struct nak_shader_bin *bin = nv_nak_build(words, count, argv[2], dev, &constant_bytes, error, sizeof(error));
++    if (!bin) { fprintf(stderr, "%s: %s\n", argv[3], error); return 1; }
++    info = &bin->info;
++    if (info->slm_size || info->crs_size || constant_bytes) {
++        fprintf(stderr, "%s: needs local memory %u, CRS %u, constant data %u bytes; the runtime provides none\n",
++                argv[3], info->slm_size, info->crs_size, constant_bytes);
++        return 1;
++    }
++    qmd_bytes = nak_qmd_size_B(dev);
++
++    struct nak_qmd_dispatch_size_layout grid = nak_get_qmd_dispatch_size_layout(dev);
++    width[PROGRAM] = width[CBUF] = ADDR_HIGH;
++    width[GRID_X] = grid.x_end - grid.x_start;
++    width[GRID_Y] = grid.y_end - grid.y_start;
++    width[GRID_Z] = grid.z_end - grid.z_start;
++    for (unsigned v = GRID_X; v <= GRID_Z; v++)
++        if (width[v] > 32) width[v] = 32;
++
++    uint32_t template[NAK_MAX_QMD_DWORDS], probe[NAK_MAX_QMD_DWORDS], check[NAK_MAX_QMD_DWORDS];
++    struct launch zero = { { 0 } };
++    fill(&zero, template);
++    int used[NAK_MAX_QMD_SIZE_B * 8] = { 0 };
++    for (unsigned v = 0; v < VARIABLES; v++) {
++        unsigned low = v <= CBUF ? ADDR_LOW : 0;
++        for (unsigned k = 0; k < 64; k++) run[v][k] = -1;
++        for (unsigned k = low; k < width[v]; k++) {
++            struct launch l = zero;
++            l.value[v] = 1ull << k;
++            fill(&l, probe);
++            int found = -1;
++            for (unsigned b = 0; b < qmd_bytes * 8; b++) {
++                if (bit(probe, b) == bit(template, b)) continue;
++                if (found >= 0 || bit(template, b) || used[b]) {
++                    fprintf(stderr, "%s bit %u does not map to one free QMD bit\n", names[v], k);
++                    return 1;
++                }
++                found = (int)b;
++            }
++            if (found < 0) { fprintf(stderr, "%s bit %u changes no QMD bit\n", names[v], k); return 1; }
++            used[found] = 1;
++            run[v][k] = found;
++        }
++    }
++
++    /* combined values: packing by the runs must reproduce nak_fill_qmd exactly */
++    uint64_t seed = sm * 0x9e3779b97f4a7c15ull;
++    struct launch samples[4];
++    for (unsigned i = 0; i < 64; i++) {
++        struct launch l;
++        for (unsigned v = 0; v < VARIABLES; v++) {
++            unsigned low = v <= CBUF ? ADDR_LOW : 0;
++            uint64_t mask = (width[v] >= 64 ? ~0ull : (1ull << width[v]) - 1) & ~((1ull << low) - 1);
++            l.value[v] = lcg(&seed) & mask;
++        }
++        if (i < 4) samples[i] = l;
++        fill(&l, probe);
++        pack(template, &l, check);
++        if (memcmp(probe, check, qmd_bytes)) { fprintf(stderr, "combined launch %u differs from nak_fill_qmd\n", i); return 1; }
++    }
++
++    printf("{\"sm\": %u, \"compute_class\": %u, \"code\": \"", sm, dev->cls_compute);
++    for (uint32_t i = 0; i < bin->code_size; i++) printf("%02x", ((const uint8_t *)bin->code)[i]);
++    printf("\", \"registers\": %u, \"shared_bytes\": %u, \"barriers\": %u, \"workgroup\": [%u, %u, %u],\n",
++           info->num_gprs, info->cs.smem_size, info->num_control_barriers,
++           info->cs.local_size[0], info->cs.local_size[1], info->cs.local_size[2]);
++    printf(" \"cbuf_bytes\": %u, \"qmd\": [", CBUF_BYTES);
++    for (unsigned i = 0; i < qmd_bytes / 4; i++) printf("%s%u", i ? ", " : "", template[i]);
++    printf("],\n \"width\": {");
++    for (unsigned v = 0; v < VARIABLES; v++) printf("%s\"%s\": %u", v ? ", " : "", names[v], width[v]);
++    printf("},\n \"runs\": {");
++    for (unsigned v = 0; v < VARIABLES; v++) {
++        printf("%s\"%s\": [", v ? ", " : "", names[v]);
++        /* contiguous input bits landing on contiguous QMD bits: [input bit, QMD bit, length] */
++        int first = 1;
++        for (unsigned k = 0; k < 64;) {
++            if (run[v][k] < 0) { k++; continue; }
++            unsigned n = 1;
++            while (k + n < 64 && run[v][k + n] == run[v][k] + (int)n) n++;
++            printf("%s[%u, %d, %u]", first ? "" : ", ", k, run[v][k], n);
++            first = 0;
++            k += n;
++        }
++        printf("]");
++    }
++    printf("},\n \"samples\": [");
++    for (unsigned i = 0; i < 4; i++) {
++        fill(&samples[i], probe);
++        printf("%s\n  {\"values\": [", i ? "," : "");
++        for (unsigned v = 0; v < VARIABLES; v++) printf("%s%llu", v ? ", " : "", (unsigned long long)samples[i].value[v]);
++        printf("], \"qmd\": [");
++        for (unsigned w = 0; w < qmd_bytes / 4; w++) printf("%s%u", w ? ", " : "", probe[w]);
++        printf("]}");
++    }
++    printf("]}\n");
++    nak_shader_bin_destroy(bin);
++    return 0;
++}
+diff --git a/nvidia-prolapse/driver-source/native/compiler/meson.build b/nvidia-prolapse/driver-source/native/compiler/meson.build
+index 27cb2fb..bdf96ad 100644
+--- a/nvidia-prolapse/driver-source/native/compiler/meson.build
++++ b/nvidia-prolapse/driver-source/native/compiler/meson.build
+@@ -5,3 +5,10 @@ native_nak = shared_library('nv_native_nak', 'nv_nak.c',
+   install : false)
+ 
+ native_nak_check = executable('nv-nak-check', 'check.c', link_with : native_nak, install : false)
++
++# Build-time kernel generator (gen.c): links the bridge sources directly for nv_nak_build and
++# NAK's QMD helpers, which the shared library does not export.
++native_nak_gen = executable('nv-nak-gen', ['nv_nak.c', 'gen.c'],
++  include_directories : [inc_include, inc_src],
++  dependencies : [idep_nak, idep_vtn, idep_nir, idep_mesautil, dep_thread, dep_m],
++  install : false)
+diff --git a/nvidia-prolapse/driver-source/native/compiler/nv_nak.c b/nvidia-prolapse/driver-source/native/compiler/nv_nak.c
+index 05f77d0..ca9efc1 100644
+--- a/nvidia-prolapse/driver-source/native/compiler/nv_nak.c
++++ b/nvidia-prolapse/driver-source/native/compiler/nv_nak.c
+@@ -4,6 +4,7 @@
+  * with a deliberately small, explicitly documented root table ABI.
+  */
+ #include "nv_nak.h"
++#include "nv_nak_build.h"
+ #include "compiler/nir/nir.h"
+ #include "compiler/nir/nir_builder.h"
+ #include "compiler/spirv/nir_spirv.h"
+@@ -86,26 +87,55 @@ static void shared_layout(const struct glsl_type *type, unsigned *size, unsigned
+     *alignment = component;
+ }
+ 
+-EXPORTED int nv_nak_compile(const uint32_t *words, size_t count,
+-                           const char *entry, uint32_t sm,
+-                           struct nv_nak_result *out, char *error, size_t capacity)
++/* The nv_device_info fields NAK reads (api.rs: sm, max_warps_per_mp; qmd.rs: cls_compute,
++ * max_smem_per_wg_kB, sm_smem_sizes_kB) for each supported shader model, with the values
++ * Mesa's winsys derives for that SM (nouveau_device.c: max_warps_per_mp_for_sm,
++ * init_shared_mem_sizes; compute classes from the NVIDIA class headers). */
++int nv_nak_device(uint32_t sm, struct nv_device_info *dev)
++{
++    static const uint16_t ampere[10] = { 0, 8, 16, 32, 64, 100, 132, 164, 196, 228 };
++    memset(dev, 0, sizeof(*dev));
++    dev->sm = sm;
++    switch (sm) {
++    case 75:  dev->cls_compute = 0xc5c0; dev->max_warps_per_mp = 32; break;
++    case 80:  dev->cls_compute = 0xc6c0; dev->max_warps_per_mp = 64; dev->sm_smem_size_count = 8; break;
++    case 86:  dev->cls_compute = 0xc7c0; dev->max_warps_per_mp = 48; dev->sm_smem_size_count = 6; break;
++    case 89:  dev->cls_compute = 0xc9c0; dev->max_warps_per_mp = 48; dev->sm_smem_size_count = 6; break;
++    case 90:  dev->cls_compute = 0xcbc0; dev->max_warps_per_mp = 64; dev->sm_smem_size_count = 10; break;
++    case 120: dev->cls_compute = 0xcec0; dev->max_warps_per_mp = 48; dev->sm_smem_size_count = 6; break;
++    default: return -1;
++    }
++    if (sm == 75) {
++        dev->sm_smem_sizes_kB[0] = 32;
++        dev->sm_smem_sizes_kB[1] = 64;
++        dev->sm_smem_size_count = 2;
++    } else {
++        memcpy(dev->sm_smem_sizes_kB, ampere, sizeof(ampere[0]) * dev->sm_smem_size_count);
++    }
++    dev->max_smem_per_wg_kB = dev->sm_smem_sizes_kB[dev->sm_smem_size_count - 1];
++    return 0;
++}
++
++/* Compiles one SPIR-V compute entrypoint for `dev`. On success returns the NAK binary (destroy
++ * with nak_shader_bin_destroy) and the size of the shader's constant data, which this ABI has
++ * no buffer for. On failure returns NULL with a diagnostic in `error`. */
++struct nak_shader_bin *nv_nak_build(const uint32_t *words, size_t count, const char *entry,
++                                    const struct nv_device_info *dev, uint32_t *constant_bytes,
++                                    char *error, size_t capacity)
+ {
+-    if (capacity && !error) return -1;
+     if (capacity) error[0] = 0;
+     struct lowering state = { error, capacity, false };
+-    if (!out) return -1;
+-    memset(out, 0, sizeof(*out));
+-    if (!words || count < 5 || words[0] != 0x07230203 || !entry || sm != 120) {
+-        fail(&state, "Expected SPIR-V compute module and shader model 120"); return -1;
++    struct nak_shader_bin *bin = NULL;
++    if (!words || count < 5 || words[0] != 0x07230203 || !entry) {
++        fail(&state, "Expected a SPIR-V compute module"); return NULL;
+     }
+     for (size_t i = 5; i < count;) {
+         size_t n = words[i] >> 16;
+-        if (!n || n > count - i) { fail(&state, "Truncated SPIR-V instruction"); return -1; }
++        if (!n || n > count - i) { fail(&state, "Truncated SPIR-V instruction"); return NULL; }
+         i += n;
+     }
+     glsl_type_singleton_init_or_ref();
+-    struct nv_device_info dev = { .sm = 120, .max_warps_per_mp = 48 };
+-    struct nak_compiler *nak = nak_compiler_create(&dev);
++    struct nak_compiler *nak = nak_compiler_create(dev);
+     struct spirv_to_nir_options options = {
+         .environment = NIR_SPIRV_VULKAN,
+         .ssbo_addr_format = nir_address_format_64bit_global,
+@@ -145,10 +175,41 @@ EXPORTED int nv_nak_compile(const uint32_t *words, size_t count,
+     NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, shared_layout);
+     NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
+     NIR_PASS(_, nir, nir_opt_dce);
+-    struct nak_shader_bin *bin = nak_compile_shader(nir, false, nak, 0, NULL, false);
++    bin = nak_compile_shader(nir, false, nak, 0, NULL, false);
+     if (!bin) { fail(&state, "NAK compilation failed"); goto done; }
++    *constant_bytes = nir->constant_data_size;
++done:
++    if (nir) ralloc_free(nir);
++    nak_compiler_destroy(nak);
++    glsl_type_singleton_decref();
++    return bin;
++}
++
++EXPORTED int nv_nak_compile(const uint32_t *words, size_t count,
++                           const char *entry, uint32_t sm,
++                           struct nv_nak_result *out, char *error, size_t capacity)
++{
++    if ((capacity && !error) || !out) return -1;
++    memset(out, 0, sizeof(*out));
++    struct nv_device_info dev;
++    if (nv_nak_device(sm, &dev)) {
++        if (capacity) snprintf(error, capacity, "Unsupported shader model %u", sm);
++        return -1;
++    }
++    uint32_t constant_bytes = 0;
++    struct nak_shader_bin *bin = nv_nak_build(words, count, entry, &dev, &constant_bytes, error, capacity);
++    if (!bin) return -1;
++    if (constant_bytes) {
++        if (capacity) snprintf(error, capacity, "Shader constant data (%u bytes) has no buffer in this ABI", constant_bytes);
++        nak_shader_bin_destroy(bin);
++        return -1;
++    }
+     out->code = malloc(bin->code_size);
+-    if (!out->code) { fail(&state, "Out of host memory"); nak_shader_bin_destroy(bin); goto done; }
++    if (!out->code) {
++        if (capacity) snprintf(error, capacity, "Out of host memory");
++        nak_shader_bin_destroy(bin);
++        return -1;
++    }
+     memcpy(out->code, bin->code, bin->code_size);
+     out->code_size = bin->code_size;
+     out->registers = bin->info.num_gprs;
+@@ -158,11 +219,7 @@ EXPORTED int nv_nak_compile(const uint32_t *words, size_t count,
+     for (unsigned i = 0; i < 3; i++) out->workgroup[i] = bin->info.cs.local_size[i];
+     out->cbuf_bytes = 1152;
+     nak_shader_bin_destroy(bin);
+-done:
+-    if (nir) ralloc_free(nir);
+-    nak_compiler_destroy(nak);
+-    glsl_type_singleton_decref();
+-    return state.failed ? -1 : 0;
++    return 0;
+ }
+ EXPORTED void nv_nak_free(struct nv_nak_result *result)
+ {
+diff --git a/nvidia-prolapse/driver-source/native/compiler/nv_nak.h b/nvidia-prolapse/driver-source/native/compiler/nv_nak.h
+index 51a3a2e..41e69da 100644
+--- a/nvidia-prolapse/driver-source/native/compiler/nv_nak.h
++++ b/nvidia-prolapse/driver-source/native/compiler/nv_nak.h
+@@ -21,7 +21,8 @@ struct nv_nak_result {
+ };
+ /* 0 success, -1 invalid/unsupported or compile failure. out is zeroed on error.
+  * error is NUL-terminated when error_size>0. Allocation belongs to the bridge.
+- * All inputs are borrowed for this call. sm must currently equal 120.
++ * All inputs are borrowed for this call. sm: 75, 80, 86, 89, 90 or 120; shaders with
++ * constant data are refused (no buffer for it in this ABI).
+  * Callers must serialize compiler calls (Mesa global GLSL type cache). */
+ int nv_nak_compile(const uint32_t *spirv, size_t word_count,
+                    const char *entrypoint, uint32_t sm,
+diff --git a/nvidia-prolapse/driver-source/native/compiler/nv_nak_build.h b/nvidia-prolapse/driver-source/native/compiler/nv_nak_build.h
+new file mode 100644
+index 0000000..6f22ffa
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/compiler/nv_nak_build.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: MIT
++ * Bridge internals shared by the shared library (nv_nak.c) and the build-time kernel
++ * generator (gen.c). Not part of the library ABI. */
++#ifndef NV_NATIVE_NAK_BUILD_H
++#define NV_NATIVE_NAK_BUILD_H
++#include <stddef.h>
++#include <stdint.h>
++struct nv_device_info;
++struct nak_shader_bin;
++/* The device description NAK compiles and fills QMDs for at shader model `sm`; -1 if unsupported. */
++int nv_nak_device(uint32_t sm, struct nv_device_info *dev);
++/* Compiles one SPIR-V compute entrypoint with the bridge ABI. Returns the NAK binary (free with
++ * nak_shader_bin_destroy) and the shader's constant data size, or NULL with `error` set. */
++struct nak_shader_bin *nv_nak_build(const uint32_t *words, size_t count, const char *entry,
++                                    const struct nv_device_info *dev, uint32_t *constant_bytes,
++                                    char *error, size_t capacity);
++#endif
+diff --git a/nvidia-prolapse/driver-source/native/shaders/fill.comp b/nvidia-prolapse/driver-source/native/shaders/fill.comp
+new file mode 100644
+index 0000000..0babe67
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/shaders/fill.comp
+@@ -0,0 +1,11 @@
++// Test kernel for the video compute engine: data[i] = seed + i * step for i < count.
++#version 450
++layout(local_size_x = 64) in;
++layout(set = 0, binding = 0, std430) buffer Out { uint data[]; };
++layout(push_constant) uniform Push { uint count; uint seed; uint step; } p;
++void main()
++{
++    uint i = gl_GlobalInvocationID.x;
++    if (i < p.count)
++        data[i] = p.seed + i * p.step;
++}
+diff --git a/nvidia-prolapse/driver-source/native/shaders/fill.spv b/nvidia-prolapse/driver-source/native/shaders/fill.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..a152472ca22dcd76dc97c9a36fb669bfdafb6b3b
+GIT binary patch
+literal 1312
+zcmZQ(Qf6mhWn|!H;9xLdfB-=TCI&_Z1_o{hHZbk(6YQf`T#}+^VhUEm$G{9$2vWn(
+zz`?-Ez`(%5z`&53n3)HX;AUW85N2RtP+(wS5MW>f%Ly_tFgP$UfXxHxV`gAxU}9ik
+zIK;@nz{<b^Rs++|%D~LP!N9<f$pDh$U;vqyo)hn$lb@8B<C#~MpPX2dnV;wB0+wfC
+z0GS<7TATs0n~i}L%m=ZP^Gowe7#J8}Vjz2qQ&UqwaxgKF8;VO(3qWEZdqM67aX@T2
+z1_lQI(h{(K5F4Z>C9xzCM1$l({sXby8Cbw>1i4d&fq}uDff?)ukl7wc?okFQW?*1|
+ziGkb$5(9-DObnz4BnI+7$Xr>l`yt^AG8g0ykQ$JB5F2D9NIi%KsRy}95ySzzg9RK1
+zN=STtaJ(`wNP^>t2^<HC44~Lx0JB9ISQyx#aR<_-z`(-5&cFc1AaQX976wkJn?R`m
+zB+mtnSCF_h0}BI)4+;yA|Fogz@qi2io6Ew$3sny?PYxPBAT|tx%oJi^0NVqKTacL`
+zJ}7QLc7WU{0yYbho<Meh_@YR5h(Yy(%oJf@0{d5%ftdjoo^lM#4507>@j>><GcYiK
+z+z1i_*$3i-!V)9~GanR=Fh7CpQ)7UH8A!i2R6oc*ka`fU3r+Jdz8=)yIt*-Jzk%Wc
+zqy{7o!e$Jt;5Y!K2as1l;roMu37o$`ZUV&vC|!VPM+R1KIPyW`6XZ@?Xjt<zFff3`
+z?V$Mx#D~cVFff4g7DzuRjKsm|fPn!Nb}%&(3=9k)@eK^D;Bb=y=VJy2kob27W(H6i
+z2f6PT0}BI4PMU!MECzBbhz&Cblnz1eh1ms4r=U0lg(FOj3IhWJNF2sjMRT7z)P10^
+zhN;nDU|;}=w=l4R)2b!|0|Q7ONW1|mrp3U(05TgS=g7du0E!<SXqo}}734Nh_<+Pf
+VYJV~?!TkX8-(Lns1`7s81^~?zKEnV2
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/mix.comp b/nvidia-prolapse/driver-source/native/shaders/mix.comp
+new file mode 100644
+index 0000000..95f8fcb
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/shaders/mix.comp
+@@ -0,0 +1,12 @@
++// Test kernel for the video compute engine, a different program from fill.comp:
++// data[i] = (seed ^ i) * 3 + data[i] for i < count, over a 2D grid of 8x8 workgroups.
++#version 450
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(set = 0, binding = 1, std430) buffer Out { uint data[]; };
++layout(push_constant) uniform Push { uint count; uint seed; uint pitch; } p;
++void main()
++{
++    uint i = gl_GlobalInvocationID.y * p.pitch + gl_GlobalInvocationID.x;
++    if (gl_GlobalInvocationID.x < p.pitch && i < p.count)
++        data[i] = (p.seed ^ i) * 3u + data[i];
++}
+diff --git a/nvidia-prolapse/driver-source/native/shaders/mix.spv b/nvidia-prolapse/driver-source/native/shaders/mix.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e11a8b90d32ee5ed0fdac10b30dbe48b61882c1
+GIT binary patch
+literal 1652
+zcmZQ(Qf6mhWn|!H;9ziMfB-=TCI&_Z1_o{hHZbk(6YQf`T#}+^Vrl?V!N<T1qQG+e
+z3>*xs3=9k`3=9mpiJ5sI32p`k1|bFp29RO_1~#yqAOiyf2NZ+MW@cb!U}9ikIK;@n
+zz{<b^Rs++|%D@a(o5=u@<6r=pm!1>vo|B)HnB$pOmY<whl9`|9=>nE#VGv+oU<fEJ
+z&H&lX#=r{ZgV@RWrFkU`3=A+akiEsJsVN{im>9?n1(_wuAk83qLGCU9o6F3g$H2hg
+zUs?jz4`PG#r6iUlf@qLhkpDnzcLo-)8$s@rVPIfzXJ7`q0c5rZl6#aviWwLfU}7Nm
+zfW$yy2NMJ70f~Xa3S_P>*!__31(^$S2S^P_J%|l55~LnPgVclEq{zSkjvE+X2_y-2
+z7Yl;}I9?eTBpDbOgc+E?aiGWmiVX%ZTa<x?fsKKIK>?~qfq{jAoq++2LE_>JEDW4b
+zH-S<CNS+I7A4uGqfrSCY2ZaU5f7(#<c%W)P>Up7Tka=>@@By)57^DW2UO?u7;ud5k
+zh!2VzkQm5~!caHD>;Uma7$ANC=@(^SfV&gs29TdY-V$M8VvuEEU;v4O^r?Xa85kI3
+z8JHPh;Vs7iiGL6uWS%|)0|UqppfCry2gC=3HAoC*juF&fAU?=1<_rwroC4Bs1=SA{
+zhsoPR^Meip8`!O&xB-cQFvwgp23ByKfYJxZiJ<WQ!N3I0Zy+~-;sumWK(r$RD+4H8
+z`JnL&(r*h5dwvE629P*N4Jcg1p!pLNUNAM{3=9k)@fHSFaQsU!Fff4hfy6=jKxRup
+z%?5=dOrJCZ0|Q9B0jdv_{y};{;&#w{3=)HxA&12bc?JdskT^&U$bF!+2a0QC_kq$h
+zNPGhWD>&{zX&R&tB>tU&nLz~<Knx5FzZh5;Kysiw0TKg+7l;jWuPQXmVRorQ!vd5B
+zU}`iN7#Kj}FuODv7#KkMK;l0cn80>{%mtbMm4O}X9xVn2u)UzN5TqVtC&*noNbUlu
+z(Pm&^0EvP0gV-=T4bj|X40RVMO~KTdFfcHH#9@3>sGeicus361U;wEBiNoU2f`Nen
+zBo0c8FnyL#eU1!l44`yr4K1rdVE~eYsk32VU;xR%;?|adfdOP5NF1iu4oNS_51=>)
+WiGkFD!V2bB5dD{dk->t2kpTdX%Ty%*
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm120/fill.bin b/nvidia-prolapse/driver-source/native/shaders/sm120/fill.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..812555e97281ed5f5305bda3406391501643b01f
+GIT binary patch
+literal 272
+zcmX?H$p8VW3=9lRd<>E>z9ItygA*SEQw<|To}Yn(;gmdsU=agY;J*PM1H&<WhBf7k
+z{}~z>7#KJhI2c&?7<g(JzzPZkK5#SKk!SGjglK1AXkcbI#Lv)F&G?^zi4mk8Y+q9~
+z(|-m=DBp#TL8XWhte=U2kAdNkJ%eNg0|OHS1H*qF1_p*>ApOk$!6tGrFo5h6C}Lp-
+z@&7;g$j)#~o&jPW*ga5rRwj^!|4-@}7|zHuv{f>&fIRU3r2r4Z5k>}In18|UlV<<`
+D@VqK%
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm120/mix.bin b/nvidia-prolapse/driver-source/native/shaders/sm120/mix.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..7007d8efcfaa55fbcec64f773c7d633e0b5344cb
+GIT binary patch
+literal 512
+zcmX?H$p8VW3=9lRd<=&x86kW%1_lNvJ_bpcydnbwLlcM(l~-b5U^v9bz*NHoQP0o7
+z!Ej2RL9mDcEbw1~kAdNsKf{`GrvD6$3=9k$3>+ZyLF&OKfYcw-XW*$}0Ba}^_`nU(
+z&&ULl2kSr6&!AGn$Otx&fscdX5I;j`@qdVY3<3-wzH21|LjqW&ff>Yi@8kjV7#JY@
+zrfP=&3=E7Q`xzKm_!xMKKpX~!0)Y?A4A<lt+$&j7)XP*rxFtV7GBe!ZXK;l1A8MWi
+zoDcFpKZ9>4L_Laqj0pRLiomur{I}_2XE-F!AXx$N&wr3JkMT1!RWtu*06Bq!0qj13
+zA{J(_{~vs0XE-L$&{WOzpMez|eo%Q<CQu0ce^SrDa7Lb?v67Jm#AkRZ#{=@8N(BQ0
+gGXuy@KCpaSCD?R^|1Sl27>+P9_`=-}3Lkj}0MW%wng9R*
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm75/fill.bin b/nvidia-prolapse/driver-source/native/shaders/sm75/fill.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..9417de1d4ca90a0f8566c11c338174913cbb3f4b
+GIT binary patch
+literal 208
+zcmX?H$p8VW3=9lRd<>E>z9ItygA*SEQw<|To}Yn(;e<ScU=agY;J*PM1H%b@2A(RA
+zG$TWSzz1fA8~hBuogh94H!w3C;%8v0Vq{=oWMp9AXJBAB#m}Gu;xjQaFf#BlfaE1B
+z7#Nrs7#RNZFfcHj;Aar10`V9a{y+H04&gKZ2if@lNj(F@8GeSgN(Ls71MEEoc^Hl`
+OGWf#W%K)-Zo&f;G&>pP-
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm75/mix.bin b/nvidia-prolapse/driver-source/native/shaders/sm75/mix.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..557de534ab20889f6bb91cde734b006e94b9d000
+GIT binary patch
+literal 432
+zcmX?H$p8VW3=9lRd<=&x86kW%1_lNvJ_bpcydnbwLlcM(l~-b5U^v9bz*NHoQP0o7
+z!Ei#JL9mDcEbw1~kAdNsKUf~D10;V)pMj?eWDg@lfxri5hGYB;f<=r>AbGI*Q~eAo
+zRg8=bU=cnBh9mq8p~e3p<}(N|FdX7%aIIuu2mp&TFoXE+oeT^LNPM0u21W)3sQH)p
+z8Qd!wKsp&17$E9pD!_^vN`8K1X1K!7;0W^{Nd6H&g9Mxp@*h8gZzn`OOurDwd`3ow
+z|2BQ>Ap0dN7#Tqx{?Eg}z;J?}L7<9>k%5JQ;s1k=><~Wle+E_thW}6M85qv+Gc;B*
+yGTDQS^pxjeVBup>sbFAWW&pXEkAdNgJVRS0B>e0>1$h{bFf#bU-2-yJJOcnm#Xpe%
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm80/fill.bin b/nvidia-prolapse/driver-source/native/shaders/sm80/fill.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..d389520c6774103086c358dff0520737787ee4ce
+GIT binary patch
+literal 208
+zcmX?H$p8VW3=9lRd<>E>z9ItygA*SEQw<|To}Yn(;e<ScU=agY;J*PM1H%b@2A(RA
+zG$TWSzz1fATl@^Zogh94H!w3C;%8v0Vq{=oWMp9AXJBAB#m}Gu;xjQaFf#BlfaE1B
+z7#Nrs7#RNZFfcHj;Aar10`V9a{y+H04&gKZ2if@lNj+G9TO|V%$N}~*1$Y>aFf#bU
+L+{*y6Po4n))Y>0R
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm80/mix.bin b/nvidia-prolapse/driver-source/native/shaders/sm80/mix.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..7579a8cee0e4bcb7b7bffad8c69bd159d0142e44
+GIT binary patch
+literal 432
+zcmX?H$p8VW3=9lRd<=&x86kW%1_lNvJ_bpcydnbwLlcM(l~-b5U^v9bz*NHoQP0o7
+z!Ei#JL9mDcEbw1~kAdNsKUf~D10;V)pMj?eWDg@lfxri5h7<e@f<=r>AbGI*Q~eAo
+zRg8=bU=cnBh9mq8p~e3p<}(N|FdX7%aIIuu2mp&TFoXE+oeT^LNPM0u21W)3sQFj;
+z8Qd!wKsp&17$E9pD!_^vN`8K1X1K=B;0W^{Nd6H&g9Mxp@*h8gZzn`OOurDwd`3ow
+z|2BQ>Ap0dN7#Tqx{?Eg}0P>GO6%!)^3j@Rd2OrrXeCGcQtPBkQpVTujoZ@F_tYl=e
+w2O0TNj)#GTk3pq^fq|I;<YGPshEwtkZIzJlvwtbT!*GO=!58ixko)Bs0DIp+(EtDd
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm86/fill.bin b/nvidia-prolapse/driver-source/native/shaders/sm86/fill.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..d389520c6774103086c358dff0520737787ee4ce
+GIT binary patch
+literal 208
+zcmX?H$p8VW3=9lRd<>E>z9ItygA*SEQw<|To}Yn(;e<ScU=agY;J*PM1H%b@2A(RA
+zG$TWSzz1fATl@^Zogh94H!w3C;%8v0Vq{=oWMp9AXJBAB#m}Gu;xjQaFf#BlfaE1B
+z7#Nrs7#RNZFfcHj;Aar10`V9a{y+H04&gKZ2if@lNj+G9TO|V%$N}~*1$Y>aFf#bU
+L+{*y6Po4n))Y>0R
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm86/mix.bin b/nvidia-prolapse/driver-source/native/shaders/sm86/mix.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..7579a8cee0e4bcb7b7bffad8c69bd159d0142e44
+GIT binary patch
+literal 432
+zcmX?H$p8VW3=9lRd<=&x86kW%1_lNvJ_bpcydnbwLlcM(l~-b5U^v9bz*NHoQP0o7
+z!Ei#JL9mDcEbw1~kAdNsKUf~D10;V)pMj?eWDg@lfxri5h7<e@f<=r>AbGI*Q~eAo
+zRg8=bU=cnBh9mq8p~e3p<}(N|FdX7%aIIuu2mp&TFoXE+oeT^LNPM0u21W)3sQFj;
+z8Qd!wKsp&17$E9pD!_^vN`8K1X1K=B;0W^{Nd6H&g9Mxp@*h8gZzn`OOurDwd`3ow
+z|2BQ>Ap0dN7#Tqx{?Eg}0P>GO6%!)^3j@Rd2OrrXeCGcQtPBkQpVTujoZ@F_tYl=e
+w2O0TNj)#GTk3pq^fq|I;<YGPshEwtkZIzJlvwtbT!*GO=!58ixko)Bs0DIp+(EtDd
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm89/fill.bin b/nvidia-prolapse/driver-source/native/shaders/sm89/fill.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..d389520c6774103086c358dff0520737787ee4ce
+GIT binary patch
+literal 208
+zcmX?H$p8VW3=9lRd<>E>z9ItygA*SEQw<|To}Yn(;e<ScU=agY;J*PM1H%b@2A(RA
+zG$TWSzz1fATl@^Zogh94H!w3C;%8v0Vq{=oWMp9AXJBAB#m}Gu;xjQaFf#BlfaE1B
+z7#Nrs7#RNZFfcHj;Aar10`V9a{y+H04&gKZ2if@lNj+G9TO|V%$N}~*1$Y>aFf#bU
+L+{*y6Po4n))Y>0R
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm89/mix.bin b/nvidia-prolapse/driver-source/native/shaders/sm89/mix.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..7579a8cee0e4bcb7b7bffad8c69bd159d0142e44
+GIT binary patch
+literal 432
+zcmX?H$p8VW3=9lRd<=&x86kW%1_lNvJ_bpcydnbwLlcM(l~-b5U^v9bz*NHoQP0o7
+z!Ei#JL9mDcEbw1~kAdNsKUf~D10;V)pMj?eWDg@lfxri5h7<e@f<=r>AbGI*Q~eAo
+zRg8=bU=cnBh9mq8p~e3p<}(N|FdX7%aIIuu2mp&TFoXE+oeT^LNPM0u21W)3sQFj;
+z8Qd!wKsp&17$E9pD!_^vN`8K1X1K=B;0W^{Nd6H&g9Mxp@*h8gZzn`OOurDwd`3ow
+z|2BQ>Ap0dN7#Tqx{?Eg}0P>GO6%!)^3j@Rd2OrrXeCGcQtPBkQpVTujoZ@F_tYl=e
+w2O0TNj)#GTk3pq^fq|I;<YGPshEwtkZIzJlvwtbT!*GO=!58ixko)Bs0DIp+(EtDd
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm90/fill.bin b/nvidia-prolapse/driver-source/native/shaders/sm90/fill.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..975d84aba5324555acdfac4739da4f7d17c7dee5
+GIT binary patch
+literal 208
+zcmX?H$p8VW3=9lnd<>E>z9ItygA*SEQw<|To}Yn(;fy?kU=agY;J*PM1H&182A(RA
+zG$TWSzz1fATl@^Zogh94H!w3C;%8v0Vq{=oWMp9AXJBAB!_S}s;xjQaFf#BlFr46L
+zkgQ-}U}9ik_|F587pMa97#RLP_{a`2PoRqVKgh=aPwK(?+bS8DKn}2fDZs;Ugpt7)
+L=3WMneew(d@Qxpd
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm90/mix.bin b/nvidia-prolapse/driver-source/native/shaders/sm90/mix.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..48ccfd1a39b20c0f5dff97836bf7228609c43b90
+GIT binary patch
+literal 432
+zcmX?H$p8VW3=9lHd<=&x86kW%1_lNvJ_bpcydnbwLlcM(l~-b5U^v9bz*NHoQP0o7
+z!Ei>NL9mDcEbw1~kAdNYKUf~D10;V!pMj@}fq{XEk)c4~12e-Beg?rJMkbIvSpAuP
+z29+vCMvy!M10Ms!F@A>7;{Ooy83Y&@4)HU%Rx&UIfJGXZL45a41_lKrK2H?`BLf4}
+z{44wn?v)H6oeT^N5cM(@V8sk2KR+@vT;peOg!vC7|A?PK0?r5dkDtM}6QUlbUkGGA
+zBO}9qn?81i6Z{O46^x7^5C7+3U|=}I&md66#K^$H!0`XUM|Or=AU^Yd237`!|4-_{
+z@{N^@O!gonU&`??@bEFHR4_0wGk{#o#{deywn|9&*}oLvVK~Cb;0t#T$o=vR0I};q
+A6#xJL
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/compute.rs b/nvidia-prolapse/driver-source/native/src/video/compute.rs
+new file mode 100644
+index 0000000..7468fe2
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/src/video/compute.rs
+@@ -0,0 +1,509 @@
++//! Video compute engine: launches the precompiled kernels of [`super::kernels`] on a compute
++//! channel of the video stack's own address space.
++//!
++//! The kernels are Mesa NAK output generated at build time (tools/gen-kernels.py); the runtime
++//! carries no compiler. A launch copies the kernel's QMD template (filled by Mesa's
++//! `nak_fill_qmd`) and ORs the program address, cbuf 0 address and grid size into the generated
++//! bit runs; cbuf 0 follows the bridge ABI (compiler/README.md): storage buffer `binding` at
++//! `binding * 16` as { u64 address, u32 bytes, u32 0 }, push constants at 1024, 1152 bytes.
++//! Kernels never use local memory, a CRS stack or constant data (the generator refuses them),
++//! so the channel needs no local-memory backing.
++use super::{
++    channel::wait_sync_file,
++    session::{vram, VramBuffer},
++    VResult, VideoError,
++};
++use crate::{
++    events::RmEvents,
++    gpu::{hi_lo, method, AddressSpace, GpuMapping, Push, Queue, SubmitStatus},
++    rm::{Device, Mapping, Memory},
++    slots::{SlotPool, TimelineView, PAGE_BYTES},
++};
++use std::{collections::HashMap, rc::Rc, sync::Arc, time::Duration};
++
++/// A precompiled kernel for one shader model (generated tables in [`super::kernels`]).
++pub(crate) struct Kernel {
++    pub name: &'static str,
++    pub sm: u32,
++    pub compute_class: u32,
++    pub code: &'static [u8],
++    pub registers: u32,
++    pub shared_bytes: u32,
++    pub barriers: u32,
++    pub workgroup: [u32; 3],
++    pub cbuf_bytes: u32,
++    /// QMD with every per-launch value zero.
++    pub qmd: &'static [u32],
++    /// Per launch value (program, cbuf, grid x, y, z): (value bit, QMD bit, length) runs.
++    pub runs: [&'static [(u32, u32, u32)]; 5],
++}
++
++impl Kernel {
++    /// The QMD of one launch. Fails when a value has a bit no run carries (misaligned address,
++    /// grid dimension beyond the QMD field).
++    pub(crate) fn pack(&self, values: [u64; 5]) -> VResult<Vec<u32>> {
++        let mut qmd = self.qmd.to_vec();
++        for (v, &value) in values.iter().enumerate() {
++            let mut carried = 0u64;
++            for &(from, to, len) in self.runs[v] {
++                let mask = if len >= 64 { u64::MAX } else { (1u64 << len) - 1 };
++                carried |= mask << from;
++                let field = (value >> from) & mask;
++                for b in 0..len {
++                    if field >> b & 1 != 0 {
++                        let bit = (to + b) as usize;
++                        qmd[bit / 32] |= 1 << (bit % 32);
++                    }
++                }
++            }
++            if value & !carried != 0 {
++                return Err(VideoError::Invalid(format!(
++                    "kernel {} launch value {v} = {value:#x} does not fit its QMD field",
++                    self.name
++                )));
++            }
++        }
++        Ok(qmd)
++    }
++}
++
++/// Compute classes whose kernels were run on hardware (RTX 4060 Laptop, Ada). Other shader
++/// models have generated kernels with unit-tested QMD packing but are never launched.
++const VALIDATED_CLASSES: &[u32] = &[0xc9c0];
++
++/// Shader model of the generated kernels for a compute class.
++fn sm_of_class(class: u32) -> Option<u32> {
++    Some(match class {
++        0xc5c0 => 75,
++        0xc6c0 => 80,
++        0xc7c0 => 86,
++        0xc9c0 => 89,
++        0xcbc0 => 90,
++        0xcec0 => 120,
++        _ => return None,
++    })
++}
++
++const CODE_BYTES: usize = 64 << 10;
++/// Zeroed tail after the code heap: instruction prefetch may read past the last program.
++const CODE_PREFETCH_PAD: usize = 4096;
++/// Programs and QMDs are placed 256-byte aligned (NVK: 0x80 programs, 256 QMDs).
++const ALIGN: usize = 256;
++/// A launch slot: QMD at 0, cbuf 0 at CBUF_OFFSET, command words at WORDS_OFFSET.
++const SLOT_BYTES: usize = 4096;
++const CBUF_OFFSET: usize = 512;
++const WORDS_OFFSET: usize = 2048;
++
++// Compute class methods (NVIDIA clc5c0.h .. clcdc0.h, identical offsets Turing..Blackwell).
++const SET_OBJECT: u32 = 0x0000;
++const INVALIDATE_SKED_CACHES: u32 = 0x0298;
++const SET_SHADER_SHARED_MEMORY_WINDOW_A: u32 = 0x02a0;
++const SEND_PCAS_A: u32 = 0x02b4;
++const SEND_SIGNALING_PCAS_B: u32 = 0x02bc; // Turing: INVALIDATE | SCHEDULE
++const SEND_SIGNALING_PCAS2_B: u32 = 0x02c0; // Ampere+: PCAS_ACTION_INVALIDATE_COPY_SCHEDULE = 3
++const SET_SHADER_LOCAL_MEMORY_WINDOW_A: u32 = 0x07b0;
++const INVALIDATE_SHADER_CACHES_NO_WFI: u32 = 0x1698; // INSTRUCTION 0:0, CONSTANT 12:12
++const SUBCHANNEL: u32 = 1;
++
++/// One storage buffer of a launch: (binding 0..8, GPU address, bytes).
++pub(crate) type Binding = (u32, u64, u32);
++
++pub(crate) struct ComputeEngine {
++    queue: Queue,
++    compute_class: u32,
++    sm: u32,
++    _pool: Arc<SlotPool>,
++    _page: (Rc<Memory>, Mapping, GpuMapping),
++    _events: RmEvents,
++    device: Rc<Device>,
++    code: VramBuffer,
++    code_used: usize,
++    programs: HashMap<&'static str, u64>,
++    /// Programs written since the last instruction-cache invalidate.
++    code_dirty: bool,
++    initialized: bool,
++    /// Launch slots and the completion token of their last launch.
++    slots: Vec<(VramBuffer, u64)>,
++}
++
++impl ComputeEngine {
++    /// The compute class of this device when its kernels are validated on hardware.
++    pub(crate) fn supported(device: &Rc<Device>) -> VResult<Option<u32>> {
++        let caps = crate::capabilities::query(device)?;
++        Ok(VALIDATED_CLASSES.contains(&caps.compute).then_some(caps.compute))
++    }
++
++    pub(crate) fn new(device: &Rc<Device>, space: &AddressSpace) -> VResult<Self> {
++        let caps = crate::capabilities::query(device)?;
++        if !VALIDATED_CLASSES.contains(&caps.compute) {
++            return Err(VideoError::Unsupported(format!(
++                "video compute kernels are not validated for compute class {:#x}",
++                caps.compute
++            )));
++        }
++        let sm = sm_of_class(caps.compute).ok_or_else(|| {
++            VideoError::Unsupported(format!("no kernels for compute class {:#x}", caps.compute))
++        })?;
++        let view = if crate::gpu::modern_host(caps.channel)? {
++            TimelineView::Native64
++        } else {
++            TimelineView::Split32
++        };
++        let pool = Arc::new(SlotPool::new(view));
++        let page_mem = device.allocate_aligned(PAGE_BYTES, PAGE_BYTES, false, true)?;
++        let page_cpu = page_mem.map()?;
++        let page_gpu = space.map(&page_mem)?;
++        pool.install_page(page_cpu.cpu_address(), page_gpu.address())?;
++        let retire = pool
++            .try_allocate()
++            .ok_or_else(|| VideoError::DeviceLost("empty semaphore slot page".into()))?;
++        let events = RmEvents::new(device)?;
++        let queue = Queue::new_with_events(device, space, 16, &events, &pool, retire)?;
++        let code = vram(device, space, CODE_BYTES + CODE_PREFETCH_PAD)?;
++        Ok(Self {
++            queue,
++            compute_class: caps.compute,
++            sm,
++            _pool: pool,
++            _page: (page_mem, page_cpu, page_gpu),
++            _events: events,
++            device: Rc::clone(device),
++            code,
++            code_used: 0,
++            programs: HashMap::new(),
++            code_dirty: false,
++            initialized: false,
++            slots: Vec::new(),
++        })
++    }
++
++    /// The kernel `name` for this engine's shader model, checked against the contract this
++    /// runtime implements (kernels.rs ABI 1: no local memory, cbuf 0 of 1152 bytes).
++    pub(crate) fn kernel(&self, name: &str) -> VResult<&'static Kernel> {
++        let all = super::kernels::KERNELS.iter();
++        #[cfg(test)]
++        let all = all.chain(super::kernels::TEST_KERNELS.iter());
++        let mut all = all;
++        let k = all
++            .find(|k| k.name == name && k.sm == self.sm && k.compute_class == self.compute_class)
++            .ok_or_else(|| VideoError::Unsupported(format!("no kernel {name} for sm_{}", self.sm)))?;
++        let threads: u32 = k.workgroup.iter().product();
++        if super::kernels::ABI != 1
++            || k.cbuf_bytes != 1152
++            || k.registers > 255
++            || k.barriers > 16
++            || threads == 0
++            || threads > 1024
++            || k.shared_bytes > 48 << 10
++            || k.code.is_empty()
++            || k.code.len() % 16 != 0
++        {
++            return Err(VideoError::Invalid(format!("kernel {name} breaks the kernel contract")));
++        }
++        Ok(k)
++    }
++
++    /// GPU address of `kernel`'s program, writing it into the code heap on first use.
++    fn program(&mut self, kernel: &'static Kernel) -> VResult<u64> {
++        if let Some(&address) = self.programs.get(kernel.name) {
++            return Ok(address);
++        }
++        let offset = self.code_used;
++        let end = offset + kernel.code.len();
++        if end > CODE_BYTES || kernel.code.len() % 4 != 0 {
++            return Err(VideoError::NoMemory(format!("kernel {} does not fit the code heap", kernel.name)));
++        }
++        for (i, word) in kernel.code.chunks_exact(4).enumerate() {
++            self.code
++                .cpu
++                .write_u32(offset + i * 4, u32::from_le_bytes(word.try_into().unwrap()))?;
++        }
++        self.code_used = end.next_multiple_of(ALIGN);
++        self.code_dirty = true;
++        let address = self.code.gpu.address() + offset as u64;
++        self.programs.insert(kernel.name, address);
++        Ok(address)
++    }
++
++    /// Forgets every program so the next ones are written from the start of the code heap again
++    /// (same addresses, new code). Waits for every launch first.
++    pub(crate) fn reset_code(&mut self, drm: i32) -> VResult<()> {
++        let pending: Vec<u64> = self.slots.iter().map(|s| s.1).filter(|&t| t != 0).collect();
++        for token in pending {
++            self.wait(drm, token)?;
++        }
++        self.programs.clear();
++        self.code_used = 0;
++        Ok(())
++    }
++
++    /// Launches `kernel` over `groups` workgroups with the given storage buffers and push
++    /// constants and returns its completion token (see [`ComputeEngine::wait`]).
++    pub(crate) fn launch(
++        &mut self,
++        space: &AddressSpace,
++        kernel: &'static Kernel,
++        bindings: &[Binding],
++        push: &[u8],
++        groups: [u32; 3],
++    ) -> VResult<u64> {
++        if push.len() > 128 || kernel.cbuf_bytes as usize != 1152 {
++            return Err(VideoError::Invalid("push constants exceed 128 bytes".into()));
++        }
++        if groups.contains(&0) {
++            return Err(VideoError::Invalid("empty compute grid".into()));
++        }
++        let program = self.program(kernel)?;
++        let si = match self.slots.iter().position(|(_, token)| {
++            *token == 0 || self.queue.shared().retired(*token).unwrap_or(false)
++        }) {
++            Some(i) => i,
++            None => {
++                self.slots.push((vram(&self.device, space, SLOT_BYTES)?, 0));
++                self.slots.len() - 1
++            }
++        };
++        let base = self.slots[si].0.gpu.address();
++        let cbuf_address = base + CBUF_OFFSET as u64;
++        let mut cbuf = vec![0u8; kernel.cbuf_bytes as usize];
++        let mut seen = 0u32;
++        for &(binding, address, bytes) in bindings {
++            if binding >= 8 || seen & (1 << binding) != 0 {
++                return Err(VideoError::Invalid(format!("storage binding {binding} invalid or repeated")));
++            }
++            seen |= 1 << binding;
++            let at = binding as usize * 16;
++            cbuf[at..at + 8].copy_from_slice(&address.to_le_bytes());
++            cbuf[at + 8..at + 12].copy_from_slice(&bytes.to_le_bytes());
++        }
++        cbuf[1024..1024 + push.len()].copy_from_slice(push);
++        let qmd = kernel.pack([
++            program,
++            cbuf_address,
++            u64::from(groups[0]),
++            u64::from(groups[1]),
++            u64::from(groups[2]),
++        ])?;
++
++        let mut words = Vec::with_capacity(32);
++        if !self.initialized {
++            method(&mut words, SUBCHANNEL, SET_OBJECT, &[self.compute_class]);
++            method(
++                &mut words,
++                SUBCHANNEL,
++                SET_SHADER_SHARED_MEMORY_WINDOW_A,
++                &hi_lo(crate::compute::SHARED_WINDOW),
++            );
++            method(
++                &mut words,
++                SUBCHANNEL,
++                SET_SHADER_LOCAL_MEMORY_WINDOW_A,
++                &hi_lo(crate::compute::LOCAL_WINDOW),
++            );
++            method(&mut words, SUBCHANNEL, INVALIDATE_SKED_CACHES, &[0]);
++        }
++        // Constant cache every launch: launch slots and their cbufs are reused at the same
++        // addresses. Instruction cache after programs were (re)written: the code reached the
++        // GPU by the barrier below, before this submission.
++        let instruction = u32::from(self.code_dirty);
++        method(&mut words, SUBCHANNEL, INVALIDATE_SHADER_CACHES_NO_WFI, &[instruction | 1 << 12]);
++        method(&mut words, SUBCHANNEL, SEND_PCAS_A, &[(base >> 8) as u32]);
++        if self.compute_class <= 0xc5c0 {
++            method(&mut words, SUBCHANNEL, SEND_SIGNALING_PCAS_B, &[3]);
++        } else {
++            method(&mut words, SUBCHANNEL, SEND_SIGNALING_PCAS2_B, &[3]);
++        }
++
++        let slot = &mut self.slots[si].0;
++        for (i, w) in qmd.iter().enumerate() {
++            slot.cpu.write_u32(i * 4, *w)?;
++        }
++        for (i, c) in cbuf.chunks(4).enumerate() {
++            slot.cpu.write_u32(CBUF_OFFSET + i * 4, u32::from_le_bytes(c.try_into().unwrap()))?;
++        }
++        for (i, w) in words.iter().enumerate() {
++            slot.cpu.write_u32(WORDS_OFFSET + i * 4, *w)?;
++        }
++        crate::platform::device_full_barrier();
++        let push = Push {
++            address: base + WORDS_OFFSET as u64,
++            size: (words.len() * 4) as u32,
++            flags: 0,
++        };
++        let token = match self.queue.submit(&[push], space, &[], &[], &[], |_| Ok(()))? {
++            SubmitStatus::Submitted(t) => t,
++            SubmitStatus::Full(_) => return Err(VideoError::Again("compute queue full".into())),
++        };
++        self.slots[si].1 = token;
++        self.initialized = true;
++        self.code_dirty = false;
++        Ok(token)
++    }
++
++    /// Returns once launch `token` finished, or the channel's error (a faulting kernel kills the
++    /// channel: its completion never comes, the error notifier says why).
++    pub(crate) fn wait(&mut self, drm: i32, token: u64) -> VResult<()> {
++        let deadline = std::time::Instant::now() + Duration::from_secs(5);
++        loop {
++            self.queue.check_error().map_err(|e| VideoError::DeviceLost(e.to_string()))?;
++            if self.queue.shared().retired(token)? {
++                return Ok(());
++            }
++            let now = std::time::Instant::now();
++            if now >= deadline {
++                return Err(VideoError::DeviceLost(format!("compute launch {token} timed out")));
++            }
++            let fence = self.queue.context_fence(drm, token)?;
++            // A fence of a dead channel never signals: wake up to look at the notifier.
++            let _ = wait_sync_file(
++                std::os::fd::AsRawFd::as_raw_fd(&fence),
++                (deadline - now).min(Duration::from_millis(50)),
++            );
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::video::kernels::{ABI, KERNELS, QMD_SAMPLES, TEST_KERNELS};
++
++    fn test_kernel(name: &str, sm: u32) -> &'static Kernel {
++        TEST_KERNELS.iter().find(|k| k.name == name && k.sm == sm).unwrap()
++    }
++
++    /// The runtime packing reproduces Mesa's nak_fill_qmd for every shader model and QMD
++    /// version (2.2 Turing, 3.0 Ampere/Ada, 4.0 Hopper, 5.0 Blackwell).
++    #[test]
++    fn qmd_packing_matches_nak_fill_qmd() {
++        assert_eq!(ABI, 1);
++        let mut models = std::collections::BTreeSet::new();
++        for &(name, sm, values, expected) in QMD_SAMPLES {
++            let qmd = test_kernel(name, sm).pack(values).unwrap();
++            assert_eq!(qmd, expected, "{name} sm_{sm} {values:x?}");
++            models.insert(sm);
++        }
++        assert_eq!(models.into_iter().collect::<Vec<_>>(), [75, 80, 86, 89, 90, 120]);
++        for k in KERNELS.iter().chain(TEST_KERNELS) {
++            assert_eq!(sm_of_class(k.compute_class), Some(k.sm), "{}", k.name);
++            assert!(k.code.len() % 16 == 0 && !k.code.is_empty(), "{} sm_{}", k.name, k.sm);
++        }
++    }
++
++    #[test]
++    fn qmd_packing_refuses_values_without_a_field() {
++        let k = test_kernel("fill", 89);
++        assert!(k.pack([0x1000, 0x2000, 1, 1, 1]).is_ok());
++        assert!(k.pack([0x1080, 0x2000, 1, 1, 1]).is_err(), "program not 256-byte aligned");
++        assert!(k.pack([0x1000, 0x2000, 1, 1 << 16, 1]).is_err(), "grid height beyond 16 bits");
++        assert!(k.pack([1 << 49, 0x2000, 1, 1, 1]).is_err(), "address beyond 49 bits");
++    }
++
++    fn read(buf: &VramBuffer, words: usize) -> Vec<u32> {
++        (0..words).map(|i| buf.cpu.read_u32(i * 4).unwrap()).collect()
++    }
++
++    fn push(values: &[u32]) -> Vec<u8> {
++        values.iter().flat_map(|v| v.to_le_bytes()).collect()
++    }
++
++    fn rss_and_fds() -> (u64, usize) {
++        let status = std::fs::read_to_string("/proc/self/status").unwrap();
++        let rss = status
++            .lines()
++            .find_map(|l| l.strip_prefix("VmRSS:"))
++            .and_then(|v| v.trim().trim_end_matches(" kB").parse().ok())
++            .unwrap();
++        (rss, std::fs::read_dir("/proc/self/fd").unwrap().count())
++    }
++
++    /// Hardware acceptance of the engine (stage 2): a kernel writes a known pattern; two different
++    /// programs alternate on one channel, also at the same program address after the code heap
++    /// is rewritten, with new push constants on every launch; 10000 launches leave RSS, fds and
++    /// the launch slots stable; a kernel faulting on an unmapped address yields an error.
++    #[test]
++    #[ignore = "local NVIDIA GPU: compute channel launches of the generated kernels"]
++    fn engine_on_hardware() {
++        use crate::video::venc::NvVencDevice;
++        use std::os::fd::AsRawFd;
++        let rm = NvVencDevice::open_on(None).unwrap();
++        let drm = rm.drm.as_raw_fd();
++        let mut engine = ComputeEngine::new(&rm.device, &rm.space).unwrap();
++        let fill = engine.kernel("fill").unwrap();
++        let mix = engine.kernel("mix").unwrap();
++        const N: usize = 4096;
++        let out = vram(&rm.device, &rm.space, N * 4).unwrap();
++        let bind = |b| (b, out.gpu.address(), (N * 4) as u32);
++        let fill_expect = |count: usize, seed: u32, step: u32, prev: &[u32]| -> Vec<u32> {
++            (0..N).map(|i| if i < count { seed.wrapping_add((i as u32).wrapping_mul(step)) } else { prev[i] }).collect()
++        };
++        let mix_expect = |count: usize, seed: u32, prev: &[u32]| -> Vec<u32> {
++            (0..N).map(|i| if i < count { (seed ^ i as u32).wrapping_mul(3).wrapping_add(prev[i]) } else { prev[i] }).collect()
++        };
++
++        // known pattern, partial last workgroup
++        let t = engine.launch(&rm.space, fill, &[bind(0)], &push(&[3000, 7, 5]), [(3000u32).div_ceil(64), 1, 1]).unwrap();
++        engine.wait(drm, t).unwrap();
++        let mut want = fill_expect(3000, 7, 5, &vec![0; N]);
++        assert_eq!(read(&out, N), want, "fill");
++
++        // two programs alternating, new push constants each launch
++        for round in 0..20u32 {
++            let seed = round.wrapping_mul(0x9e37_79b9);
++            let t = if round % 2 == 0 {
++                want = fill_expect(N, seed, round + 1, &want);
++                engine.launch(&rm.space, fill, &[bind(0)], &push(&[N as u32, seed, round + 1]), [64, 1, 1]).unwrap()
++            } else {
++                want = mix_expect(N, seed, &want);
++                // 64 x 64 elements as an 8 x 8 grid of 8x8 workgroups
++                engine.launch(&rm.space, mix, &[bind(1)], &push(&[N as u32, seed, 64]), [8, 8, 1]).unwrap()
++            };
++            engine.wait(drm, t).unwrap();
++            assert_eq!(read(&out, N), want, "alternating round {round}");
++        }
++
++        // the same program address holding the other program after the heap is rewritten
++        let mut address = None;
++        for round in 0..6u32 {
++            engine.reset_code(drm).unwrap();
++            let (kernel, seed) = if round % 2 == 0 { (fill, round + 100) } else { (mix, round + 200) };
++            let t = if round % 2 == 0 {
++                want = fill_expect(N, seed, 3, &want);
++                engine.launch(&rm.space, kernel, &[bind(0)], &push(&[N as u32, seed, 3]), [64, 1, 1]).unwrap()
++            } else {
++                want = mix_expect(N, seed, &want);
++                engine.launch(&rm.space, kernel, &[bind(1)], &push(&[N as u32, seed, 64]), [8, 8, 1]).unwrap()
++            };
++            let here = engine.programs[kernel.name];
++            assert_eq!(*address.get_or_insert(here), here, "program moved");
++            engine.wait(drm, t).unwrap();
++            assert_eq!(read(&out, N), want, "rewritten program round {round}");
++        }
++
++        // 10000 launches: process and engine resources stay flat
++        let before = rss_and_fds();
++        let mut last = 0;
++        for i in 0..10000u32 {
++            last = engine.launch(&rm.space, fill, &[bind(0)], &push(&[64, i, 1]), [1, 1, 1]).unwrap();
++            if i % 64 == 63 {
++                engine.wait(drm, last).unwrap();
++            }
++        }
++        engine.wait(drm, last).unwrap();
++        let after = rss_and_fds();
++        let slots = engine.slots.len();
++        eprintln!("10000 launches: RSS {} -> {} kB, fds {} -> {}, launch slots {slots}", before.0, after.0, before.1, after.1);
++        assert!(after.0 < before.0 + 4096, "RSS grew");
++        assert_eq!(after.1, before.1, "fds leaked");
++        assert!(slots <= 70, "launch slots grew to {slots}");
++        assert_eq!(read(&out, 64), (0..64).map(|i| 9999 + i).collect::<Vec<u32>>());
++
++        // a kernel storing to an unmapped address kills the channel: an error, not a hang
++        let unmapped = 0xf0_0000_0000u64; // inside the 1 TiB address space, never mapped
++        let t = engine.launch(&rm.space, fill, &[(0, unmapped, 4096)], &push(&[1024, 1, 1]), [16, 1, 1]).unwrap();
++        let started = std::time::Instant::now();
++        let error = engine.wait(drm, t).unwrap_err();
++        eprintln!("faulting launch: {error} after {:?}", started.elapsed());
++        assert!(matches!(error, VideoError::DeviceLost(_)));
++    }
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/kernels.rs b/nvidia-prolapse/driver-source/native/src/video/kernels.rs
+new file mode 100644
+index 0000000..678b3da
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/src/video/kernels.rs
+@@ -0,0 +1,226 @@
++// @generated by tools/gen-kernels.py from shaders/*.spv with Mesa NAK ddaf85e353442d9d7f192fdcf1823e652e3f2ee3; do not edit.
++// Regenerate after changing a shader, the bridge (compiler/) or the Mesa pin, and check with
++// `tools/gen-kernels.py --check`.
++use super::compute::Kernel;
++
++/// Version of the kernel contract (bindings, cbuf layout, runs) these tables follow.
++pub(crate) const ABI: u32 = 1;
++
++/// Production kernels, every shader model.
++pub(crate) static KERNELS: &[Kernel] = &[
++];
++
++/// Kernels for the engine's own hardware tests.
++#[cfg(test)]
++pub(crate) static TEST_KERNELS: &[Kernel] = &[
++    Kernel {
++        name: "fill",
++        sm: 75,
++        compute_class: 0xc5c0,
++        code: include_bytes!("../../shaders/sm75/fill.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [64, 1, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 572784640, 4194338, 65537, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "mix",
++        sm: 75,
++        compute_class: 0xc5c0,
++        code: include_bytes!("../../shaders/sm75/mix.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [8, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 572784640, 524322, 65544, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "fill",
++        sm: 80,
++        compute_class: 0xc6c0,
++        code: include_bytes!("../../shaders/sm80/fill.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [64, 1, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 1409548288, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "mix",
++        sm: 80,
++        compute_class: 0xc6c0,
++        code: include_bytes!("../../shaders/sm80/mix.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [8, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 1409548288, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "fill",
++        sm: 86,
++        compute_class: 0xc7c0,
++        code: include_bytes!("../../shaders/sm86/fill.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [64, 1, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "mix",
++        sm: 86,
++        compute_class: 0xc7c0,
++        code: include_bytes!("../../shaders/sm86/mix.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [8, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "fill",
++        sm: 89,
++        compute_class: 0xc9c0,
++        code: include_bytes!("../../shaders/sm89/fill.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [64, 1, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "mix",
++        sm: 89,
++        compute_class: 0xc9c0,
++        code: include_bytes!("../../shaders/sm89/mix.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [8, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "fill",
++        sm: 90,
++        compute_class: 0xcbc0,
++        code: include_bytes!("../../shaders/sm90/fill.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [64, 1, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65600, 1572865, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1224, 41)], &[(8, 1538, 41)], &[(0, 1024, 32)], &[(0, 1056, 16)], &[(0, 1088, 16)]],
++    },
++    Kernel {
++        name: "mix",
++        sm: 90,
++        compute_class: 0xcbc0,
++        code: include_bytes!("../../shaders/sm90/mix.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [8, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 524296, 1572865, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1224, 41)], &[(8, 1538, 41)], &[(0, 1024, 32)], &[(0, 1056, 16)], &[(0, 1088, 16)]],
++    },
++    Kernel {
++        name: "fill",
++        sm: 120,
++        compute_class: 0xcec0,
++        code: include_bytes!("../../shaders/sm120/fill.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [64, 1, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65600, 6145, 11798528, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1028, 41)], &[(8, 1346, 41)], &[(0, 1248, 32)], &[(0, 1280, 16)], &[(0, 1312, 16)]],
++    },
++    Kernel {
++        name: "mix",
++        sm: 120,
++        compute_class: 0xcec0,
++        code: include_bytes!("../../shaders/sm120/mix.bin"),
++        registers: 24,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [8, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 524296, 6145, 11798528, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1028, 41)], &[(8, 1346, 41)], &[(0, 1248, 32)], &[(0, 1280, 16)], &[(0, 1312, 16)]],
++    },
++];
++
++/// nak_fill_qmd results for combined launch values (program, cbuf, grid x/y/z): the
++/// runtime packing must reproduce them bit for bit.
++#[cfg(test)]
++pub(crate) static QMD_SAMPLES: &[(&str, u32, [u64; 5], &[u32])] = &[
++    ("fill", 75, [536296022915328, 459258987084800, 2106699644, 11249, 11989], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2106699644, 11249, 11989, 0, 0, 572784640, 4194338, 65537, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2429090816, 37855665, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 636532992, 124866, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 75, [365262520915200, 266643138387968, 1808638154, 44208, 38947], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 1808638154, 44208, 38947, 0, 0, 572784640, 4194338, 65537, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2978717696, 37810818, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1322194176, 85044, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 75, [143643240508416, 32814141868800, 3266500016, 26159, 40817], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3266500016, 26159, 40817, 0, 0, 572784640, 4194338, 65537, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 591727360, 37756376, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2354260992, 33444, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 75, [553663107038976, 426721054522624, 3357701257, 65145, 55261], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3357701257, 65145, 55261, 0, 0, 572784640, 4194338, 65537, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3168763136, 37848089, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3167878912, 128909, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 75, [536296022915328, 459258987084800, 2106699644, 11249, 11989], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2106699644, 11249, 11989, 0, 0, 572784640, 524322, 65544, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2429090816, 37855665, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 636532992, 124866, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 75, [365262520915200, 266643138387968, 1808638154, 44208, 38947], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 1808638154, 44208, 38947, 0, 0, 572784640, 524322, 65544, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2978717696, 37810818, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1322194176, 85044, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 75, [143643240508416, 32814141868800, 3266500016, 26159, 40817], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3266500016, 26159, 40817, 0, 0, 572784640, 524322, 65544, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 591727360, 37756376, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2354260992, 33444, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 75, [553663107038976, 426721054522624, 3357701257, 65145, 55261], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3357701257, 65145, 55261, 0, 0, 572784640, 524322, 65544, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3168763136, 37848089, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3167878912, 128909, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 80, [412496371229952, 541398177044480, 2528698529, 51797, 20351], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2528698529, 51797, 20351, 0, 0, 1409548288, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 369514496, 37874790, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3417154816, 96041, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 80, [165418381568512, 86795180677632, 3663106249, 64774, 55595], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3663106249, 64774, 55595, 0, 0, 1409548288, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2481560064, 37768944, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2011130368, 38514, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 80, [260823755410944, 40890522155008, 2265457508, 31394, 56132], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2265457508, 31394, 56132, 0, 0, 1409548288, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2433497088, 37758256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3276426752, 60727, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 80, [359267005365504, 334638220101632, 2001680981, 6331, 28579], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2001680981, 6331, 28579, 0, 0, 1409548288, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 138201088, 37826650, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1580989696, 83648, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 80, [412496371229952, 541398177044480, 2528698529, 51797, 20351], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2528698529, 51797, 20351, 0, 0, 1409548288, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 369514496, 37874790, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3417154816, 96041, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 80, [165418381568512, 86795180677632, 3663106249, 64774, 55595], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3663106249, 64774, 55595, 0, 0, 1409548288, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2481560064, 37768944, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2011130368, 38514, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 80, [260823755410944, 40890522155008, 2265457508, 31394, 56132], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2265457508, 31394, 56132, 0, 0, 1409548288, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2433497088, 37758256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3276426752, 60727, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 80, [359267005365504, 334638220101632, 2001680981, 6331, 28579], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2001680981, 6331, 28579, 0, 0, 1409548288, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 138201088, 37826650, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1580989696, 83648, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 86, [38756807838720, 77015251574784, 3035097191, 21811, 30386], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3035097191, 21811, 30386, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2192990208, 37766667, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3317926912, 9023, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 86, [150785395720960, 546517575531008, 734507209, 50133, 10037], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 734507209, 50133, 10037, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 166984192, 37875982, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1978860288, 35107, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 86, [401440373294080, 500942141235712, 205213039, 24569, 22081], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 205213039, 24569, 22081, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2925634048, 37865370, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2665038848, 93467, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 86, [351171664726016, 336728809480448, 3810430487, 27504, 48989], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3810430487, 27504, 48989, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3373474048, 37827136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2253703168, 81763, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 86, [38756807838720, 77015251574784, 3035097191, 21811, 30386], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3035097191, 21811, 30386, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2192990208, 37766667, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3317926912, 9023, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 86, [150785395720960, 546517575531008, 734507209, 50133, 10037], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 734507209, 50133, 10037, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 166984192, 37875982, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1978860288, 35107, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 86, [401440373294080, 500942141235712, 205213039, 24569, 22081], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 205213039, 24569, 22081, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2925634048, 37865370, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2665038848, 93467, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 86, [351171664726016, 336728809480448, 3810430487, 27504, 48989], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3810430487, 27504, 48989, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3373474048, 37827136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2253703168, 81763, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 89, [414836979564544, 126298765550592, 3288296522, 6818, 35404], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3288296522, 6818, 35404, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 957244416, 37778142, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3268313088, 96586, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 89, [143468902797312, 213428819536128, 3565174985, 10044, 20026], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3565174985, 10044, 20026, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3304663296, 37798428, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4110209024, 33403, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 89, [471748682235648, 168017997354752, 1322574452, 53925, 5056], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 1322574452, 53925, 5056, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3171702528, 37787855, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2359344896, 109837, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 89, [347123994406144, 56299127459328, 419837944, 5323, 59194], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 419837944, 5323, 59194, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 696143360, 37761844, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 442576128, 80821, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 89, [414836979564544, 126298765550592, 3288296522, 6818, 35404], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3288296522, 6818, 35404, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 957244416, 37778142, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3268313088, 96586, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 89, [143468902797312, 213428819536128, 3565174985, 10044, 20026], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3565174985, 10044, 20026, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3304663296, 37798428, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4110209024, 33403, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 89, [471748682235648, 168017997354752, 1322574452, 53925, 5056], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 1322574452, 53925, 5056, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3171702528, 37787855, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2359344896, 109837, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 89, [347123994406144, 56299127459328, 419837944, 5323, 59194], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 419837944, 5323, 59194, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 696143360, 37761844, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 442576128, 80821, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 90, [164897067858944, 142726603542528, 3372696299, 1821, 37076], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3372696299, 1821, 37076, 0, 65600, 1572865, 388463616, 38393, 0, 0, 0, 0, 0, 0, 0, 0, 1015153728, 37749255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 90, [328680056296448, 290049218678528, 3077075145, 40372, 23355], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3077075145, 40372, 23355, 0, 65600, 1572865, 3389002752, 76526, 0, 0, 0, 0, 0, 0, 0, 0, 828544572, 37749791, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 90, [495184785216000, 57043282727680, 263372491, 41865, 21226], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 263372491, 41865, 21226, 0, 65600, 1572865, 825790976, 115294, 0, 0, 0, 0, 0, 0, 0, 0, 2243062348, 37748943, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 90, [533424755439872, 150472551259392, 3584607726, 19774, 40750], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3584607726, 19774, 40750, 0, 65600, 1572865, 2702178560, 124197, 0, 0, 0, 0, 0, 0, 0, 0, 1786502516, 37749283, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 90, [164897067858944, 142726603542528, 3372696299, 1821, 37076], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3372696299, 1821, 37076, 0, 524296, 1572865, 388463616, 38393, 0, 0, 0, 0, 0, 0, 0, 0, 1015153728, 37749255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 90, [328680056296448, 290049218678528, 3077075145, 40372, 23355], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3077075145, 40372, 23355, 0, 524296, 1572865, 3389002752, 76526, 0, 0, 0, 0, 0, 0, 0, 0, 828544572, 37749791, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 90, [495184785216000, 57043282727680, 263372491, 41865, 21226], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 263372491, 41865, 21226, 0, 524296, 1572865, 825790976, 115294, 0, 0, 0, 0, 0, 0, 0, 0, 2243062348, 37748943, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 90, [533424755439872, 150472551259392, 3584607726, 19774, 40750], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3584607726, 19774, 40750, 0, 524296, 1572865, 2702178560, 124197, 0, 0, 0, 0, 0, 0, 0, 0, 1786502516, 37749283, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 120, [547999064588544, 72611789879552, 1609722313, 48502, 21714], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1872318480, 7974, 65600, 6145, 11798528, 0, 0, 1609722313, 48502, 21714, 687850724, 37749000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 120, [255515127058944, 336861379259648, 1318981832, 32699, 57707], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1007034656, 3718, 65600, 6145, 11798528, 0, 0, 1318981832, 32699, 57707, 2124113332, 37749961, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 120, [72367967788800, 105501564445696, 2847052032, 7739, 47581], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 397424112, 1053, 65600, 6145, 11798528, 0, 0, 2847052032, 7739, 47581, 3489470096, 37749119, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("fill", 120, [492948052241664, 160925498153984, 4038420664, 60105, 11728], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1452850896, 7173, 65600, 6145, 11798528, 0, 0, 4038420664, 60105, 11728, 1905040496, 37749321, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 120, [547999064588544, 72611789879552, 1609722313, 48502, 21714], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1872318480, 7974, 524296, 6145, 11798528, 0, 0, 1609722313, 48502, 21714, 687850724, 37749000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 120, [255515127058944, 336861379259648, 1318981832, 32699, 57707], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1007034656, 3718, 524296, 6145, 11798528, 0, 0, 1318981832, 32699, 57707, 2124113332, 37749961, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 120, [72367967788800, 105501564445696, 2847052032, 7739, 47581], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 397424112, 1053, 524296, 6145, 11798528, 0, 0, 2847052032, 7739, 47581, 3489470096, 37749119, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("mix", 120, [492948052241664, 160925498153984, 4038420664, 60105, 11728], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1452850896, 7173, 524296, 6145, 11798528, 0, 0, 4038420664, 60105, 11728, 1905040496, 37749321, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++];
+diff --git a/nvidia-prolapse/driver-source/native/src/video/mod.rs b/nvidia-prolapse/driver-source/native/src/video/mod.rs
+index bf1eb29..2441867 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/mod.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/mod.rs
+@@ -14,11 +14,13 @@
+ pub mod av1;
+ pub mod bits;
+ pub mod channel;
++pub(crate) mod compute;
+ pub mod ffi;
+ pub mod enc;
+ pub mod h264;
+ pub mod hdr;
+ pub mod hevc;
++pub(crate) mod kernels;
+ pub mod legacy;
+ pub mod mpeg2;
+ pub mod mpeg4;
+diff --git a/nvidia-prolapse/driver-source/native/tools/gen-kernels.py b/nvidia-prolapse/driver-source/native/tools/gen-kernels.py
+new file mode 100755
+index 0000000..ea1d061
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/tools/gen-kernels.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""Generate the precompiled compute kernels of the video engine (src/video/compute.rs).
++
++  --spirv   compile shaders/<name>.comp to shaders/<name>.spv with glslangValidator (host)
++  (default) compile every shaders/<name>.spv for every shader model with the Mesa NAK generator
++            (compiler/gen.c, built by `compiler/build.py --target host`) and write
++            shaders/sm<sm>/<name>.bin and src/video/kernels.rs
++  --check   regenerate into memory and fail unless the committed files are byte-identical
++
++The generator runs where build/nak-host was built (localhost/nvk-native-a17, repository at /work).
++The runtime carries no compiler: it loads the SASS, copies the QMD template and ORs the per-launch
++program address, cbuf 0 address and grid size into the generated bit runs.
++"""
++import argparse
++import json
++import subprocess
++import sys
++from pathlib import Path
++
++NATIVE = Path(__file__).resolve().parents[1]
++ROOT = NATIVE.parents[2]
++GEN = ROOT / "build/nak-host/src/nouveau/native-bridge/nv-nak-gen"
++MESA_PIN = "ddaf85e353442d9d7f192fdcf1823e652e3f2ee3"  # compiler/build.py PIN (mesa-26.2.5)
++SHADERS = NATIVE / "shaders"
++OUT_RS = NATIVE / "src/video/kernels.rs"
++# Shader models with generated kernels. Runtime use is further limited to the models in
++# compute.rs VALIDATED_SM (hardware-tested); the rest only have unit-tested QMD packing.
++SMS = (75, 80, 86, 89, 90, 120)
++# (name, test-only): test kernels exist for the hardware tests of the engine itself.
++KERNELS = (("fill", True), ("mix", True))
++VARIABLES = ("program", "cbuf", "grid_x", "grid_y", "grid_z")
++ABI = 1
++
++
++def spirv():
++    for name, _ in KERNELS:
++        subprocess.run(["glslangValidator", "-V", "--target-env", "vulkan1.2", "-o",
++                        str(SHADERS / f"{name}.spv"), str(SHADERS / f"{name}.comp")], check=True)
++
++
++def generate():
++    """{path: bytes} of every generated file."""
++    files = {}
++    entries, samples = [], []
++    for sm in SMS:
++        for name, test in KERNELS:
++            out = subprocess.run([str(GEN), str(sm), "main", str(SHADERS / f"{name}.spv")],
++                                 check=True, capture_output=True, text=True).stdout
++            k = json.loads(out)
++            code = bytes.fromhex(k["code"])
++            files[SHADERS / f"sm{sm}/{name}.bin"] = code
++            runs = ", ".join("&[" + ", ".join(f"({a}, {b}, {c})" for a, b, c in k["runs"][v]) + "]"
++                             for v in VARIABLES)
++            entry = (f"    Kernel {{\n"
++                     f"        name: \"{name}\",\n"
++                     f"        sm: {sm},\n"
++                     f"        compute_class: {k['compute_class']:#06x},\n"
++                     f"        code: include_bytes!(\"../../shaders/sm{sm}/{name}.bin\"),\n"
++                     f"        registers: {k['registers']},\n"
++                     f"        shared_bytes: {k['shared_bytes']},\n"
++                     f"        barriers: {k['barriers']},\n"
++                     f"        workgroup: {k['workgroup']},\n"
++                     f"        cbuf_bytes: {k['cbuf_bytes']},\n"
++                     f"        qmd: &{k['qmd']},\n"
++                     f"        runs: [{runs}],\n"
++                     f"    }},\n")
++            entries.append((test, entry))
++            for s in k["samples"]:
++                samples.append(f"    (\"{name}\", {sm}, {s['values']}, &{s['qmd']}),\n")
++    rs = ["// @generated by tools/gen-kernels.py from shaders/*.spv with Mesa NAK "
++          f"{MESA_PIN}; do not edit.\n",
++          "// Regenerate after changing a shader, the bridge (compiler/) or the Mesa pin, and check with\n",
++          "// `tools/gen-kernels.py --check`.\n",
++          "use super::compute::Kernel;\n\n",
++          f"/// Version of the kernel contract (bindings, cbuf layout, runs) these tables follow.\n",
++          f"pub(crate) const ABI: u32 = {ABI};\n\n",
++          "/// Production kernels, every shader model.\n",
++          "pub(crate) static KERNELS: &[Kernel] = &[\n"]
++    rs += [e for test, e in entries if not test]
++    rs += ["];\n\n", "/// Kernels for the engine's own hardware tests.\n", "#[cfg(test)]\n",
++           "pub(crate) static TEST_KERNELS: &[Kernel] = &[\n"]
++    rs += [e for test, e in entries if test]
++    rs += ["];\n\n",
++           "/// nak_fill_qmd results for combined launch values (program, cbuf, grid x/y/z): the\n",
++           "/// runtime packing must reproduce them bit for bit.\n",
++           "#[cfg(test)]\n",
++           "pub(crate) static QMD_SAMPLES: &[(&str, u32, [u64; 5], &[u32])] = &[\n"]
++    rs += samples
++    rs += ["];\n"]
++    files[OUT_RS] = "".join(rs).encode()
++    return files
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--spirv", action="store_true")
++    parser.add_argument("--check", action="store_true")
++    args = parser.parse_args()
++    if args.spirv:
++        spirv()
++        return
++    files = generate()
++    if args.check:
++        stale = [p for p, data in files.items() if not p.exists() or p.read_bytes() != data]
++        expected = {p for p in files if p.suffix == ".bin"}
++        extra = [p for p in SHADERS.glob("sm*/*.bin") if p not in expected]
++        for p in stale + extra:
++            print(f"gen-kernels: {p.relative_to(NATIVE)} is not what the generator produces", file=sys.stderr)
++        sys.exit(1 if stale or extra else 0)
++    for p, data in files.items():
++        p.parent.mkdir(parents=True, exist_ok=True)
++        p.write_bytes(data)
++    print(f"gen-kernels: {len(files) - 1} kernels, {OUT_RS.relative_to(NATIVE)}")
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.56.0
+

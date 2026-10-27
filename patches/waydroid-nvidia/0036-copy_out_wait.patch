@@ -1,0 +1,74 @@
+From a7a63cba6300a05ca8e4d649672130db3c6f42e3 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Tue, 27 Oct 2026 15:19:32 +0800
+Subject: [PATCH 36/37] =?utf-8?q?=E8=A7=86=E9=A2=91=EF=BC=9Acopy=5Fout=5Fw?=
+ =?utf-8?q?ait=20=E6=8E=A8=E8=BF=9F=E8=A7=A3=E7=A0=81=E7=8A=B6=E6=80=81?=
+ =?utf-8?q?=E6=A3=80=E6=9F=A5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+native 64 位 timeline 下，copy_out_wait 不再在提交拷贝前 CPU 等待解码，
+copy engine 在 GPU 上 acquire 解码 timeline，拷贝完成后再检查该帧的引擎
+状态，失败的帧仍返回错误。对外交出 fence 的 copy_out 保持导出前确认状态。
+---
+ .../driver-source/native/src/video/session.rs | 24 +++++++++++++++----
+ 1 file changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/session.rs b/nvidia-prolapse/driver-source/native/src/video/session.rs
+index 4055e58..c2f62d5 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/session.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/session.rs
+@@ -810,7 +810,17 @@ impl Session {
+         self.nvdec.wait(&self.drm, self.nvdec.submitted)
+     }
+ 
++    /// Copy picture `id` into `t`; returns the fence of the copy (None: already done). The picture's
++    /// engine status is known before the copy is queued, so the fence never stands for a failed
++    /// picture: callers that hand the fence on (Android buffer queues) get the error here.
+     pub fn copy_out(&mut self, id: u64, t: &Target) -> VResult<Option<OwnedFd>> {
++        self.copy_out_inner(id, t, false)
++    }
++
++    /// `defer_status`: the caller waits for the copy and then checks the picture
++    /// ([`Session::copy_out_wait`]), so with a native 64-bit timeline the copy engine orders itself
++    /// after the decode on the GPU instead of a CPU wait for the decode here.
++    fn copy_out_inner(&mut self, id: u64, t: &Target, defer_status: bool) -> VResult<Option<OwnedFd>> {
+         self.copy.reap()?;
+         let pic = self
+             .pictures
+@@ -821,8 +831,10 @@ impl Session {
+         let decoded_at = pic.decoded_at;
+         // Never hand out a picture whose engine status is unknown: wait for its
+         // decode (CPU) if that is still unchecked, then check every completed
+-        // picture (codecs with a status_offset).
+-        if (0..RING_SLOTS).any(|k| self.ring[k].unchecked && self.ring[k].busy_until == decoded_at)
++        // picture (codecs with a status_offset). A deferred check skips the wait.
++        let deferred = defer_status && self.nvdec.timeline.native64();
++        if !deferred
++            && (0..RING_SLOTS).any(|k| self.ring[k].unchecked && self.ring[k].busy_until == decoded_at)
+         {
+             self.stats.cpu_waits += 1;
+             self.nvdec.wait(&self.drm, decoded_at)?;
+@@ -1138,13 +1150,15 @@ impl Session {
+         Ok(OutputAllocation { fd, memory })
+     }
+ 
+-    /// Complete a copy-out before the CPU maps its destination.
++    /// Complete a copy-out before the CPU maps its destination. The picture's engine status is
++    /// checked once the copy (ordered after the decode) completed: a failed picture returns the
++    /// error even though the copy itself ran.
+     pub fn copy_out_wait(&mut self, id: u64, target: &Target) -> VResult<()> {
+-        if let Some(fence) = self.copy_out(id, target)? {
++        if let Some(fence) = self.copy_out_inner(id, target, true)? {
+             wait_sync_file(std::os::fd::AsRawFd::as_raw_fd(&fence), Duration::from_secs(5))
+                 .map_err(VideoError::DeviceLost)?;
+         }
+-        Ok(())
++        self.wait_picture(id)
+     }
+ }
+ 
+-- 
+2.56.0
+

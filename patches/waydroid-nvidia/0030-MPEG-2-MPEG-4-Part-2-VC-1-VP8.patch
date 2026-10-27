@@ -1,0 +1,1355 @@
+From 96e8662d184dfde2ffd5d15f9fca870d979ac2f9 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Tue, 27 Oct 2026 00:09:06 +0800
+Subject: [PATCH 30/37] =?utf-8?q?=E8=A7=86=E9=A2=91=E8=A7=A3=E7=A0=81?=
+ =?utf-8?q?=EF=BC=9AMPEG-2=E3=80=81MPEG-4=20Part=202=E3=80=81VC-1=E3=80=81?=
+ =?utf-8?q?VP8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+- legacy.rs：老格式通用框架（surface 映射、参考帧、场对、状态偏移）
+- MPEG-2：场叠放输出布局，第二场写入第一场 surface，copy_out 交织两场；与 C 驱动逐字节一致
+- MPEG-4 SP/ASP：引擎要求码流从 VOP 起始码开始，由 VA 参数重建 VOP 头并移位接上宏块数据；
+  与 stock libnvcuvid 逐字节一致；不支持 GMC、短头、数据分区
+- VC-1 Simple/Main/Advanced：引擎自行解析图像层，描述符只填序列/入口层
+- VP8：首帧前写入 RFC 6386 默认概率表（vp8_init.bin），描述符宽高按宏块对齐；与软解逐字节一致
+- caps 按 stock 在本卡上报告的尺寸上限
+---
+ nvidia-prolapse/driver-source/native/LICENSE  |   3 +
+ .../driver-source/native/src/video/legacy.rs  | 248 ++++++++++++++++++
+ .../driver-source/native/src/video/mod.rs     |  46 ++++
+ .../driver-source/native/src/video/mpeg2.rs   | 155 +++++++++++
+ .../driver-source/native/src/video/mpeg4.rs   | 173 ++++++++++++
+ .../driver-source/native/src/video/session.rs | 187 ++++++++-----
+ .../driver-source/native/src/video/vc1.rs     | 185 +++++++++++++
+ .../driver-source/native/src/video/vp8.rs     | 150 +++++++++++
+ .../native/src/video/vp8_init.bin             | Bin 0 -> 1228 bytes
+ 9 files changed, 1085 insertions(+), 62 deletions(-)
+ create mode 100644 nvidia-prolapse/driver-source/native/src/video/legacy.rs
+ create mode 100644 nvidia-prolapse/driver-source/native/src/video/mpeg2.rs
+ create mode 100644 nvidia-prolapse/driver-source/native/src/video/mpeg4.rs
+ create mode 100644 nvidia-prolapse/driver-source/native/src/video/vc1.rs
+ create mode 100644 nvidia-prolapse/driver-source/native/src/video/vp8.rs
+ create mode 100644 nvidia-prolapse/driver-source/native/src/video/vp8_init.bin
+
+diff --git a/nvidia-prolapse/driver-source/native/LICENSE b/nvidia-prolapse/driver-source/native/LICENSE
+index 9d56a8d..84a8ab3 100644
+--- a/nvidia-prolapse/driver-source/native/LICENSE
++++ b/nvidia-prolapse/driver-source/native/LICENSE
+@@ -33,6 +33,9 @@ Exceptions (inherit the upstream or stated license):
+     licenses/                 notices of ash (MIT/Apache-2.0), tinygrad (MIT)
+                               and NVIDIA's public headers (MIT)
+     src/vp9_tables.rs         values from libvpx (BSD-3-Clause, notice in file)
++    src/video/vp8_init.bin    VP8 default probabilities of RFC 6386 (whose
++                              reference code is BSD-3-Clause), laid out for
++                              the decoder engine
+     src/video/av1/cdf_defaults.rs
+                               values from Mesa (MIT, AMD; notice in file)
+     src/video/av1/testdata/   Big Buck Bunny (c) 2008 Blender Foundation,
+diff --git a/nvidia-prolapse/driver-source/native/src/video/legacy.rs b/nvidia-prolapse/driver-source/native/src/video/legacy.rs
+new file mode 100644
+index 0000000..7d04d6a
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/src/video/legacy.rs
+@@ -0,0 +1,248 @@
++//! Parameter-driven decoders of the pre-VP9 NVDEC formats (MPEG-2, MPEG-4 part 2, VC-1, VP8).
++//!
++//! The engine parses the macroblock layer itself; the client supplies the sequence/picture level
++//! fields (a VA picture's parameter buffers) and the engine-readable bitstream. [`Format`] is the
++//! per-codec half: picture parameters → descriptor slot and method list. [`LegacyCodec`] is the
++//! shared `CodecDecoder`: VA surface identity ↔ session surfaces, reference resolution, and field
++//! pairs (the second field of a frame is decoded into the surface of the first).
++//!
++//! Descriptor layouts, method lists and side-buffer rules follow stock libnvcuvid 615.78.08 as
++//! captured in RM traces (`tools/nvdec-trace`); each format module cites what it measured.
++use super::{
++    Allocator, BuildContext, CodecDecoder, DecodeJob, Job, PictureInfo, VResult, VideoError,
++};
++use std::{cell::RefCell, collections::HashMap, rc::Rc};
++
++/// References a picture may name: MPEG-2/MPEG-4/VC-1 use forward and backward, VP8 last, golden
++/// and alt-ref.
++pub const MAX_REFS: usize = 3;
++
++/// Which part of a frame a picture codes.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Field {
++    Frame,
++    /// First field of a frame; the second field follows as its own picture.
++    First,
++    /// Second field: decoded into the surface of the first.
++    Second,
++}
++
++/// Offsets of the bottom field image inside a frame surface, in 256-byte units: stock stores the
++/// two fields as separate images (luma rows aligned to 32, chroma rows to 16).
++pub fn field_offsets(pitch: u32, frame_height: u32) -> (u32, u32) {
++    let field = frame_height.div_ceil(2);
++    (
++        pitch * field.next_multiple_of(32) / 256,
++        pitch * field.div_ceil(2).next_multiple_of(16) / 256,
++    )
++}
++
++/// The VA-visible identity of one coded picture and what the format needs to place it.
++pub struct Picture<P> {
++    /// VA render target (surface id) the picture decodes into.
++    pub target: u32,
++    /// VA surface ids this picture predicts from, in the order the format's [`Format::build`]
++    /// expects (`None`: the stream refers to nothing there).
++    pub refs: [Option<u32>; MAX_REFS],
++    pub field: Field,
++    pub width: u32,
++    pub height: u32,
++    pub params: P,
++}
++
++/// Session surfaces a picture is built from.
++pub struct Slots {
++    pub current: usize,
++    /// Resolved [`Picture::refs`]; an unknown or absent reference is `None`.
++    pub refs: [Option<usize>; MAX_REFS],
++}
++
++pub trait Format {
++    type Params;
++    /// `CODEC_*` of this format.
++    const CODEC: u32;
++    /// Offset of `nvdec_status_s` in the descriptor slot, if the format reports one.
++    const STATUS: Option<usize>;
++    /// `error_status` bits the engine sets on pictures it decoded correctly.
++    const BENIGN_STATUS: u32 = 0;
++    /// The engine writes two stacked field images per picture (see `CodecDecoder::field_stacked`).
++    const FIELD_STACKED: bool;
++    /// Side buffers, once at session creation.
++    fn allocate(&mut self, alloc: &mut dyn Allocator, max_width: u32, max_height: u32) -> VResult<()>;
++    /// Descriptor slot and method list of one picture. `bitstream` is the engine bitstream the
++    /// session staged for it.
++    fn build(
++        &mut self,
++        picture: &Picture<Self::Params>,
++        slots: &Slots,
++        ctx: &BuildContext,
++        desc: &mut [u8],
++    ) -> VResult<Vec<u32>>;
++}
++
++/// State shared with the VA frontend: the picture it staged for the next `push_unit`, and the
++/// session surface every VA target decoded into.
++pub struct Shared<P> {
++    pub pending: Option<Picture<P>>,
++    surfaces: HashMap<u32, usize>,
++}
++
++impl<P> Default for Shared<P> {
++    fn default() -> Self {
++        Self { pending: None, surfaces: HashMap::new() }
++    }
++}
++
++impl<P> Shared<P> {
++    /// The client released `target`: forget its surface.
++    pub fn release(&mut self, target: u32) {
++        self.surfaces.remove(&target);
++    }
++}
++
++pub type Handle<P> = Rc<RefCell<Shared<P>>>;
++
++pub struct LegacyCodec<F: Format> {
++    format: F,
++    shared: Handle<F::Params>,
++    job: Option<Picture<F::Params>>,
++    bits: Option<Vec<u8>>,
++    /// References of the picture being decoded, kept alive until the next picture.
++    refs: Vec<usize>,
++    /// Surface of a first field whose second field has not arrived yet.
++    half: Option<(u32, usize)>,
++    /// Surface the next job writes into (second fields).
++    output: Option<usize>,
++    max: (u32, u32),
++}
++
++impl<F: Format> LegacyCodec<F> {
++    pub fn new(format: F, shared: Handle<F::Params>, max_width: u32, max_height: u32) -> Self {
++        Self {
++            format,
++            shared,
++            job: None,
++            bits: None,
++            refs: Vec::new(),
++            half: None,
++            output: None,
++            max: (max_width, max_height),
++        }
++    }
++}
++
++impl<F: Format> CodecDecoder for LegacyCodec<F> {
++    fn codec(&self) -> u32 {
++        F::CODEC
++    }
++    fn bit_depth(&self) -> u32 {
++        8
++    }
++    fn dpb_size(&self) -> usize {
++        MAX_REFS
++    }
++    fn allocate(&mut self, alloc: &mut dyn Allocator, w: u32, h: u32) -> VResult<()> {
++        self.format.allocate(alloc, w, h)
++    }
++    fn surfaces_needed(&self, _: &[u8]) -> VResult<usize> {
++        let second = self.shared.borrow().pending.as_ref().is_some_and(|p| p.field == Field::Second);
++        Ok(usize::from(!second))
++    }
++    fn push_unit(&mut self, data: &[u8]) -> VResult<()> {
++        let picture = self
++            .shared
++            .borrow_mut()
++            .pending
++            .take()
++            .ok_or_else(|| VideoError::Invalid("missing VA picture".into()))?;
++        if picture.width == 0
++            || picture.height == 0
++            || picture.width > self.max.0.next_multiple_of(16)
++            || picture.height > self.max.1.next_multiple_of(16)
++        {
++            return Err(VideoError::Unsupported(format!(
++                "coded size {}x{} outside the {}x{} context",
++                picture.width, picture.height, self.max.0, self.max.1
++            )));
++        }
++        self.output = None;
++        if picture.field == Field::Second {
++            match self.half.take() {
++                Some((t, s)) if t == picture.target => self.output = Some(s),
++                _ => return Err(VideoError::Bitstream("second field without its first field".into())),
++            }
++        }
++        self.job = Some(picture);
++        self.bits = Some(data.to_vec());
++        Ok(())
++    }
++    fn next_job(&mut self) -> VResult<Option<Job>> {
++        let (Some(p), Some(bitstream)) = (self.job.as_ref(), self.bits.take()) else {
++            return Ok(None);
++        };
++        let info = PictureInfo {
++            width: p.width,
++            height: p.height,
++            crop: [0, 0, p.width, p.height],
++            bit_depth: 8,
++            keyframe: p.refs.iter().all(Option::is_none),
++            ..Default::default()
++        };
++        Ok(Some(Job::Decode(DecodeJob {
++            info,
++            show: true,
++            display_key: None,
++            bitstream,
++            readback: None,
++        })))
++    }
++    fn build(&mut self, _job: &DecodeJob, ctx: &BuildContext, d: &mut [u8]) -> VResult<Vec<u32>> {
++        let picture = self
++            .job
++            .take()
++            .ok_or_else(|| VideoError::Invalid("build without a staged VA picture".into()))?;
++        let current = self.output.unwrap_or(ctx.current);
++        let shared = self.shared.borrow();
++        let mut slots = Slots { current, refs: [None; MAX_REFS] };
++        for (slot, id) in slots.refs.iter_mut().zip(picture.refs) {
++            *slot = id.and_then(|id| shared.surfaces.get(&id).copied());
++        }
++        drop(shared);
++        self.refs = slots.refs.iter().flatten().copied().collect();
++        let ctx = BuildContext { current, ..*ctx };
++        let words = self.format.build(&picture, &slots, &ctx, d)?;
++                self.shared.borrow_mut().surfaces.insert(picture.target, current);
++        if picture.field == Field::First {
++            self.half = Some((picture.target, current));
++        }
++        Ok(words)
++    }
++    fn finish(&mut self, _: &DecodeJob, _: usize, _: Option<&[u8]>) -> VResult<()> {
++        Ok(())
++    }
++    fn referenced(&self) -> Vec<usize> {
++        let mut r = self.refs.clone();
++        r.extend(self.half.map(|h| h.1));
++        r
++    }
++    fn output_surface(&self) -> Option<usize> {
++        self.output
++    }
++    fn status_offset(&self) -> Option<usize> {
++        F::STATUS
++    }
++    fn field_stacked(&self) -> bool {
++        F::FIELD_STACKED
++    }
++    fn benign_status(&self) -> u32 {
++        F::BENIGN_STATUS
++    }
++    fn flush(&mut self) {
++        self.job = None;
++        self.bits = None;
++        self.refs.clear();
++        self.half = None;
++        self.output = None;
++        *self.shared.borrow_mut() = Shared::default();
++    }
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/mod.rs b/nvidia-prolapse/driver-source/native/src/video/mod.rs
+index 9203fa7..bf1eb29 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/mod.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/mod.rs
+@@ -19,10 +19,15 @@ pub mod enc;
+ pub mod h264;
+ pub mod hdr;
+ pub mod hevc;
++pub mod legacy;
++pub mod mpeg2;
++pub mod mpeg4;
+ #[cfg(test)]
+ pub mod pretend;
+ pub mod session;
+ pub mod venc;
++pub mod vc1;
++pub mod vp8;
+ pub mod vp9;
+ 
+ use crate::rm::{self, Client};
+@@ -38,6 +43,11 @@ pub const CODEC_H264: u32 = 1;
+ pub const CODEC_HEVC: u32 = 2;
+ pub const CODEC_VP9: u32 = 3;
+ pub const CODEC_AV1: u32 = 4;
++/// Pre-VP9 formats, driven by external (VA) picture parameters only; not part of the C ABI.
++pub const CODEC_MPEG2: u32 = 5;
++pub const CODEC_MPEG4: u32 = 6;
++pub const CODEC_VC1: u32 = 7;
++pub const CODEC_VP8: u32 = 8;
+ pub const FORMAT_NV12: u32 = 1;
+ pub const FORMAT_P010: u32 = 2;
+ pub const FORMAT_YUV420P: u32 = 3;
+@@ -484,6 +494,21 @@ pub trait CodecDecoder {
+     fn status_offset(&self) -> Option<usize> {
+         None
+     }
++    /// `error_status` bits the engine also sets on valid pictures (stock decodes them the same).
++    fn benign_status(&self) -> u32 {
++        0
++    }
++    /// Session surface the next job must write into instead of a free one (the second field of a
++    /// frame decodes into the surface of the first).
++    fn output_surface(&self) -> Option<usize> {
++        None
++    }
++    /// The engine stores every picture as two field images (the bottom field image at the offset
++    /// [`legacy::field_offsets`] gives), whatever its structure: MPEG-2 and the other pre-VP9
++    /// formats. `copy_out` interleaves the fields into a frame.
++    fn field_stacked(&self) -> bool {
++        false
++    }
+ }
+ 
+ /// Why this library refuses `codec` on `class` although stock decodes it there, or `None`.
+@@ -549,6 +574,10 @@ impl NvdecEngineCaps {
+             CODEC_HEVC => !self.hevc_off,
+             CODEC_VP9 => !self.vp9_off,
+             CODEC_AV1 => !self.av1_off,
++            // The pre-VP9 formats have no BSP caps bit of their own (stock asks the generation only);
++            // VP8 shares the VP9 engine's capsTbl[4] bit 2.
++            CODEC_MPEG2 | CODEC_MPEG4 | CODEC_VC1 => true,
++            CODEC_VP8 => self.vp8,
+             _ => false,
+         }
+     }
+@@ -600,6 +629,23 @@ pub fn caps(codec: u32, class: u32, engine: &NvdecEngineCaps) -> NvVideoCaps {
+             c.bit_depth_mask = 1 << 8 | 1 << 10;
+             c.chroma_420_only = 1;
+         }
++        // Stock (cuvidGetDecoderCaps, 4:2:0 8-bit, Ada 615.78): MPEG-2 48x16..4080², MPEG-4 and VC-1
++        // 48x16..2048², VP8 64x64..32768x16384.
++        CODEC_MPEG2 => {
++            (c.min_width, c.min_height, c.max_width, c.max_height) = (48, 16, 4080, 4080);
++            c.bit_depth_mask = 1 << 8;
++            c.chroma_420_only = 1;
++        }
++        CODEC_MPEG4 | CODEC_VC1 => {
++            (c.min_width, c.min_height, c.max_width, c.max_height) = (48, 16, 2048, 2048);
++            c.bit_depth_mask = 1 << 8;
++            c.chroma_420_only = 1;
++        }
++        CODEC_VP8 => {
++            (c.min_width, c.min_height, c.max_width, c.max_height) = (64, 64, 32768, 16384);
++            c.bit_depth_mask = 1 << 8;
++            c.chroma_420_only = 1;
++        }
+         _ => stock = false,
+     }
+     c.supported = u32::from(stock);
+diff --git a/nvidia-prolapse/driver-source/native/src/video/mpeg2.rs b/nvidia-prolapse/driver-source/native/src/video/mpeg2.rs
+new file mode 100644
+index 0000000..12316bc
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/src/video/mpeg2.rs
+@@ -0,0 +1,155 @@
++//! MPEG-2 video (and MPEG-1 constrained to the same syntax) on the engine's `SET_APPLICATION_ID` 1
++//! setup (`nvdec_mpeg2_pic_s`, public `nvdec_drv.h`).
++//!
++//! Layout and values follow stock libnvcuvid 615.78.08 as captured in RM traces of progressive,
++//! interlaced-frame and field-coded streams (byte for byte in `tests`): the setup sits at the
++//! descriptor start, the slice start-offset table at +0x200, the engine status at +0x900. The
++//! bitstream is the picture's slices with their start codes; the setup carries two end-of-sequence
++//! start codes (`explicitEOSPresentFlag`). Slots: current, forward, backward reference.
++use super::{
++    legacy::{field_offsets, Field, Format, Picture, Slots},
++    Allocator, BuildContext, VResult, VideoError, CODEC_MPEG2,
++};
++use crate::gpu::method;
++
++pub const APP_ID: u32 = 1;
++const SLICE_OFFSETS: usize = 0x200;
++const STATUS: usize = 0x900;
++/// Slice offsets that fit between the table start and the status.
++pub const MAX_SLICES: usize = (STATUS - SLICE_OFFSETS) / 4;
++
++/// ISO 13818-2 default matrices (6.3.11), raster order.
++pub const DEFAULT_INTRA: [u8; 64] = [
++    8, 16, 19, 22, 26, 27, 29, 34, 16, 16, 22, 24, 27, 29, 34, 37, 19, 22, 26, 27, 29, 34, 34, 38,
++    22, 22, 26, 27, 29, 34, 37, 40, 22, 26, 27, 29, 32, 35, 40, 48, 26, 27, 29, 32, 35, 40, 48, 58,
++    26, 27, 29, 34, 38, 46, 56, 69, 27, 29, 35, 38, 46, 56, 69, 83,
++];
++pub const DEFAULT_INTER: [u8; 64] = [16; 64];
++
++/// `picture_structure` (Table 6-14).
++pub const TOP_FIELD: u8 = 1;
++pub const BOTTOM_FIELD: u8 = 2;
++pub const FRAME_PICTURE: u8 = 3;
++
++/// Sequence and picture level syntax of one MPEG-2 picture, as the VA picture parameter buffer
++/// carries it.
++#[derive(Clone, Debug)]
++pub struct Params {
++    /// `horizontal_size` / `vertical_size` of the sequence.
++    pub width: u32,
++    pub height: u32,
++    pub picture_structure: u8,
++    pub picture_coding_type: u8,
++    pub intra_dc_precision: u8,
++    pub frame_pred_frame_dct: bool,
++    pub concealment_motion_vectors: bool,
++    pub intra_vlc_format: bool,
++    pub q_scale_type: bool,
++    pub alternate_scan: bool,
++    pub top_field_first: bool,
++    /// `f_code[s][t]` flattened: forward horizontal/vertical, backward horizontal/vertical.
++    pub f_code: [u8; 4],
++    /// Quantiser matrices in raster order.
++    pub intra_matrix: [u8; 64],
++    pub inter_matrix: [u8; 64],
++    /// Start of every slice in the bitstream.
++    pub slice_offsets: Vec<u32>,
++}
++
++#[derive(Default)]
++pub struct Mpeg2;
++
++fn put32(d: &mut [u8], o: usize, v: u32) {
++    d[o..o + 4].copy_from_slice(&v.to_le_bytes());
++}
++fn put16(d: &mut [u8], o: usize, v: u16) {
++    d[o..o + 2].copy_from_slice(&v.to_le_bytes());
++}
++
++/// Stock `gptimer_timeout_value`: three frames' worth of macroblocks at 10000 cycles, at least
++/// a 1080p frame.
++pub fn gptimer(mbs: u32) -> u32 {
++    mbs.max(8100).saturating_mul(10000)
++}
++
++impl Format for Mpeg2 {
++    type Params = Params;
++    const CODEC: u32 = CODEC_MPEG2;
++    const STATUS: Option<usize> = Some(STATUS);
++    const FIELD_STACKED: bool = true;
++
++    fn allocate(&mut self, _: &mut dyn Allocator, _: u32, _: u32) -> VResult<()> {
++        Ok(())
++    }
++
++    fn build(
++        &mut self,
++        pic: &Picture<Params>,
++        slots: &Slots,
++        ctx: &BuildContext,
++        d: &mut [u8],
++    ) -> VResult<Vec<u32>> {
++        let p = &pic.params;
++        if p.slice_offsets.is_empty() || p.slice_offsets.len() > MAX_SLICES {
++            return Err(VideoError::Unsupported(format!(
++                "MPEG-2 picture with {} slices (1..={MAX_SLICES})",
++                p.slice_offsets.len()
++            )));
++        }
++        let (mbw, mbh) = (p.width.div_ceil(16), p.height.div_ceil(16));
++        let pitch = ctx.layout.pitch;
++        let (luma_bot, chroma_bot) = field_offsets(pitch, mbh * 16);
++        // eos[16]: two sequence_end_code start codes.
++        d[0x34..0x44].copy_from_slice(&[0, 0, 1, 0xb7, 0, 0, 0, 0, 0, 0, 1, 0xb7, 0, 0, 0, 0]);
++        put32(d, 0x44, 1);
++        put32(d, 0x48, ctx.bitstream_len as u32);
++        put32(d, 0x4c, p.slice_offsets.len() as u32);
++        put32(d, 0x50, gptimer(mbw * mbh));
++        put16(d, 0x54, p.width as u16);
++        put16(d, 0x56, p.height as u16);
++        d[0x58] = p.picture_structure;
++        d[0x59] = p.picture_coding_type;
++        d[0x5a] = p.intra_dc_precision;
++        d[0x5b] = u8::from(p.frame_pred_frame_dct);
++        d[0x5c] = u8::from(p.concealment_motion_vectors);
++        d[0x5d] = u8::from(p.intra_vlc_format);
++        d[0x5e] = 1; // tileFormat 1, gob_height 0
++        d[0x60..0x64].copy_from_slice(&p.f_code);
++        put16(d, 0x64, mbw as u16);
++        put16(d, 0x66, mbh as u16);
++        put32(d, 0x68, pitch);
++        put32(d, 0x6c, pitch);
++        put32(d, 0x74, luma_bot);
++        put32(d, 0x80, chroma_bot);
++        put16(d, 0x8c, 1); // output_memory_layout
++        put16(d, 0x8e, u16::from(p.alternate_scan));
++        put16(d, 0x90, u16::from(pic.field == Field::Second));
++        put32(d, 0x98, u32::from(p.q_scale_type));
++        put32(d, 0x9c, u32::from(p.top_field_first));
++        d[0xa8..0xe8].copy_from_slice(&p.intra_matrix);
++        d[0xe8..0x128].copy_from_slice(&p.inter_matrix);
++        put32(d, 0x128, 1);
++        put32(d, 0x12c, 1);
++        for (i, &o) in p.slice_offsets.iter().enumerate() {
++            put32(d, SLICE_OFFSETS + 4 * i, o);
++        }
++
++        let da = ctx.descriptor;
++        let forward = slots.refs[0].unwrap_or(slots.current);
++        let backward = slots.refs[1].unwrap_or(forward);
++        let mut w = Vec::new();
++        method(&mut w, 4, 0x200, &[APP_ID]);
++        method(&mut w, 4, 0x400, &[0x52050 | APP_ID]);
++        ctx.reloc(&mut w, 0x404, da);
++        ctx.reloc(&mut w, 0x408, ctx.bitstream);
++        ctx.reloc(&mut w, 0x410, da + SLICE_OFFSETS as u64);
++        for (i, s) in [slots.current, forward, backward].into_iter().enumerate() {
++            ctx.reloc(&mut w, 0x430 + 4 * i as u32, ctx.surfaces[s].luma);
++            ctx.reloc(&mut w, 0x474 + 4 * i as u32, ctx.surfaces[s].chroma);
++        }
++        ctx.reloc(&mut w, 0x424, da + STATUS as u64);
++        method(&mut w, 4, 0x40c, &[ctx.picture_index]);
++        method(&mut w, 4, 0x300, &[0]);
++        Ok(w)
++    }
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/mpeg4.rs b/nvidia-prolapse/driver-source/native/src/video/mpeg4.rs
+new file mode 100644
+index 0000000..dae6a12
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/src/video/mpeg4.rs
+@@ -0,0 +1,173 @@
++//! MPEG-4 part 2 (Simple, Advanced Simple, Main without sprites) on the engine's
++//! `SET_APPLICATION_ID` 4 setup (`nvdec_mpeg4_pic_s`, public `nvdec_drv.h`).
++//!
++//! The engine parses the video object plane header and the macroblock layer itself: the bitstream
++//! is one VOP from its `0x000001b6` start code on, and the setup carries only the video object
++//! layer syntax and the values libnvcuvid's parser takes from the VOP header (picture type,
++//! rounding, f_codes, B-VOP time distances). Layout and values follow stock libnvcuvid 615.78.08
++//! as captured in RM traces of I/P/B, quarter-sample, interlaced, MPEG-quantiser, resync-marker and
++//! odd-sized streams: setup at the descriptor start, one slice offset at +0x200, engine status at
++//! +0x300. Output is two stacked field images per surface, like MPEG-2. Slots: current, forward,
++//! backward reference (the current surface for an absent one).
++use super::{
++    legacy::{field_offsets, Format, Picture, Slots},
++    mpeg2::gptimer,
++    Allocator, BuildContext, VResult, VideoError, CODEC_MPEG4,
++};
++use crate::gpu::method;
++
++pub const APP_ID: u32 = 4;
++const SLICE_OFFSETS: usize = 0x200;
++const STATUS: usize = 0x300;
++/// Bytes of picture scratch that precede the history buffer.
++const SCRATCH: u64 = 0x400;
++/// History bytes per macroblock column.
++const HISTORY_PER_COLUMN: u64 = 768;
++/// Bytes of per-macroblock side data (motion of the backward reference for direct mode), rounded
++/// up to 64 KiB.
++const SIDE_PER_MB: u64 = 192;
++const SIDE_ALIGN: u64 = 0x10000;
++/// `sequence_end_code` (ISO 14496-2 6.2.2), twice, as the stream-end marker pair of the setup.
++const EOS: [u8; 16] = [0, 0, 1, 0xb1, 0, 0, 0, 0, 0, 0, 1, 0xb1, 0, 0, 0, 0];
++
++/// `vop_coding_type` of the setup.
++pub const PTYPE_I: u8 = 0;
++pub const PTYPE_P: u8 = 1;
++pub const PTYPE_B: u8 = 2;
++
++/// Video object layer syntax and the per-VOP fields the engine does not derive.
++#[derive(Clone, Debug)]
++pub struct Params {
++    /// `video_object_layer_width` / `_height`.
++    pub width: u32,
++    pub height: u32,
++    /// Bits of `vop_time_increment` (1..=16).
++    pub time_increment_bits: u8,
++    pub resync_marker_disable: bool,
++    pub interlaced: bool,
++    pub quant_type: bool,
++    pub quarter_sample: bool,
++    pub short_video_header: bool,
++    pub ptype: u8,
++    pub rounding: bool,
++    pub alternate_scan: bool,
++    pub top_field_first: bool,
++    /// `vop_fcode_forward` / `vop_fcode_backward`.
++    pub fcode: [u8; 2],
++    /// B-VOP time distances: between the references (`TRD`) and from the forward one (`TRB`).
++    pub trd: u16,
++    pub trb: u16,
++    /// Quantiser matrices in raster order (all 16 when the VOL does not load any).
++    pub intra_matrix: [u8; 64],
++    pub inter_matrix: [u8; 64],
++}
++
++#[derive(Default)]
++pub struct Mpeg4 {
++    side: u64,
++    scratch: u64,
++}
++
++fn put32(d: &mut [u8], o: usize, v: u32) {
++    d[o..o + 4].copy_from_slice(&v.to_le_bytes());
++}
++fn put16(d: &mut [u8], o: usize, v: u16) {
++    d[o..o + 2].copy_from_slice(&v.to_le_bytes());
++}
++
++impl Format for Mpeg4 {
++    type Params = Params;
++    const CODEC: u32 = CODEC_MPEG4;
++    const STATUS: Option<usize> = Some(STATUS);
++    const FIELD_STACKED: bool = true;
++    /// Bit 3 shows on correct B-VOPs (every stock capture of a B-VOP stream has some, with no
++    /// macroblock in error and output identical to a decode without it).
++    const BENIGN_STATUS: u32 = 8;
++
++    fn allocate(&mut self, alloc: &mut dyn Allocator, max_width: u32, max_height: u32) -> VResult<()> {
++        let (mbw, mbh) = (u64::from(max_width.div_ceil(16)), u64::from(max_height.div_ceil(16)));
++        self.side = alloc.vram((mbw * mbh * SIDE_PER_MB).next_multiple_of(SIDE_ALIGN).max(SIDE_ALIGN) as usize)?;
++        self.scratch = alloc.vram((SCRATCH + mbw * HISTORY_PER_COLUMN).next_multiple_of(SIDE_ALIGN) as usize)?;
++        Ok(())
++    }
++
++    fn build(
++        &mut self,
++        pic: &Picture<Params>,
++        slots: &Slots,
++        ctx: &BuildContext,
++        d: &mut [u8],
++    ) -> VResult<Vec<u32>> {
++        let p = &pic.params;
++        if p.ptype > PTYPE_B || !(1..=16).contains(&p.time_increment_bits) {
++            return Err(VideoError::Unsupported(format!(
++                "MPEG-4 picture type {}, {} time increment bits",
++                p.ptype, p.time_increment_bits
++            )));
++        }
++        let (mbw, mbh) = (p.width.div_ceil(16), p.height.div_ceil(16));
++        let pitch = ctx.layout.pitch;
++        let (luma_bot, chroma_bot) = field_offsets(pitch, mbh * 16);
++        let b = p.ptype == PTYPE_B;
++        d[0x34..0x44].copy_from_slice(&EOS);
++        d[0x44] = 1; // explicitEOSPresentFlag
++        put32(d, 0x48, ctx.bitstream_len as u32);
++        put32(d, 0x4c, 1); // slice_count: the VOP is one unit
++        put32(d, 0x50, SCRATCH as u32);
++        put32(d, 0x54, gptimer(mbw * mbh));
++        put16(d, 0x58, p.width as u16);
++        put16(d, 0x5a, p.height as u16);
++        d[0x5c] = p.time_increment_bits;
++        d[0x5d] = u8::from(p.resync_marker_disable);
++        d[0x5e] = 1; // tileFormat 1, gob_height 0
++        put32(d, 0x60, p.width);
++        put32(d, 0x64, p.height);
++        put32(d, 0x68, pitch);
++        put32(d, 0x6c, pitch);
++        put32(d, 0x74, luma_bot);
++        put32(d, 0x80, chroma_bot);
++        put32(d, 0x88, ((mbw as u64 * HISTORY_PER_COLUMN) / 256) as u32);
++        // Only B-VOPs carry time distances; the others get 1.
++        let (trd, trb) = if b { (u32::from(p.trd), u32::from(p.trb)) } else { (1, 1) };
++        for i in 0..2 {
++            put32(d, 0x8c + 4 * i, trd);
++            put32(d, 0x94 + 4 * i, trb);
++        }
++        put16(d, 0xa0, u16::from(p.fcode[0]));
++        put16(d, 0xa2, u16::from(p.fcode[1]));
++        d[0xa4] = u8::from(p.interlaced);
++        d[0xa5] = u8::from(p.quant_type);
++        d[0xa6] = u8::from(p.quarter_sample);
++        d[0xa7] = u8::from(p.short_video_header);
++        d[0xa8] = 1; // curr_output_memory_layout
++        d[0xa9] = p.ptype;
++        d[0xaa] = u8::from(p.rounding);
++        d[0xab] = u8::from(p.alternate_scan);
++        d[0xac] = u8::from(p.top_field_first);
++        d[0xb0..0xf0].copy_from_slice(&p.intra_matrix);
++        d[0xf0..0x130].copy_from_slice(&p.inter_matrix);
++        d[0x130] = 1; // ref_memory_layout[0..2]
++        d[0x131] = 1;
++
++        let da = ctx.descriptor;
++        let forward = slots.refs[0].unwrap_or(slots.current);
++        let backward = slots.refs[1].unwrap_or(slots.current);
++        let mut w = Vec::new();
++        method(&mut w, 4, 0x200, &[APP_ID]);
++        method(&mut w, 4, 0x400, &[0x52050 | APP_ID]);
++        ctx.reloc(&mut w, 0x404, da);
++        ctx.reloc(&mut w, 0x408, ctx.bitstream);
++        ctx.reloc(&mut w, 0x410, da + SLICE_OFFSETS as u64);
++        for (i, s) in [slots.current, forward, backward].into_iter().enumerate() {
++            ctx.reloc(&mut w, 0x430 + 4 * i as u32, ctx.surfaces[s].luma);
++            ctx.reloc(&mut w, 0x474 + 4 * i as u32, ctx.surfaces[s].chroma);
++        }
++        ctx.reloc(&mut w, 0x414, self.side);
++        ctx.reloc(&mut w, 0x418, self.scratch + SCRATCH);
++        ctx.reloc(&mut w, 0x424, da + STATUS as u64);
++        method(&mut w, 4, 0x40c, &[ctx.picture_index]);
++        ctx.reloc(&mut w, 0x4b8, self.scratch);
++        method(&mut w, 4, 0x300, &[0]);
++        Ok(w)
++    }
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/session.rs b/nvidia-prolapse/driver-source/native/src/video/session.rs
+index a88fa73..0184273 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/session.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/session.rs
+@@ -234,11 +234,12 @@ pub(crate) fn engine_status_error(status: &[u8; 16], picture: u32) -> Option<Str
+     };
+     (word(3) != 0).then(|| {
+         format!(
+-            "NVDEC error_status {:#x} ({} blocks in error) on picture {picture}: the decoded picture \
+-             is wrong (malformed bitstream or a stream feature the descriptor does not describe); \
+-             flush and restart at a key frame",
++            "NVDEC error_status {:#x} ({} blocks in error, {} decoded) on picture {picture}: the \
++             decoded picture is wrong (malformed bitstream or a stream feature the descriptor does \
++             not describe); flush and restart at a key frame",
+             word(3),
+-            word(1)
++            word(1),
++            word(0)
+         )
+     })
+ }
+@@ -254,6 +255,8 @@ pub struct Session {
+     surface_refs: Vec<SurfaceRef>,
+     /// Last copy-engine token reading each surface.
+     surface_copy: Vec<u64>,
++    /// Pitch-linear frame assembled from field-stacked pictures on their way to block-linear targets.
++    weave_stage: Option<VramBuffer>,
+     /// HDR static metadata declared by the unit that decoded each surface (a
+     /// show_existing_frame outputs the metadata of the frame it shows).
+     surface_hdr: Vec<HdrStaticMetadata>,
+@@ -443,6 +446,7 @@ impl Session {
+             ring,
+             next_ring: 0,
+             surface_copy: vec![0; surfaces.len()],
++            weave_stage: None,
+             surface_hdr: vec![HdrStaticMetadata::default(); surfaces.len()],
+             current_hdr: HdrStaticMetadata::default(),
+             resize_needed: None,
+@@ -489,6 +493,8 @@ impl Session {
+         self.ring[k].unchecked = false;
+         let mut b = [0u8; 16];
+         self.ring[k].desc.cpu.read_bytes(off, &mut b)?;
++        let error = u32::from_le_bytes([b[12], b[13], b[14], b[15]]) & !self.codec.benign_status();
++        b[12..].copy_from_slice(&error.to_le_bytes());
+         if let Some(m) = engine_status_error(&b, self.ring[k].picture) {
+             self.failed = Some(m.clone());
+             return Err(VideoError::Bitstream(m));
+@@ -636,14 +642,17 @@ impl Session {
+         timestamp: u64,
+         hdr: HdrStaticMetadata,
+     ) -> VResult<()> {
+-        let current = *self
+-            .free_surfaces()
+-            .first()
+-            // The unit was admitted by `decode`; running out now is an
+-            // accounting bug (the codec already consumed state), not AGAIN.
+-            .ok_or_else(|| {
+-                VideoError::Invalid("no free DPB surface inside an admitted unit".into())
+-            })?;
++        let current = match self.codec.output_surface() {
++            Some(surface) => surface,
++            None => *self
++                .free_surfaces()
++                .first()
++                // The unit was admitted by `decode`; running out now is an
++                // accounting bug (the codec already consumed state), not AGAIN.
++                .ok_or_else(|| {
++                    VideoError::Invalid("no free DPB surface inside an admitted unit".into())
++                })?,
++        };
+         // A copy_out may still read this surface (picture released early).
+         if self.surface_copy[current] != 0 && !self.copy.retired(self.surface_copy[current])? {
+             let fd = self.copy.queue.context_fence(
+@@ -846,6 +855,34 @@ impl Session {
+         }
+         let src_kinds = self.codec.gob_kinds(self.nvdec.class);
+         let blackwell_ce = self.copy.copy_class >= 0xc9b5;
++        // A field-stacked picture (two field images per surface) is interleaved by the copy
++        // engine: each field is written to every other destination row (doubled destination
++        // pitch). Block-linear destinations cannot be addressed that way, so the frame is
++        // assembled in a pitch-linear staging buffer first and copied on.
++        let weave = self.codec.field_stacked();
++        if weave && (ct != 0 || (dst.planar && dst.block.is_some())) {
++            return Err(VideoError::Unsupported(
++                "field-stacked picture: crop from the top, or a planar block-linear target".into(),
++            ));
++        }
++        let staged = weave && dst.block.is_some();
++        if staged && self.weave_stage.is_none() {
++            self.weave_stage = Some(vram(&self.device, &self.space, self.layout.size)?);
++        }
++        let stage_va = self.weave_stage.as_ref().map_or(0, |b| b.gpu.address());
++        let (first_block, out_pitch, out_va) = if staged {
++            (
++                None,
++                [self.layout.pitch, self.layout.chroma_pitch, 0],
++                [stage_va, stage_va + self.layout.chroma_offset, 0],
++            )
++        } else {
++            (dst.block, t.pitch, plane_va)
++        };
++        let fields = if weave { 2 } else { 1 };
++        let (luma_field, chroma_field) =
++            super::legacy::field_offsets(self.layout.pitch, info.height.next_multiple_of(16));
++        let field_bytes = [u64::from(luma_field) * 256, u64::from(chroma_field) * 256];
+         let mut w = Vec::new();
+         method(&mut w, 4, 0, &[self.copy.copy_class]); // SET_OBJECT
+         #[allow(clippy::needless_range_loop)] // plane index selects several per-plane values
+@@ -888,62 +925,88 @@ impl Session {
+             } else {
+                 self.layout.chroma_pitch
+             };
+-            // Source: engine block linear, 1-GOB wide, 2-GOB high blocks.
+-            let gob_kind = if blackwell_ce {
+-                src_kinds[p.min(1)] << 16
+-            } else {
+-                0
+-            };
+-            method(&mut w, 4, 0x728, &[1 << 4 | 1 << 12 | gob_kind]); // SET_SRC_BLOCK_SIZE
+-            method(&mut w, 4, 0x72c, &[src_width, rows_alloc, 1, 0]); // SRC W/H/D/LAYER
+-            method(&mut w, 4, 0x744, &[ox, oy]); // SRC_ORIGIN_X/Y
+-            let mut launch = 2 | 1 << 2 | 1 << 9; // non-pipelined, flush, multi-line
+-            if let Some(component) = remap {
+-                // DST_X = SRC_X (Cb) or SRC_Y (Cr), DST_Y/Z/W = NO_WRITE (6), COMPONENT_SIZE ONE,
+-                // NUM_SRC_COMPONENTS TWO, NUM_DST_COMPONENTS ONE.
+-                method(
+-                    &mut w,
+-                    4,
+-                    0x708,
+-                    &[component | 6 << 4 | 6 << 8 | 6 << 12 | (bps - 1) << 16 | 1 << 20],
+-                );
+-                launch |= 1 << 10; // REMAP_ENABLE
+-            }
+-            match dst.block {
+-                None => launch |= 1 << 8, // DST pitch
+-                Some((h, kinds)) => {
+-                    let dk = if blackwell_ce {
+-                        kinds[p.min(1)] << 16
+-                    } else {
+-                        0
+-                    };
+-                    method(&mut w, 4, 0x70c, &[h << 4 | 1 << 12 | dk]); // SET_DST_BLOCK_SIZE
+-                    let dst_rows = rows.next_multiple_of(8 << h);
++            for f in 0..fields {
++                // Rows f, f + 2, ... of the frame come from field image f.
++                let rows = if weave { (rows + 1 - f) / 2 } else { rows };
++                let src_va = src_va + u64::from(f) * field_bytes[p.min(1)];
++                // Source: engine block linear, 1-GOB wide, 2-GOB high blocks.
++                let gob_kind = if blackwell_ce {
++                    src_kinds[p.min(1)] << 16
++                } else {
++                    0
++                };
++                method(&mut w, 4, 0x728, &[1 << 4 | 1 << 12 | gob_kind]); // SET_SRC_BLOCK_SIZE
++                method(&mut w, 4, 0x72c, &[src_width, rows_alloc, 1, 0]); // SRC W/H/D/LAYER
++                method(&mut w, 4, 0x744, &[ox, oy]); // SRC_ORIGIN_X/Y
++                let mut launch = 2 | 1 << 2 | 1 << 9; // non-pipelined, flush, multi-line
++                if let Some(component) = remap {
++                    // DST_X = SRC_X (Cb) or SRC_Y (Cr), DST_Y/Z/W = NO_WRITE (6), COMPONENT_SIZE ONE,
++                    // NUM_SRC_COMPONENTS TWO, NUM_DST_COMPONENTS ONE.
+                     method(
+                         &mut w,
+                         4,
+-                        0x710,
+-                        // With remapping X counts destination elements (one component of `bps` bytes).
+-                        &[if remap.is_some() { dst.pitch[p] / bps } else { dst.pitch[p] }, dst_rows, 1, 0],
++                        0x708,
++                        &[component | 6 << 4 | 6 << 8 | 6 << 12 | (bps - 1) << 16 | 1 << 20],
+                     );
+-                    method(&mut w, 4, 0x74c, &[0, 0]); // DST_ORIGIN_X/Y
++                    launch |= 1 << 10; // REMAP_ENABLE
++                }
++                match first_block {
++                    None => launch |= 1 << 8, // DST pitch
++                    Some((h, kinds)) => {
++                        let dk = if blackwell_ce {
++                            kinds[p.min(1)] << 16
++                        } else {
++                            0
++                        };
++                        method(&mut w, 4, 0x70c, &[h << 4 | 1 << 12 | dk]); // SET_DST_BLOCK_SIZE
++                        let dst_rows = rows.next_multiple_of(8 << h);
++                        method(
++                            &mut w,
++                            4,
++                            0x710,
++                            // With remapping X counts destination elements (one component of `bps` bytes).
++                            &[if remap.is_some() { dst.pitch[p] / bps } else { dst.pitch[p] }, dst_rows, 1, 0],
++                        );
++                        method(&mut w, 4, 0x74c, &[0, 0]); // DST_ORIGIN_X/Y
++                    }
+                 }
++                let [ih, il] = crate::gpu::hi_lo(src_va);
++                let [oh, ol] = crate::gpu::hi_lo(out_va[p] + u64::from(f) * u64::from(out_pitch[p]));
++                method(&mut w, 4, 0x400, &[ih, il, oh, ol]);
++                method(
++                    &mut w,
++                    4,
++                    0x410,
++                    &[
++                        if p == 0 { self.layout.pitch } else { self.layout.chroma_pitch },
++                        out_pitch[p] * fields,
++                        line_bytes,
++                        rows,
++                    ],
++                );
++                method(&mut w, 4, 0x300, &[launch]);
++            }
++        }
++        if staged {
++            // Second pass: the woven pitch-linear frame into the block-linear target.
++            let (h, kinds) = dst.block.expect("staged implies a block-linear target");
++            for p in 0..2 {
++                let (rows, line_bytes) = if p == 0 {
++                    (ch, cw * bps)
++                } else {
++                    (ch.div_ceil(2), cw.div_ceil(2) * 2 * bps)
++                };
++                let dk = if blackwell_ce { kinds[p] << 16 } else { 0 };
++                method(&mut w, 4, 0x70c, &[h << 4 | 1 << 12 | dk]);
++                method(&mut w, 4, 0x710, &[dst.pitch[p], rows.next_multiple_of(8 << h), 1, 0]);
++                method(&mut w, 4, 0x74c, &[0, 0]);
++                let [ih, il] = crate::gpu::hi_lo(out_va[p]);
++                let [oh, ol] = crate::gpu::hi_lo(plane_va[p]);
++                method(&mut w, 4, 0x400, &[ih, il, oh, ol]);
++                method(&mut w, 4, 0x410, &[out_pitch[p], t.pitch[p], line_bytes, rows]);
++                // SRC pitch layout, non-pipelined, flush, multi-line.
++                method(&mut w, 4, 0x300, &[2 | 1 << 2 | 1 << 7 | 1 << 9]);
+             }
+-            let [ih, il] = crate::gpu::hi_lo(src_va);
+-            let [oh, ol] = crate::gpu::hi_lo(plane_va[p]);
+-            method(&mut w, 4, 0x400, &[ih, il, oh, ol]);
+-            method(
+-                &mut w,
+-                4,
+-                0x410,
+-                &[
+-                    if p == 0 { self.layout.pitch } else { self.layout.chroma_pitch },
+-                    t.pitch[p],
+-                    line_bytes,
+-                    rows,
+-                ],
+-            );
+-            method(&mut w, 4, 0x300, &[launch]);
+         }
+         // Command buffer: reuse one whose copy retired.
+         let ci = match self.copy.commands.iter().position(|(_, tok)| {
+diff --git a/nvidia-prolapse/driver-source/native/src/video/vc1.rs b/nvidia-prolapse/driver-source/native/src/video/vc1.rs
+new file mode 100644
+index 0000000..03f91b7
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/src/video/vc1.rs
+@@ -0,0 +1,185 @@
++//! VC-1 / WMV9 (Simple, Main, Advanced profile) on the engine's `SET_APPLICATION_ID` 2 setup
++//! (`nvdec_vc1_pic_s`, public `nvdec_drv.h`).
++//!
++//! The engine parses the picture layer itself; the setup carries only the sequence and entry-point
++//! level syntax and the buffers. Layout and values follow stock libnvcuvid 615.78.08 as captured
++//! in RM traces: setup at the descriptor start, slice start offsets at +0x200, engine status at
++//! +0x600. Output is two stacked field images per surface, like MPEG-2. Slots: current, forward,
++//! backward reference.
++use super::{
++    legacy::{field_offsets, Format, Picture, Slots},
++    mpeg2::gptimer,
++    Allocator, BuildContext, VResult, VideoError, CODEC_VC1,
++};
++use crate::gpu::method;
++
++pub const APP_ID: u32 = 2;
++const SLICE_OFFSETS: usize = 0x200;
++const STATUS: usize = 0x600;
++pub const MAX_SLICES: usize = (STATUS - SLICE_OFFSETS) / 4;
++/// Control word bit of a bidirectionally predicted picture.
++const CONTROL_B_PICTURE: u32 = 0x80;
++/// `profile` of the setup: 1 = Simple/Main, 2 = Advanced.
++const PROFILE_ADVANCED: u8 = 2;
++const PROFILE_SIMPLE_MAIN: u8 = 1;
++/// Frame start code (`prefixStartCode`) of Simple/Main pictures.
++const PREFIX_START_CODE: [u8; 4] = [0, 0, 1, 0x0d];
++/// Bytes of the entry-point scratch that precede the history buffer.
++const SCRATCH: u64 = 0x200;
++/// History bytes per macroblock column.
++const HISTORY_PER_COLUMN: u64 = 768;
++/// Bytes of per-macroblock side data (direct-mode motion of the references), at least 64 KiB.
++const SIDE_PER_MB: u64 = 384;
++const SIDE_MIN: u64 = 0x10000;
++
++/// Sequence and entry-point level syntax plus the picture kind the control word depends on.
++#[derive(Clone, Debug, Default)]
++pub struct Params {
++    /// Coded size of the entry point.
++    pub width: u32,
++    pub height: u32,
++    pub advanced: bool,
++    pub postproc: bool,
++    pub pulldown: bool,
++    pub interlace: bool,
++    pub tfcntr: bool,
++    pub finterp: bool,
++    pub psf: bool,
++    pub multires: bool,
++    pub syncmarker: bool,
++    pub rangered: bool,
++    pub max_b_frames: u8,
++    pub dquant: u8,
++    pub panscan: bool,
++    pub refdist: bool,
++    pub quantizer: u8,
++    pub extended_mv: bool,
++    pub extended_dmv: bool,
++    pub overlap: bool,
++    pub vstransform: bool,
++    pub loopfilter: bool,
++    pub fastuvmc: bool,
++    /// B or BI picture.
++    pub b_picture: bool,
++    /// Start of every slice in the staged bitstream.
++    pub slice_offsets: Vec<u32>,
++}
++
++#[derive(Default)]
++pub struct Vc1 {
++    side: u64,
++    scratch: u64,
++}
++
++fn put32(d: &mut [u8], o: usize, v: u32) {
++    d[o..o + 4].copy_from_slice(&v.to_le_bytes());
++}
++fn put16(d: &mut [u8], o: usize, v: u16) {
++    d[o..o + 2].copy_from_slice(&v.to_le_bytes());
++}
++
++impl Format for Vc1 {
++    type Params = Params;
++    const CODEC: u32 = CODEC_VC1;
++    const STATUS: Option<usize> = Some(STATUS);
++    const FIELD_STACKED: bool = true;
++
++    fn allocate(&mut self, alloc: &mut dyn Allocator, max_width: u32, max_height: u32) -> VResult<()> {
++        let (mbw, mbh) = (u64::from(max_width.div_ceil(16)), u64::from(max_height.div_ceil(16)));
++        self.side = alloc.vram((mbw * mbh * SIDE_PER_MB).max(SIDE_MIN).next_multiple_of(256) as usize)?;
++        self.scratch = alloc.vram((SCRATCH + mbw * HISTORY_PER_COLUMN).max(SIDE_MIN).next_multiple_of(256) as usize)?;
++        Ok(())
++    }
++
++    fn build(
++        &mut self,
++        pic: &Picture<Params>,
++        slots: &Slots,
++        ctx: &BuildContext,
++        d: &mut [u8],
++    ) -> VResult<Vec<u32>> {
++        let p = &pic.params;
++        if p.slice_offsets.is_empty() || p.slice_offsets.len() > MAX_SLICES {
++            return Err(VideoError::Unsupported(format!(
++                "VC-1 picture with {} slices (1..={MAX_SLICES})",
++                p.slice_offsets.len()
++            )));
++        }
++        let (mbw, mbh) = (p.width.div_ceil(16), p.height.div_ceil(16));
++        let pitch = ctx.layout.pitch;
++        let (luma_bot, chroma_bot) = field_offsets(pitch, mbh * 16);
++        if !p.advanced {
++            // Simple/Main streams have no start codes: the engine takes the frame start code here.
++            d[0x44..0x48].copy_from_slice(&PREFIX_START_CODE);
++        }
++        d[0x4c] = 1; // explicitEOSPresentFlag (eos[] stays zero)
++        put32(d, 0x50, ctx.bitstream_len as u32);
++        put32(d, 0x54, p.slice_offsets.len() as u32);
++        put32(d, 0x58, SCRATCH as u32);
++        put32(d, 0x5c, gptimer(mbw * mbh));
++        put16(d, 0x60, p.width as u16);
++        put16(d, 0x62, p.height as u16);
++        d[0x64] = if p.advanced { PROFILE_ADVANCED } else { PROFILE_SIMPLE_MAIN };
++        d[0x65] = u8::from(p.postproc);
++        d[0x66] = u8::from(p.pulldown);
++        d[0x67] = u8::from(p.interlace);
++        d[0x68] = u8::from(p.tfcntr);
++        d[0x69] = u8::from(p.finterp);
++        d[0x6a] = u8::from(p.psf);
++        d[0x6b] = 1; // tileFormat 1, gob_height 0
++        d[0x6c] = u8::from(p.multires);
++        d[0x6d] = u8::from(p.syncmarker);
++        d[0x6e] = u8::from(p.rangered);
++        d[0x6f] = p.max_b_frames;
++        d[0x70] = p.dquant;
++        d[0x71] = u8::from(p.panscan);
++        d[0x72] = u8::from(p.refdist);
++        d[0x73] = p.quantizer;
++        d[0x74] = u8::from(p.extended_mv);
++        d[0x75] = u8::from(p.extended_dmv);
++        d[0x76] = u8::from(p.overlap);
++        d[0x77] = u8::from(p.vstransform);
++        put32(d, 0x13c, mbw * 3);
++        put32(d, 0x140, pitch);
++        put32(d, 0x144, pitch);
++        put32(d, 0x14c, luma_bot);
++        put32(d, 0x158, chroma_bot);
++        put16(d, 0x160, p.width as u16);
++        put16(d, 0x162, p.height as u16);
++        d[0x164] = u8::from(p.loopfilter);
++        d[0x165] = u8::from(p.fastuvmc);
++        d[0x166] = 1; // output_memory_layout
++        d[0x167] = 1; // ref_memory_layout[0]
++        d[0x168] = 1; // ref_memory_layout[1]
++        for (i, &o) in p.slice_offsets.iter().enumerate() {
++            put32(d, SLICE_OFFSETS + 4 * i, o);
++        }
++
++        let da = ctx.descriptor;
++        let forward = slots.refs[0].unwrap_or(slots.current);
++        let backward = slots.refs[1].unwrap_or(forward);
++        let surface = |s: usize| (ctx.surfaces[s].luma, ctx.surfaces[s].chroma);
++        let control = 0x52050 | APP_ID | if p.b_picture { CONTROL_B_PICTURE } else { 0 };
++        let mut w = Vec::new();
++        method(&mut w, 4, 0x200, &[APP_ID]);
++        method(&mut w, 4, 0x400, &[control]);
++        ctx.reloc(&mut w, 0x404, da);
++        ctx.reloc(&mut w, 0x408, ctx.bitstream);
++        ctx.reloc(&mut w, 0x410, da + SLICE_OFFSETS as u64);
++        for (i, s) in [slots.current, forward, backward].into_iter().enumerate() {
++            let (luma, chroma) = surface(s);
++            ctx.reloc(&mut w, 0x430 + 4 * i as u32, luma);
++            ctx.reloc(&mut w, 0x474 + 4 * i as u32, chroma);
++        }
++        ctx.reloc(&mut w, 0x414, self.side);
++        ctx.reloc(&mut w, 0x418, self.scratch + SCRATCH);
++        ctx.reloc(&mut w, 0x424, da + STATUS as u64);
++        method(&mut w, 4, 0x40c, &[ctx.picture_index]);
++        ctx.reloc(&mut w, 0x4b8, self.scratch);
++        let (luma, chroma) = surface(slots.current);
++        ctx.reloc(&mut w, 0x428, luma);
++        ctx.reloc(&mut w, 0x42c, chroma);
++        method(&mut w, 4, 0x300, &[0]);
++        Ok(w)
++    }
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/vp8.rs b/nvidia-prolapse/driver-source/native/src/video/vp8.rs
+new file mode 100644
+index 0000000..96e85b0
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/src/video/vp8.rs
+@@ -0,0 +1,150 @@
++//! VP8 on the engine's `SET_APPLICATION_ID` 5 setup (`nvdec_vp8_pic_s`, public `nvdec_drv.h`).
++//!
++//! The engine parses the whole frame itself (frame header, probabilities, partitions); the setup
++//! carries only the sizes, the frame type and the first partition's length. Values, method list
++//! and side buffers follow stock libnvcuvid 615.78.08 as captured in RM traces: setup at the
++//! descriptor start, engine status at +0x100, slots golden / alt-ref / last / current, a fixed
++//! 0x4b00-byte buffer (method 0x540) directly followed by the history buffer (method 0x418,
++//! 512 bytes per macroblock column).
++use super::{
++    legacy::{Format, Picture, Slots},
++    Allocator, BuildContext, VResult, VideoError, CODEC_VP8,
++};
++use crate::gpu::method;
++
++pub const APP_ID: u32 = 5;
++const STATUS: usize = 0x100;
++/// Size of the buffer behind method 0x540 (measured: constant for 176x144 to 1280x720).
++const SCRATCH: u64 = 0x4b00;
++/// Initial contents of the first 0x4cc bytes of the scratch buffer, uploaded by stock before the
++/// first picture: the VP8 default probabilities of RFC 6386 in the engine's layout. Coefficient
++/// probabilities [4][8][3][11] each padded to 12 bytes (§13.5), y-mode {112, 86, 140, 37} and
++/// uv-mode {162, 101, 204} (§16.2) padded to 8, motion-vector probabilities [2][19] (§17.2), zeros.
++const INIT_TABLE: &[u8] = include_bytes!("vp8_init.bin");
++/// History bytes per macroblock column (`HistBufferSize` = 2 units of 256 per column).
++const HISTORY_PER_COLUMN: u64 = 512;
++/// Uncompressed data chunk of a key frame: frame tag, start code, 14-bit sizes with scaling bits.
++const KEY_CHUNK: usize = 10;
++const INTER_CHUNK: usize = 3;
++
++/// One VP8 frame as the VA picture parameter buffer describes it.
++#[derive(Clone, Debug)]
++pub struct Params {
++    pub width: u32,
++    pub height: u32,
++    pub key_frame: bool,
++    pub version: u8,
++    /// Bytes of the first partition including the frame header bits already consumed by the
++    /// client (the frame tag's `first_part_size`).
++    pub first_partition_size: u32,
++    /// `update_mb_segmentation_data` of the frame header (0 unless segmentation is enabled).
++    pub update_segment_data: bool,
++}
++
++impl Params {
++    /// Bytes of the uncompressed data chunk (frame tag, and on key frames start code and sizes)
++    /// in front of the first partition. The engine reads the partitions without it but counts it
++    /// in `VLDBufferSize`, as stock does.
++    pub fn chunk_len(&self) -> usize {
++        if self.key_frame {
++            KEY_CHUNK
++        } else {
++            INTER_CHUNK
++        }
++    }
++}
++
++#[derive(Default)]
++pub struct Vp8 {
++    scratch: u64,
++    history: u64,
++}
++
++fn put32(d: &mut [u8], o: usize, v: u32) {
++    d[o..o + 4].copy_from_slice(&v.to_le_bytes());
++}
++fn put16(d: &mut [u8], o: usize, v: u16) {
++    d[o..o + 2].copy_from_slice(&v.to_le_bytes());
++}
++
++impl Format for Vp8 {
++    type Params = Params;
++    const CODEC: u32 = CODEC_VP8;
++    const STATUS: Option<usize> = Some(STATUS);
++    const FIELD_STACKED: bool = false;
++
++    fn allocate(&mut self, alloc: &mut dyn Allocator, max_width: u32, _: u32) -> VResult<()> {
++        let history = u64::from(max_width.div_ceil(16)) * HISTORY_PER_COLUMN;
++        self.scratch = alloc.vram((SCRATCH + history).next_multiple_of(256) as usize)?;
++        self.history = self.scratch + SCRATCH;
++        alloc.write(self.scratch, 0, &[0; SCRATCH as usize])?;
++        alloc.write(self.scratch, 0, INIT_TABLE)?;
++        Ok(())
++    }
++
++    fn build(
++        &mut self,
++        pic: &Picture<Params>,
++        slots: &Slots,
++        ctx: &BuildContext,
++        d: &mut [u8],
++    ) -> VResult<Vec<u32>> {
++        let p = &pic.params;
++        let (mbw, mbh) = (p.width.div_ceil(16), p.height.div_ceil(16));
++        let pitch = ctx.layout.pitch;
++        // Offsets of the (unused) bottom field images as stock writes them: rows aligned to 16.
++        let field = mbh * 8;
++        let luma_bot = pitch * field.next_multiple_of(16) / 256;
++        let chroma_bot = pitch * (field / 2).next_multiple_of(16) / 256;
++        put32(d, 0x34, super::mpeg2::gptimer(mbw * mbh));
++        put16(d, 0x38, (mbw * 16) as u16);
++        put16(d, 0x3a, (mbh * 16) as u16);
++        d[0x3c] = u8::from(p.key_frame);
++        d[0x3d] = p.version;
++        d[0x3e] = 1; // tileFormat 1, gob_height 0
++        d[0x3f] = 1; // errorConcealOn
++        put32(d, 0x40, p.first_partition_size);
++        put32(d, 0x44, (mbw * 2).max(1));
++        put32(d, 0x48, (p.chunk_len() + ctx.bitstream_len) as u32);
++        put32(d, 0x4c, pitch / 16);
++        put32(d, 0x50, pitch / 16);
++        put32(d, 0x58, luma_bot);
++        put32(d, 0x64, chroma_bot);
++        d[0x8c] = u8::from(p.update_segment_data);
++
++        let cur = slots.current;
++        // Stock slot order: golden, alt-ref, last, current. A missing reference decodes against the
++        // picture itself (key frames name none).
++        let [last, golden, altref] = [0, 1, 2].map(|i| slots.refs[i].unwrap_or(cur));
++        let da = ctx.descriptor;
++        let mut w = Vec::new();
++        method(&mut w, 4, 0x200, &[APP_ID]);
++        // Key frames conceal from the current slot (error frame index 3 in bits 7..).
++        let conceal = if p.key_frame { 3 << 7 } else { 0 };
++        method(&mut w, 4, 0x400, &[0x52050 | APP_ID | conceal]);
++        ctx.reloc(&mut w, 0x404, da);
++        ctx.reloc(&mut w, 0x408, ctx.bitstream);
++        for (i, s) in [golden, altref, last, cur].into_iter().enumerate() {
++            ctx.reloc(&mut w, 0x430 + 4 * i as u32, ctx.surfaces[s].luma);
++            ctx.reloc(&mut w, 0x474 + 4 * i as u32, ctx.surfaces[s].chroma);
++        }
++        ctx.reloc(&mut w, 0x418, self.history);
++        ctx.reloc(&mut w, 0x424, da + STATUS as u64);
++        method(&mut w, 4, 0x40c, &[ctx.picture_index]);
++        ctx.reloc(&mut w, 0x540, self.scratch);
++        method(&mut w, 4, 0x300, &[0]);
++        Ok(w)
++    }
++}
++
++impl Params {
++    pub fn check(&self) -> VResult<()> {
++        if self.width == 0 || self.height == 0 || self.width > 0x3fff || self.height > 0x3fff {
++            return Err(VideoError::Unsupported(format!(
++                "VP8 frame size {}x{}",
++                self.width, self.height
++            )));
++        }
++        Ok(())
++    }
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/vp8_init.bin b/nvidia-prolapse/driver-source/native/src/video/vp8_init.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..c2467edd5e40bae3dc04e5df63bc3f3b84cd72a5
+GIT binary patch
+literal 1228
+zcmZob00soJ0fqgy<KO=$x52UudmBIfe|+^nh{ups_xR7Xi~s*OG&C?UCjI#T<`IOw
+zwe{V<yRZJw0*U*zo%()k3q(ER&Y%B3gH$&(FzlH2{r{T>5Ho%AZv21q48mqi{r&$V
+zRL!dHkAL1k%~vfs^7+Ysi200X{{8<7Rdas9umA7BS{oSB(x3moyc*15V4U&i{|Bg=
+zjqRWRzj_D}4`{sn{}9w(Mn;GNkUPI2vEiZ(4GhPW-`+pCd(nc4v+Wp~b&uU$v*FI%
+zKX(}!T=XYhn7aJ#qW||B7#OF1{D1cW#BDozU;Vvz=l^k#nSse$KW*6e^VI+U4GfHp
+zFaBOT`soOWom_e8*U4l5Pl42kM=$=gYWMd`AaTYM-~PXXSk92U>Er+BUm<4dG@bl=
+z_5g&<*z*4O?Ti1Hg7n69Jp6rYA4FU%W!=|Z3nBJ0Zu|NF#cPOvYx+O_fBXu<R`%Wc
+z`{3pOXF+-y=YIeH<~c-fW$)|%4<AF=y2*QfAHMk?6haJ)jKBY1g}Uc7;}5U`kls$l
+zjsG7&#s6~t_<jDu{{tZL^}G*0AKdx#7|1W4f~)T?-27(w|5ptRjPc+9UfB-T&hS3!
+z%dgAOIGyc#_{W~Z5OGF{_rGu5hPdsd@$LUdc0t_is<-d`$y@)QfXrvy{~N3r#J<1u
+zC){nlH3+vc3Lx0~RG$5R19j(Ar1)ig1Q7(8^ZfvV{h<NDW^DTdx9h6iFF4yg7NG|0
+zLI{D9Um!wYlHruZ)z`cB-&ycs{eOl!wQVm}?s&59|Lz6`TfMH^(>Hxs_5Vf#17pFn
+zU&r@<pAQPRWw}rOT)zH)9ms9!zKdS0+46N0NSx8+&bMR7f8GJHYrOV<-hS}cT@YKs
+zz3KL>RiC$k*o@mA{=EGG5_eOlJ^FLw?0-;hV35gK^=bQ|fA_&^0-yaka~cv~)oB;M
+z?>X}SCCDz3_?e%Vto?r)#Adwr<NuAT5cjWG|LxD~vtaKt=$BmofB6c8%~<*7@0Dv1
+zc5lelKPOK?^0-#Of)9&!LgEoQe|<p;|9432g0LRdMX6^P7BxJav}W=(^*IfVE#4D1
+hoqPZ9AH$M{Gpov9_dI*j(A4BLWy|R||Nb%H0|0_r$O8ZX
+
+literal 0
+HcmV?d00001
+
+-- 
+2.56.0
+

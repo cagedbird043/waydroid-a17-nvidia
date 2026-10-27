@@ -1,0 +1,502 @@
+From fba733d66912706a7dc207084091046ef4c83aa1 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Mon, 26 Oct 2026 19:34:06 +0800
+Subject: [PATCH 28/37] =?utf-8?q?=E8=A7=86=E9=A2=91=E7=BC=96=E7=A0=81?=
+ =?utf-8?q?=EF=BC=9Adma-buf=20=E8=BE=93=E5=85=A5=E7=BB=8F=20copy=20engine?=
+ =?utf-8?q?=20=E7=9B=B4=E6=8E=A5=E8=BF=9B=20NVENC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+- enc/ingest.rs：导入的 NV12/P010 系列（线性与 Turing+ 块线性）由 copy engine 重排进 NVENC 输入槽，
+  BGRA 经系统内存 staging 由 CPU 做 BT.709 转换
+- Encoder 增加 load_dmabuf / load_dmabuf_bgra / forget_dmabuf，按来源缓存导入
+- session.rs 开放 VramBuffer、CopyEngine 给编码侧复用
+- 原有配置输出不变：176 组对照仍与 C 核心逐字节一致
+---
+ .../native/src/video/enc/encoder.rs           |  68 +++-
+ .../native/src/video/enc/ingest.rs            | 311 ++++++++++++++++++
+ .../driver-source/native/src/video/enc/mod.rs |   1 +
+ .../driver-source/native/src/video/session.rs |  18 +-
+ 4 files changed, 388 insertions(+), 10 deletions(-)
+ create mode 100644 nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs b/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
+index 0e559ed..3ffdee6 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
+@@ -1,7 +1,7 @@
+ //! NVENC session ported from mickys/nvenc enc.c/enc.h (MIT, 90d1d6a).
+ //! Picture setups preserve the C core's bytes; RM ownership and completion are native Rust.
+ use super::{
+-    av1hdr, av1probs, h264hdr, hevchdr, layout, nvenc_drv::*, tmpl_av1::*, tmpl_h264::*,
++    av1hdr, av1probs, h264hdr, hevchdr, ingest, layout, nvenc_drv::*, tmpl_av1::*, tmpl_h264::*,
+     tmpl_hevc::*,
+ };
+ use crate::video::{
+@@ -164,6 +164,8 @@ impl Default for Pending {
+ pub struct Encoder {
+     // Drop the channel before allocations/device. Drop waits for queued work first.
+     chan: EngineChannel,
++    ingest: Option<ingest::Ingest>,
++    stage: Mem,
+     pub cfg: EncConfig,
+     rm: NvVencDevice,
+     wmb: usize,
+@@ -465,6 +467,8 @@ impl Encoder {
+         let av1_hq = av1 && (cfg.quality || cfg.bframes > 0);
+         Ok(Self {
+             chan,
++            ingest: None,
++            stage: Mem::default(),
+             cfg: c,
+             rm,
+             wmb,
+@@ -771,6 +775,68 @@ impl Encoder {
+         layout::in_tile_plane(c, uv, uvs, 4 * w, h, 4 * self.pitch);
+         Ok(())
+     }
++    /// Fills the next input slot from an external 4:2:0 dma-buf on the copy engine (NV12 for 8-bit,
++    /// P010 for 10-bit encodes); the visible `cfg.width` x `cfg.height` region is copied and the
++    /// padding stays zero, exactly as with the CPU loaders. `key` identifies the buffer: its
++    /// import is cached until [`Encoder::forget_dmabuf`].
++    pub fn load_dmabuf(&mut self, key: u64, src: &ingest::Source) -> VResult<()> {
++        let ds = self.input_slot()?;
++        if src.bytes_per_sample as usize != self.bps || self.cfg.chroma444 {
++            return Err(invalid("dma-buf sample size or chroma format does not match the encoder"));
++        }
++        if self.cfg.aq != 0 && self.cfg.codec == ENC_HEVC {
++            return Err(invalid("spatial AQ needs CPU-visible luma"));
++        }
++        self.aq_valid[ds] = false;
++        let dst = ingest::Destination::Tiled {
++            luma: self.input[ds].gpu,
++            chroma: self.input[ds].gpu + self.luma_sz as u64,
++            pitch: (self.pitch * self.bps) as u32,
++            width: self.cfg.width as u32,
++            height: self.cfg.height as u32,
++        };
++        if self.ingest.is_none() {
++            self.ingest = Some(ingest::Ingest::new(&self.rm)?);
++        }
++        let ingest = self.ingest.as_mut().unwrap();
++        ingest.copy(&self.rm, key, src, &dst)
++    }
++    /// Like [`Encoder::load_dmabuf`] for a one-plane BGRA dma-buf (`bytes_per_sample` 4): the
++    /// copy engine brings the visible region into a pitch-linear staging buffer and the CPU converts
++    /// it with [`Encoder::load_bgra`]. This GPU has no compute path here, so colour conversion
++    /// is the one step that still touches pixels on the CPU.
++    pub fn load_dmabuf_bgra(&mut self, key: u64, src: &ingest::Source) -> VResult<()> {
++        self.input_slot()?;
++        if src.bytes_per_sample != 4 || self.bps != 1 || self.cfg.chroma444 {
++            return Err(invalid("BGRA dma-buf needs an 8-bit 4:2:0 encoder"));
++        }
++        let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
++        let pitch = up(w * 4, 64);
++        if self.stage.size < pitch * h {
++            self.stage = Mem::alloc(&mut self.rm, pitch * h, 4096, true)?;
++        }
++        let dst = ingest::Destination::Linear {
++            address: self.stage.gpu,
++            pitch: pitch as u32,
++            width: w as u32,
++            height: h as u32,
++        };
++        if self.ingest.is_none() {
++            self.ingest = Some(ingest::Ingest::new(&self.rm)?);
++        }
++        let ingest = self.ingest.as_mut().unwrap();
++        ingest.copy(&self.rm, key, src, &dst)?;
++        let stage = std::mem::take(&mut self.stage);
++        let result = self.load_bgra(&stage.bytes()[..pitch * h], pitch);
++        self.stage = stage;
++        result
++    }
++    /// Drops the cached import of a buffer previously passed to [`Encoder::load_dmabuf`].
++    pub fn forget_dmabuf(&mut self, key: u64) {
++        if let Some(ingest) = self.ingest.as_mut() {
++            ingest.forget(key);
++        }
++    }
+     pub fn load_l10r(&mut self, src: &[u8], stride: usize) -> VResult<()> {
+         let ds = self.input_slot()?;
+         let (l, c) = self.input[ds].bytes_mut().split_at_mut(self.luma_sz);
+diff --git a/nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs b/nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs
+new file mode 100644
+index 0000000..e7b57b3
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs
+@@ -0,0 +1,311 @@
++//! GPU ingest of external 4:2:0 dma-bufs into the encoder's NVENC input surface.
++//!
++//! NVENC reads 8/16-bit semi-planar input in block-linear tiles two GOBs (16 rows) high; this GPU's
++//! GOB addressing is the one the copy engine writes, so a copy-engine rectangle copy converts any
++//! linear or NVIDIA block-linear NV12/P010 dma-bufs into the layout (measured: byte-identical to
++//! the CPU tiler `layout::in_tile_plane`). No pixel crosses the CPU. The dma-bufs are imported
++//! into the encoder's own address space once per key and stay mapped until [`Ingest::forget`].
++use super::super::{
++    channel::wait_sync_file,
++    session::{vram, CopyEngine},
++    VResult, VideoError,
++};
++use crate::{
++    gpu::{hi_lo, method, Push, SubmitStatus},
++    rm::Memory,
++    gpu::GpuMapping,
++};
++use std::{
++    collections::HashMap,
++    os::fd::{AsFd, AsRawFd, BorrowedFd},
++    rc::Rc,
++    time::Duration,
++};
++
++/// Source surface layout. `BlockLinear` is NVIDIA's 2D block-linear with 64-byte wide blocks of
++/// `8 << log2_height` rows.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Layout {
++    Linear,
++    BlockLinear { log2_height: u32 },
++}
++
++/// One plane of an external dma-buf. `fd` is borrowed for the duration of the call; planes with
++/// the same fd share one import.
++#[derive(Clone, Copy, Debug)]
++pub struct Plane {
++    pub fd: i32,
++    pub offset: u64,
++    pub pitch: u32,
++}
++
++/// An external NV12 (`bytes_per_sample` 1) or P010 (2) surface: luma plane, interleaved CbCr plane.
++#[derive(Clone, Copy, Debug)]
++pub struct Source {
++    pub planes: [Plane; 2],
++    pub layout: Layout,
++    pub bytes_per_sample: u32,
++}
++
++/// DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c, s, g, k, h) (drm_fourcc.h):
++/// 0x10 | h[3:0] | k[19:12] | g[21:20] | s[22] | c[25:23].
++/// Only uncompressed generation-2 (Turing and later) layouts are readable by the copy engine.
++pub fn layout_from_modifier(modifier: u64) -> Option<Layout> {
++    if modifier == 0 {
++        return Some(Layout::Linear);
++    }
++    let v = modifier & ((1 << 56) - 1);
++    if modifier >> 56 != 0x03 || v & 0x10 == 0 || v >> 26 != 0 {
++        return None;
++    }
++    let (h, g, c) = ((v & 0xf) as u32, (v >> 20) & 3, (v >> 23) & 7);
++    (c == 0 && g == 2 && h <= 5).then_some(Layout::BlockLinear { log2_height: h })
++}
++
++struct Import {
++    memory: Rc<Memory>,
++    gpu: GpuMapping,
++}
++
++pub(crate) struct Ingest {
++    engine: CopyEngine,
++    imports: HashMap<u64, Vec<Import>>,
++}
++
++/// Destination of a copy: both planes of one NVENC input slot (block linear, two GOBs high), or a
++/// pitch-linear staging buffer.
++pub(crate) enum Destination {
++    Tiled { luma: u64, chroma: u64, pitch: u32, width: u32, height: u32 },
++    Linear { address: u64, pitch: u32, width: u32, height: u32 },
++}
++
++enum Target {
++    Tiled(u64, u32),
++    Pitch(u64, u32),
++}
++
++impl Ingest {
++    pub fn new(rm: &super::super::venc::NvVencDevice) -> VResult<Self> {
++        Ok(Self {
++            engine: CopyEngine::new(&rm.device, &rm.space)?,
++            imports: HashMap::new(),
++        })
++    }
++
++    pub fn forget(&mut self, key: u64) {
++        self.imports.remove(&key);
++    }
++
++    fn import(
++        &mut self,
++        rm: &super::super::venc::NvVencDevice,
++        key: u64,
++        source: &Source,
++        planes: usize,
++    ) -> VResult<[usize; 2]> {
++        let mut order: Vec<i32> = Vec::new();
++        let mut index = [0usize; 2];
++        for (p, plane) in source.planes[..planes].iter().enumerate() {
++            if plane.fd < 0 {
++                return Err(VideoError::Invalid(format!("plane {p} dma-buf fd {}", plane.fd)));
++            }
++            index[p] = match order.iter().position(|&fd| fd == plane.fd) {
++                Some(i) => i,
++                None => {
++                    order.push(plane.fd);
++                    order.len() - 1
++                }
++            };
++        }
++        if self.imports.get(&key).is_some_and(|v| v.len() == order.len()) {
++            return Ok(index);
++        }
++        let mut imports = Vec::with_capacity(order.len());
++        for (i, fd) in order.iter().enumerate() {
++            // SAFETY: the caller lends a live fd for the duration of the call.
++            let borrowed = unsafe { BorrowedFd::borrow_raw(*fd) };
++            let memory = crate::external::import(&rm.device, rm.drm.as_fd(), borrowed)
++                .map_err(|e| VideoError::Invalid(format!("dma-buf import object {i}: {e}")))?;
++            let gpu = rm.space.map(&memory)?;
++            imports.push(Import { memory, gpu });
++        }
++        self.imports.insert(key, imports);
++        Ok(index)
++    }
++
++    /// Appends the copy of one `rows` x `line`-byte rectangle of `plane` to `words`.
++    fn rectangle(
++        words: &mut Vec<u32>,
++        layout: Layout,
++        plane: &Plane,
++        source: u64,
++        target: Target,
++        line: u32,
++        rows: u32,
++        size: u64,
++    ) -> VResult<()> {
++        let need = match layout {
++            Layout::Linear => u64::from(plane.pitch) * u64::from(rows - 1) + u64::from(line),
++            Layout::BlockLinear { log2_height } => {
++                u64::from(plane.pitch) * u64::from(rows.next_multiple_of(8 << log2_height))
++            }
++        };
++        let valid = plane.pitch >= line
++            && match layout {
++                Layout::Linear => plane.pitch % 4 == 0,
++                Layout::BlockLinear { .. } => plane.pitch % 64 == 0,
++            };
++        if !valid || plane.offset.checked_add(need).is_none_or(|end| end > size) {
++            return Err(VideoError::Invalid(format!(
++                "plane pitch {} offset {} cannot hold {rows} rows of {line} bytes in a {size}-byte dma-buf",
++                plane.pitch, plane.offset
++            )));
++        }
++        let mut launch = 2 | 1 << 2 | 1 << 9; // non-pipelined, flush, multi-line
++        match layout {
++            Layout::Linear => launch |= 1 << 7, // source pitch
++            Layout::BlockLinear { log2_height } => {
++                method(words, 4, 0x728, &[log2_height << 4 | 1 << 12]); // SET_SRC_BLOCK_SIZE
++                let src_rows = rows.next_multiple_of(8 << log2_height);
++                method(words, 4, 0x72c, &[plane.pitch, src_rows, 1, 0]);
++                method(words, 4, 0x744, &[0, 0]); // SRC_ORIGIN_X/Y
++            }
++        }
++        let (destination, dst_pitch) = match target {
++            Target::Tiled(address, pitch) => {
++                method(words, 4, 0x70c, &[1 << 4 | 1 << 12]); // SET_DST_BLOCK_SIZE: two GOBs high
++                method(words, 4, 0x710, &[pitch, rows.next_multiple_of(16), 1, 0]);
++                method(words, 4, 0x74c, &[0, 0]); // DST_ORIGIN_X/Y
++                (address, pitch)
++            }
++            Target::Pitch(address, pitch) => {
++                launch |= 1 << 8; // destination pitch
++                (address, pitch)
++            }
++        };
++        let [ih, il] = hi_lo(source);
++        let [oh, ol] = hi_lo(destination);
++        method(words, 4, 0x400, &[ih, il, oh, ol]);
++        method(words, 4, 0x410, &[plane.pitch, dst_pitch, line, rows]);
++        method(words, 4, 0x300, &[launch]);
++        Ok(())
++    }
++
++    /// Copies the visible region of `source` into `dst` and returns after the copy engine finished.
++    /// 4:2:0 sources (two planes, `bytes_per_sample` 1 or 2) go to a tiled slot; a one-plane BGRA
++    /// source (`bytes_per_sample` 4) goes to a pitch-linear staging buffer.
++    pub fn copy(
++        &mut self,
++        rm: &super::super::venc::NvVencDevice,
++        key: u64,
++        source: &Source,
++        dst: &Destination,
++    ) -> VResult<()> {
++        let bps = source.bytes_per_sample;
++        let planes = if matches!(dst, Destination::Linear { .. }) { 1 } else { 2 };
++        let index = self.import(rm, key, source, planes)?;
++        let imports = &self.imports[&key];
++        let mut words = Vec::with_capacity(64);
++        method(&mut words, 4, 0, &[self.engine.copy_class]); // SET_OBJECT
++        match *dst {
++            Destination::Tiled { luma, chroma, pitch, width, height } => {
++                for p in 0..2usize {
++                    let (rows, line) = if p == 0 {
++                        (height, width * bps)
++                    } else {
++                        (height.div_ceil(2), width.div_ceil(2) * 2 * bps)
++                    };
++                    let plane = &source.planes[p];
++                    let import = &imports[index[p]];
++                    Self::rectangle(
++                        &mut words,
++                        source.layout,
++                        plane,
++                        import.gpu.address() + plane.offset,
++                        Target::Tiled(if p == 0 { luma } else { chroma }, pitch),
++                        line,
++                        rows,
++                        import.memory.size as u64,
++                    )?;
++                }
++            }
++            Destination::Linear { address, pitch, width, height } => {
++                let plane = &source.planes[0];
++                let import = &imports[index[0]];
++                Self::rectangle(
++                    &mut words,
++                    source.layout,
++                    plane,
++                    import.gpu.address() + plane.offset,
++                    Target::Pitch(address, pitch),
++                    width * bps,
++                    height,
++                    import.memory.size as u64,
++                )?;
++            }
++        }
++        let ci = match self.engine.commands.iter().position(|(_, token)| {
++            *token == 0 || self.engine.queue.shared().retired(*token).unwrap_or(false)
++        }) {
++            Some(i) => i,
++            None => {
++                self.engine.commands.push((vram(&rm.device, &rm.space, 4096)?, 0));
++                self.engine.commands.len() - 1
++            }
++        };
++        let cmd = &mut self.engine.commands[ci].0;
++        for (i, word) in words.iter().enumerate() {
++            cmd.cpu.write_u32(i * 4, *word)?;
++        }
++        crate::platform::device_full_barrier();
++        let push = Push {
++            address: cmd.gpu.address(),
++            size: (words.len() * 4) as u32,
++            flags: 0,
++        };
++        let token = match self
++            .engine
++            .queue
++            .submit(&[push], &rm.space, &[], &[], &[], |_| Ok(()))?
++        {
++            SubmitStatus::Submitted(t) => t,
++            SubmitStatus::Full(_) => return Err(VideoError::Again("copy queue full".into())),
++        };
++        self.engine.commands[ci].1 = token;
++        if !self.engine.queue.shared().retired(token)? {
++            let fence = self
++                .engine
++                .queue
++                .context_fence(rm.drm.as_raw_fd(), token)?;
++            wait_sync_file(fence.as_raw_fd(), Duration::from_secs(5))
++                .map_err(VideoError::DeviceLost)?;
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn modifiers() {
++        let bl = |c: u64, s: u64, g: u64, k: u64, h: u64| {
++            0x03 << 56 | 0x10 | h | k << 12 | g << 20 | s << 22 | c << 23
++        };
++        assert_eq!(layout_from_modifier(0), Some(Layout::Linear));
++        assert_eq!(
++            layout_from_modifier(0x0300_0000_0060_6010),
++            Some(Layout::BlockLinear { log2_height: 0 })
++        );
++        assert_eq!(
++            layout_from_modifier(bl(0, 1, 2, 6, 4)),
++            Some(Layout::BlockLinear { log2_height: 4 })
++        );
++        assert_eq!(layout_from_modifier(bl(1, 1, 2, 6, 0)), None); // compressed
++        assert_eq!(layout_from_modifier(bl(0, 0, 0, 0xfe, 0)), None); // pre-Turing GOBs
++        assert_eq!(layout_from_modifier(bl(0, 1, 2, 6, 6)), None);
++        assert_eq!(layout_from_modifier(0x0100_0000_0000_0001), None); // other vendor
++        assert_eq!(layout_from_modifier(0x00ff_ffff_ffff_ffff), None); // invalid
++    }
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/enc/mod.rs b/nvidia-prolapse/driver-source/native/src/video/enc/mod.rs
+index 391abc4..d72160d 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/enc/mod.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/enc/mod.rs
+@@ -29,6 +29,7 @@ mod av1tables;
+ mod encoder;
+ pub mod h264hdr;
+ pub mod hevchdr;
++pub mod ingest;
+ pub mod layout;
+ pub mod nvenc_drv;
+ pub mod tmpl_av1;
+diff --git a/nvidia-prolapse/driver-source/native/src/video/session.rs b/nvidia-prolapse/driver-source/native/src/video/session.rs
+index d6577a9..fca6c1b 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/session.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/session.rs
+@@ -47,13 +47,13 @@ pub struct SessionInfo {
+     pub extra_output_slots: u32,
+ }
+ 
+-struct VramBuffer {
++pub(crate) struct VramBuffer {
+     _memory: Rc<Memory>,
+-    cpu: Mapping,
+-    gpu: GpuMapping,
++    pub(crate) cpu: Mapping,
++    pub(crate) gpu: GpuMapping,
+ }
+ 
+-fn vram(device: &Rc<Device>, space: &AddressSpace, size: usize) -> VResult<VramBuffer> {
++pub(crate) fn vram(device: &Rc<Device>, space: &AddressSpace, size: usize) -> VResult<VramBuffer> {
+     let memory = device
+         .allocate_vram(size)
+         .map_err(|e| VideoError::NoMemory(format!("VRAM {size} bytes: {e}")))?;
+@@ -129,19 +129,19 @@ type Import = (Rc<Memory>, GpuMapping);
+ 
+ /// Copy-engine context: a backend Queue (copy engine only), its own slot
+ /// pool page, and per-copy command buffers.
+-struct CopyEngine {
+-    queue: Queue,
+-    copy_class: u32,
++pub(crate) struct CopyEngine {
++    pub(crate) queue: Queue,
++    pub(crate) copy_class: u32,
+     _pool: Arc<SlotPool>,
+     _page: (Rc<Memory>, Mapping, GpuMapping),
+     _events: RmEvents,
+-    commands: Vec<(VramBuffer, u64)>,
++    pub(crate) commands: Vec<(VramBuffer, u64)>,
+     /// Imported targets kept alive until their copy retired.
+     pending: VecDeque<(u64, Vec<Import>)>,
+ }
+ 
+ impl CopyEngine {
+-    fn new(device: &Rc<Device>, space: &AddressSpace) -> VResult<Self> {
++    pub(crate) fn new(device: &Rc<Device>, space: &AddressSpace) -> VResult<Self> {
+         let caps = crate::capabilities::query(device)?;
+         let view = if crate::gpu::modern_host(caps.channel)? {
+             TimelineView::Native64
+-- 
+2.56.0
+

@@ -1,0 +1,523 @@
+From ccc6f46c73b1c3f8634c46a3a79988b625e7bb08 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Tue, 27 Oct 2026 11:43:27 +0800
+Subject: [PATCH 32/37] =?utf-8?q?=E8=A7=86=E9=A2=91=E7=BC=96=E7=A0=81?=
+ =?utf-8?q?=EF=BC=9A4:4:4=20=E5=A4=96=E9=83=A8=20dma-buf=20=E7=BB=8F=20cop?=
+ =?utf-8?q?y=20engine=20=E7=9B=B4=E6=8E=A5=E8=BF=9B=20NVENC=20=E8=BE=93?=
+ =?utf-8?q?=E5=85=A5=E6=A7=BD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+- ingest::Source 改为三平面并带 chroma444；Cb、Cr 各用一次 remap 拷贝写进交错 chroma 的偶数 / 奇数分量，另一分量 NO_WRITE
+- load_dmabuf 接受 444P / Q416，AV1 拒绝
+- 抽出 check_plane 与 run；新增实机测试 chroma_444_interleave（1/2 字节样本、线性与块线性源、跨 GOB 尺寸、带 padding pitch、单次与分次提交，对照 CPU tiler 逐字节一致）
+---
+ .../native/src/video/enc/encoder.rs           |  14 +-
+ .../native/src/video/enc/ingest.rs            | 389 +++++++++++++++---
+ 2 files changed, 337 insertions(+), 66 deletions(-)
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs b/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
+index 3ffdee6..e690836 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
+@@ -775,15 +775,19 @@ impl Encoder {
+         layout::in_tile_plane(c, uv, uvs, 4 * w, h, 4 * self.pitch);
+         Ok(())
+     }
+-    /// Fills the next input slot from an external 4:2:0 dma-buf on the copy engine (NV12 for 8-bit,
+-    /// P010 for 10-bit encodes); the visible `cfg.width` x `cfg.height` region is copied and the
+-    /// padding stays zero, exactly as with the CPU loaders. `key` identifies the buffer: its
+-    /// import is cached until [`Encoder::forget_dmabuf`].
++    /// Fills the next input slot from an external dma-buf on the copy engine: NV12/P010 for 4:2:0
++    /// encodes, 444P/Q416 (three planes) for 4:4:4 ones, 8-bit for 8-bit encodes and 16-bit for
++    /// 10-bit ones; the visible `cfg.width` x `cfg.height` region is copied and the padding stays
++    /// zero, exactly as with the CPU loaders. `key` identifies the buffer: its import is cached
++    /// until [`Encoder::forget_dmabuf`].
+     pub fn load_dmabuf(&mut self, key: u64, src: &ingest::Source) -> VResult<()> {
+         let ds = self.input_slot()?;
+-        if src.bytes_per_sample as usize != self.bps || self.cfg.chroma444 {
++        if src.bytes_per_sample as usize != self.bps || src.chroma444 != self.cfg.chroma444 {
+             return Err(invalid("dma-buf sample size or chroma format does not match the encoder"));
+         }
++        if src.chroma444 && self.cfg.codec == ENC_AV1 {
++            return Err(invalid("4:4:4 dma-buf ingest needs an H.264 or HEVC encoder"));
++        }
+         if self.cfg.aq != 0 && self.cfg.codec == ENC_HEVC {
+             return Err(invalid("spatial AQ needs CPU-visible luma"));
+         }
+diff --git a/nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs b/nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs
+index e7b57b3..f4dc43c 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs
+@@ -1,10 +1,12 @@
+-//! GPU ingest of external 4:2:0 dma-bufs into the encoder's NVENC input surface.
++//! GPU ingest of external YUV dma-bufs into the encoder's NVENC input surface.
+ //!
+ //! NVENC reads 8/16-bit semi-planar input in block-linear tiles two GOBs (16 rows) high; this GPU's
+ //! GOB addressing is the one the copy engine writes, so a copy-engine rectangle copy converts any
+ //! linear or NVIDIA block-linear NV12/P010 dma-bufs into the layout (measured: byte-identical to
+-//! the CPU tiler `layout::in_tile_plane`). No pixel crosses the CPU. The dma-bufs are imported
+-//! into the encoder's own address space once per key and stay mapped until [`Ingest::forget`].
++//! the CPU tiler `layout::in_tile_plane`). Planar 4:4:4 chroma (444P, Q416) is interleaved into
++//! the CbCr plane by two remapped copies, one per component (measured byte-exact in
++//! `tests::chroma_444_interleave`). No pixel crosses the CPU. The dma-bufs are imported into the
++//! encoder's own address space once per key and stay mapped until [`Ingest::forget`].
+ use super::super::{
+     channel::wait_sync_file,
+     session::{vram, CopyEngine},
+@@ -39,12 +41,15 @@ pub struct Plane {
+     pub pitch: u32,
+ }
+ 
+-/// An external NV12 (`bytes_per_sample` 1) or P010 (2) surface: luma plane, interleaved CbCr plane.
++/// An external surface: NV12 (`bytes_per_sample` 1) or P010 (2) with a luma and an interleaved
++/// CbCr plane; with `chroma444`, 444P (1) or Q416 (2) with luma, Cb and Cr planes; or one BGRA
++/// plane (4). Unused planes are ignored.
+ #[derive(Clone, Copy, Debug)]
+ pub struct Source {
+-    pub planes: [Plane; 2],
++    pub planes: [Plane; 3],
+     pub layout: Layout,
+     pub bytes_per_sample: u32,
++    pub chroma444: bool,
+ }
+ 
+ /// DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c, s, g, k, h) (drm_fourcc.h):
+@@ -72,8 +77,9 @@ pub(crate) struct Ingest {
+     imports: HashMap<u64, Vec<Import>>,
+ }
+ 
+-/// Destination of a copy: both planes of one NVENC input slot (block linear, two GOBs high), or a
+-/// pitch-linear staging buffer.
++/// Destination of a copy: both planes of one NVENC input slot (block linear, two GOBs high; the
++/// chroma plane is `pitch` wide for 4:2:0 and `2 * pitch` wide for 4:4:4), or a pitch-linear
++/// staging buffer.
+ pub(crate) enum Destination {
+     Tiled { luma: u64, chroma: u64, pitch: u32, width: u32, height: u32 },
+     Linear { address: u64, pitch: u32, width: u32, height: u32 },
+@@ -102,9 +108,9 @@ impl Ingest {
+         key: u64,
+         source: &Source,
+         planes: usize,
+-    ) -> VResult<[usize; 2]> {
++    ) -> VResult<[usize; 3]> {
+         let mut order: Vec<i32> = Vec::new();
+-        let mut index = [0usize; 2];
++        let mut index = [0usize; 3];
+         for (p, plane) in source.planes[..planes].iter().enumerate() {
+             if plane.fd < 0 {
+                 return Err(VideoError::Invalid(format!("plane {p} dma-buf fd {}", plane.fd)));
+@@ -133,17 +139,8 @@ impl Ingest {
+         Ok(index)
+     }
+ 
+-    /// Appends the copy of one `rows` x `line`-byte rectangle of `plane` to `words`.
+-    fn rectangle(
+-        words: &mut Vec<u32>,
+-        layout: Layout,
+-        plane: &Plane,
+-        source: u64,
+-        target: Target,
+-        line: u32,
+-        rows: u32,
+-        size: u64,
+-    ) -> VResult<()> {
++    /// Rejects a plane whose pitch or offset cannot hold `rows` rows of `line` bytes in `size`.
++    fn check_plane(layout: Layout, plane: &Plane, line: u32, rows: u32, size: u64) -> VResult<()> {
+         let need = match layout {
+             Layout::Linear => u64::from(plane.pitch) * u64::from(rows - 1) + u64::from(line),
+             Layout::BlockLinear { log2_height } => {
+@@ -161,6 +158,21 @@ impl Ingest {
+                 plane.pitch, plane.offset
+             )));
+         }
++        Ok(())
++    }
++
++    /// Appends the copy of one `rows` x `line`-byte rectangle of `plane` to `words`.
++    fn rectangle(
++        words: &mut Vec<u32>,
++        layout: Layout,
++        plane: &Plane,
++        source: u64,
++        target: Target,
++        line: u32,
++        rows: u32,
++        size: u64,
++    ) -> VResult<()> {
++        Self::check_plane(layout, plane, line, rows, size)?;
+         let mut launch = 2 | 1 << 2 | 1 << 9; // non-pipelined, flush, multi-line
+         match layout {
+             Layout::Linear => launch |= 1 << 7, // source pitch
+@@ -191,9 +203,100 @@ impl Ingest {
+         Ok(())
+     }
+ 
++    /// Appends the copy of one full-resolution chroma plane (`width` x `rows` samples of `bps`
++    /// bytes) into one component of the interleaved CbCr plane of a tiled NVENC input slot:
++    /// `component` 0 writes the even (Cb) samples, 1 the odd (Cr) ones. The other component is
++    /// NO_WRITE, so the copy for the second plane leaves the first one in place
++    /// (SET_REMAP_COMPONENTS, cl90b5.h; with remapping on, X dimensions count elements, pitches
++    /// stay in bytes; a source element is one sample, a destination element one CbCr pair).
++    #[allow(clippy::too_many_arguments)]
++    fn chroma_component(
++        words: &mut Vec<u32>,
++        layout: Layout,
++        plane: &Plane,
++        source: u64,
++        size: u64,
++        destination: u64,
++        dst_pitch: u32,
++        width: u32,
++        rows: u32,
++        bps: u32,
++        component: u32,
++    ) -> VResult<()> {
++        Self::check_plane(layout, plane, width * bps, rows, size)?;
++        if dst_pitch < 2 * width * bps || dst_pitch % 64 != 0 {
++            return Err(VideoError::Invalid(format!("interleaved chroma pitch {dst_pitch}")));
++        }
++        let mut launch = 2 | 1 << 2 | 1 << 9 | 1 << 10; // non-pipelined, flush, multi-line, remap
++        match layout {
++            Layout::Linear => launch |= 1 << 7, // source pitch
++            Layout::BlockLinear { log2_height } => {
++                method(words, 4, 0x728, &[log2_height << 4 | 1 << 12]); // SET_SRC_BLOCK_SIZE
++                let src_rows = rows.next_multiple_of(8 << log2_height);
++                method(words, 4, 0x72c, &[plane.pitch / bps, src_rows, 1, 0]);
++                method(words, 4, 0x744, &[0, 0]); // SRC_ORIGIN_X/Y
++            }
++        }
++        // DST_X/DST_Y: SRC_X (0) into this component, NO_WRITE (6) into the other; DST_Z/W
++        // NO_WRITE; COMPONENT_SIZE bps; NUM_SRC_COMPONENTS ONE; NUM_DST_COMPONENTS TWO.
++        let (x, y) = if component == 0 { (0, 6) } else { (6, 0) };
++        method(words, 4, 0x708, &[x | y << 4 | 6 << 8 | 6 << 12 | (bps - 1) << 16 | 1 << 24]);
++        method(words, 4, 0x70c, &[1 << 4 | 1 << 12]); // SET_DST_BLOCK_SIZE: two GOBs high
++        method(words, 4, 0x710, &[dst_pitch / (2 * bps), rows.next_multiple_of(16), 1, 0]);
++        method(words, 4, 0x74c, &[0, 0]); // DST_ORIGIN_X/Y
++        let [ih, il] = hi_lo(source);
++        let [oh, ol] = hi_lo(destination);
++        method(words, 4, 0x400, &[ih, il, oh, ol]);
++        method(words, 4, 0x410, &[plane.pitch, dst_pitch, width, rows]);
++        method(words, 4, 0x300, &[launch]);
++        Ok(())
++    }
++
++    /// Submits `words` on the copy engine and returns after it finished.
++    fn run(&mut self, rm: &super::super::venc::NvVencDevice, words: &[u32]) -> VResult<()> {
++        let ci = match self.engine.commands.iter().position(|(_, token)| {
++            *token == 0 || self.engine.queue.shared().retired(*token).unwrap_or(false)
++        }) {
++            Some(i) => i,
++            None => {
++                self.engine.commands.push((vram(&rm.device, &rm.space, 4096)?, 0));
++                self.engine.commands.len() - 1
++            }
++        };
++        let cmd = &mut self.engine.commands[ci].0;
++        for (i, word) in words.iter().enumerate() {
++            cmd.cpu.write_u32(i * 4, *word)?;
++        }
++        crate::platform::device_full_barrier();
++        let push = Push {
++            address: cmd.gpu.address(),
++            size: (words.len() * 4) as u32,
++            flags: 0,
++        };
++        let token = match self
++            .engine
++            .queue
++            .submit(&[push], &rm.space, &[], &[], &[], |_| Ok(()))?
++        {
++            SubmitStatus::Submitted(t) => t,
++            SubmitStatus::Full(_) => return Err(VideoError::Again("copy queue full".into())),
++        };
++        self.engine.commands[ci].1 = token;
++        if !self.engine.queue.shared().retired(token)? {
++            let fence = self
++                .engine
++                .queue
++                .context_fence(rm.drm.as_raw_fd(), token)?;
++            wait_sync_file(fence.as_raw_fd(), Duration::from_secs(5))
++                .map_err(VideoError::DeviceLost)?;
++        }
++        Ok(())
++    }
++
+     /// Copies the visible region of `source` into `dst` and returns after the copy engine finished.
+-    /// 4:2:0 sources (two planes, `bytes_per_sample` 1 or 2) go to a tiled slot; a one-plane BGRA
+-    /// source (`bytes_per_sample` 4) goes to a pitch-linear staging buffer.
++    /// YUV sources (`bytes_per_sample` 1 or 2) go to a tiled slot: 4:2:0 as two rectangle
++    /// copies, 4:4:4 as the luma copy plus one remapped copy per chroma component. A one-plane
++    /// BGRA source (`bytes_per_sample` 4) goes to a pitch-linear staging buffer.
+     pub fn copy(
+         &mut self,
+         rm: &super::super::venc::NvVencDevice,
+@@ -202,12 +305,47 @@ impl Ingest {
+         dst: &Destination,
+     ) -> VResult<()> {
+         let bps = source.bytes_per_sample;
+-        let planes = if matches!(dst, Destination::Linear { .. }) { 1 } else { 2 };
++        let planes = match dst {
++            Destination::Linear { .. } => 1,
++            Destination::Tiled { .. } if source.chroma444 => 3,
++            Destination::Tiled { .. } => 2,
++        };
+         let index = self.import(rm, key, source, planes)?;
+         let imports = &self.imports[&key];
+-        let mut words = Vec::with_capacity(64);
++        let mut words = Vec::with_capacity(96);
+         method(&mut words, 4, 0, &[self.engine.copy_class]); // SET_OBJECT
+         match *dst {
++            Destination::Tiled { luma, chroma, pitch, width, height } if source.chroma444 => {
++                let plane = &source.planes[0];
++                let import = &imports[index[0]];
++                Self::rectangle(
++                    &mut words,
++                    source.layout,
++                    plane,
++                    import.gpu.address() + plane.offset,
++                    Target::Tiled(luma, pitch),
++                    width * bps,
++                    height,
++                    import.memory.size as u64,
++                )?;
++                for p in 1..3usize {
++                    let plane = &source.planes[p];
++                    let import = &imports[index[p]];
++                    Self::chroma_component(
++                        &mut words,
++                        source.layout,
++                        plane,
++                        import.gpu.address() + plane.offset,
++                        import.memory.size as u64,
++                        chroma,
++                        2 * pitch,
++                        width,
++                        height,
++                        bps,
++                        p as u32 - 1,
++                    )?;
++                }
++            }
+             Destination::Tiled { luma, chroma, pitch, width, height } => {
+                 for p in 0..2usize {
+                     let (rows, line) = if p == 0 {
+@@ -244,43 +382,7 @@ impl Ingest {
+                 )?;
+             }
+         }
+-        let ci = match self.engine.commands.iter().position(|(_, token)| {
+-            *token == 0 || self.engine.queue.shared().retired(*token).unwrap_or(false)
+-        }) {
+-            Some(i) => i,
+-            None => {
+-                self.engine.commands.push((vram(&rm.device, &rm.space, 4096)?, 0));
+-                self.engine.commands.len() - 1
+-            }
+-        };
+-        let cmd = &mut self.engine.commands[ci].0;
+-        for (i, word) in words.iter().enumerate() {
+-            cmd.cpu.write_u32(i * 4, *word)?;
+-        }
+-        crate::platform::device_full_barrier();
+-        let push = Push {
+-            address: cmd.gpu.address(),
+-            size: (words.len() * 4) as u32,
+-            flags: 0,
+-        };
+-        let token = match self
+-            .engine
+-            .queue
+-            .submit(&[push], &rm.space, &[], &[], &[], |_| Ok(()))?
+-        {
+-            SubmitStatus::Submitted(t) => t,
+-            SubmitStatus::Full(_) => return Err(VideoError::Again("copy queue full".into())),
+-        };
+-        self.engine.commands[ci].1 = token;
+-        if !self.engine.queue.shared().retired(token)? {
+-            let fence = self
+-                .engine
+-                .queue
+-                .context_fence(rm.drm.as_raw_fd(), token)?;
+-            wait_sync_file(fence.as_raw_fd(), Duration::from_secs(5))
+-                .map_err(VideoError::DeviceLost)?;
+-        }
+-        Ok(())
++        self.run(rm, &words)
+     }
+ }
+ 
+@@ -308,4 +410,169 @@ mod tests {
+         assert_eq!(layout_from_modifier(0x0100_0000_0000_0001), None); // other vendor
+         assert_eq!(layout_from_modifier(0x00ff_ffff_ffff_ffff), None); // invalid
+     }
++
++    /// Byte offset of (`x` bytes, `y` rows) in NVIDIA block linear: GOBs of 64 bytes x 8 rows,
++    /// blocks one GOB wide and `8 << log2_height` rows high, `pitch` bytes per row (the GOB
++    /// swizzle of `layout::in_offset`).
++    fn bl_offset(x: usize, y: usize, pitch: usize, log2_height: u32) -> usize {
++        let bh = 8usize << log2_height;
++        let inside = x % 16 + (y % 4) * 16 + ((x / 16) % 2) * 64 + ((y / 4) % 2) * 128
++            + ((x / 32) % 2) * 256;
++        (y / bh) * pitch * bh + (x / 64) * 64 * bh + ((y % bh) / 8) * 512 + inside
++    }
++
++    fn put(buf: &mut crate::video::session::VramBuffer, bytes: &[u8]) {
++        for (i, c) in bytes.chunks(4).enumerate() {
++            let mut w = [0u8; 4];
++            w[..c.len()].copy_from_slice(c);
++            buf.cpu.write_u32(i * 4, u32::from_le_bytes(w)).unwrap();
++        }
++    }
++
++    fn get(buf: &crate::video::session::VramBuffer, len: usize) -> Vec<u8> {
++        let mut out = Vec::with_capacity(len + 4);
++        for i in 0..len.div_ceil(4) {
++            out.extend_from_slice(&buf.cpu.read_u32(i * 4).unwrap().to_le_bytes());
++        }
++        out.truncate(len);
++        out
++    }
++
++    fn first_mismatch(got: &[u8], want: &[u8]) -> Option<(usize, usize, u8, u8)> {
++        let n = got.iter().zip(want).filter(|(a, b)| a != b).count();
++        let i = got.iter().zip(want).position(|(a, b)| a != b)?;
++        Some((n, i, got[i], want[i]))
++    }
++
++    /// Stage-1a experiment: two remapped copy-engine passes (Cb into component X, Cr into
++    /// component Y, the other component NO_WRITE) assemble the interleaved 4:4:4 CbCr plane of a
++    /// tiled NVENC input slot from two planar chroma planes. Checks after each pass that written
++    /// bytes equal the source and every other byte keeps its non-zero prefill, for 1- and 2-byte
++    /// samples, linear and block-linear sources, sizes crossing GOB and row boundaries, padded
++    /// pitches, and both passes in one submission.
++    #[test]
++    #[ignore = "local NVIDIA GPU: copy-engine NO_WRITE remap into a tiled NVENC input plane"]
++    fn chroma_444_interleave() {
++        use crate::video::{enc::layout::in_offset, session::vram, venc::NvVencDevice};
++        let rm = NvVencDevice::open_on(None).unwrap();
++        let mut ingest = Ingest::new(&rm).unwrap();
++        let up = |v: usize, a: usize| v.div_ceil(a) * a;
++        let mut cases = 0;
++        for bps in [1usize, 2] {
++            for (w, h) in [(64usize, 16usize), (70, 37), (200, 130), (1920, 1080)] {
++                for layout in [
++                    Layout::Linear,
++                    Layout::BlockLinear { log2_height: 1 },
++                    Layout::BlockLinear { log2_height: 4 },
++                ] {
++                    for extra in [0usize, 64] {
++                        let (pitch, rows) = match layout {
++                            Layout::Linear => (up(w * bps, 64) + 64 + extra, h),
++                            Layout::BlockLinear { log2_height } => {
++                                (up(w * bps, 64) + extra, up(h, 8 << log2_height))
++                            }
++                        };
++                        let plane_bytes = up(pitch * rows, 4096);
++                        let mut src = vram(&rm.device, &rm.space, 2 * plane_bytes).unwrap();
++                        let sample = |p: usize, x: usize, y: usize, k: usize| -> u8 {
++                            if p == 0 {
++                                (x * 7 + y * 13 + k * 101 + 1) as u8
++                            } else {
++                                (x * 11 + y * 3 + k * 57 + 129) as u8
++                            }
++                        };
++                        let mut image = vec![0u8; 2 * plane_bytes];
++                        for p in 0..2 {
++                            for y in 0..h {
++                                for x in 0..w {
++                                    for k in 0..bps {
++                                        let o = match layout {
++                                            Layout::Linear => y * pitch + x * bps + k,
++                                            Layout::BlockLinear { log2_height } => {
++                                                bl_offset(x * bps + k, y, pitch, log2_height)
++                                            }
++                                        };
++                                        image[p * plane_bytes + o] = sample(p, x, y, k);
++                                    }
++                                }
++                            }
++                        }
++                        put(&mut src, &image);
++                        let dpitch = up(2 * w * bps, 64) + extra;
++                        let dsize = dpitch * up(h, 16);
++                        let mut dst = vram(&rm.device, &rm.space, dsize).unwrap();
++                        let prefill: Vec<u8> = (0..dsize).map(|i| (i * 31 + 0x5a) as u8 | 1).collect();
++                        let (src_va, dst_va) = (src.gpu.address(), dst.gpu.address());
++                        let plane = |p: usize| Plane {
++                            fd: -1,
++                            offset: (p * plane_bytes) as u64,
++                            pitch: pitch as u32,
++                        };
++                        let pass = |words: &mut Vec<u32>, p: usize| {
++                            Ingest::chroma_component(
++                                words,
++                                layout,
++                                &plane(p),
++                                src_va + (p * plane_bytes) as u64,
++                                (2 * plane_bytes) as u64,
++                                dst_va,
++                                dpitch as u32,
++                                w as u32,
++                                h as u32,
++                                bps as u32,
++                                p as u32,
++                            )
++                            .unwrap();
++                        };
++                        let mut want = prefill.clone();
++                        let expect = |want: &mut Vec<u8>, p: usize| {
++                            for y in 0..h {
++                                for x in 0..w {
++                                    for k in 0..bps {
++                                        want[in_offset((2 * x + p) * bps + k, y, dpitch)] = sample(p, x, y, k);
++                                    }
++                                }
++                            }
++                        };
++                        let tag = format!("bps {bps} {w}x{h} {layout:?} pitch {pitch} dpitch {dpitch}");
++                        // Separate submissions, checked after each pass.
++                        put(&mut dst, &prefill);
++                        for p in 0..2 {
++                            let mut words = Vec::new();
++                            method(&mut words, 4, 0, &[ingest.engine.copy_class]);
++                            pass(&mut words, p);
++                            ingest.run(&rm, &words).unwrap();
++                            expect(&mut want, p);
++                            let got = get(&dst, dsize);
++                            assert_eq!(first_mismatch(&got, &want), None, "{tag}: after pass {p}");
++                        }
++                        // Both passes in one push buffer.
++                        put(&mut dst, &prefill);
++                        let mut words = Vec::new();
++                        method(&mut words, 4, 0, &[ingest.engine.copy_class]);
++                        pass(&mut words, 0);
++                        pass(&mut words, 1);
++                        ingest.run(&rm, &words).unwrap();
++                        let got = get(&dst, dsize);
++                        assert_eq!(first_mismatch(&got, &want), None, "{tag}: one submission");
++                        // The same plane from the CPU tiler the 4:4:4 CPU loaders use
++                        // (`Encoder::load_x444`: interleaved CbCr, 2 * pitch).
++                        let mut interleaved = vec![0u8; 2 * w * bps * h];
++                        for y in 0..h {
++                            for x in 0..w {
++                                for (p, k) in (0..2).flat_map(|p| (0..bps).map(move |k| (p, k))) {
++                                    interleaved[y * 2 * w * bps + (2 * x + p) * bps + k] = sample(p, x, y, k);
++                                }
++                            }
++                        }
++                        let mut cpu = prefill.clone();
++                        crate::video::enc::layout::in_tile_plane(&mut cpu, &interleaved, 2 * w * bps, 2 * w * bps, h, dpitch);
++                        assert_eq!(first_mismatch(&got, &cpu), None, "{tag}: CPU tiler");
++                        cases += 1;
++                    }
++                }
++            }
++        }
++        eprintln!("{cases} cases byte-exact");
++    }
+ }
+-- 
+2.56.0
+

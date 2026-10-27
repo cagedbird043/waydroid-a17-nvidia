@@ -1,0 +1,943 @@
+From bed6a8b1caab67be7b073be84d40215d6f9306df Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Tue, 27 Oct 2026 12:39:23 +0800
+Subject: [PATCH 34/37] =?utf-8?q?=E7=BC=96=E7=A0=81=EF=BC=9ABGRA=20?=
+ =?utf-8?q?=E8=BE=93=E5=85=A5=E7=9A=84=E8=89=B2=E5=BD=A9=E8=BD=AC=E6=8D=A2?=
+ =?utf-8?q?=E6=94=B9=E5=9C=A8=20GPU=20=E4=B8=8A=E5=81=9A?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+- 新内核 shaders/bgra_nv12.comp：BT.709 video range，与 layout.rs 的 CPU 定点转换同系数、同取整、同奇数边处理
+- Ingest::bgra_to_nv12：copy engine 拷进显存线性 scratch → compute 转线性 NV12 → copy engine 写进 NVENC 输入槽
+- Encoder::load_dmabuf_bgra 在已实测的 GPU 上走 GPU 路径，否则保留系统内存 staging + CPU 转换；两条路径都重置 AQ 有效位
+- 实机测试 bgra_to_nv12_matches_cpu：180 组与 CPU 转换逐字节一致
+---
+ .../native/shaders/bgra_nv12.comp             |  57 ++++++
+ .../native/shaders/bgra_nv12.spv              | Bin 0 -> 7504 bytes
+ .../native/shaders/sm120/bgra_nv12.bin        | Bin 0 -> 4656 bytes
+ .../native/shaders/sm75/bgra_nv12.bin         | Bin 0 -> 4480 bytes
+ .../native/shaders/sm80/bgra_nv12.bin         | Bin 0 -> 4480 bytes
+ .../native/shaders/sm86/bgra_nv12.bin         | Bin 0 -> 4480 bytes
+ .../native/shaders/sm89/bgra_nv12.bin         | Bin 0 -> 4480 bytes
+ .../native/shaders/sm90/bgra_nv12.bin         | Bin 0 -> 4480 bytes
+ .../driver-source/native/src/video/compute.rs |   3 +-
+ .../native/src/video/enc/encoder.rs           |  31 ++-
+ .../native/src/video/enc/ingest.rs            | 177 +++++++++++++++++-
+ .../driver-source/native/src/video/kernels.rs | 102 ++++++++++
+ .../driver-source/native/tools/gen-kernels.py |   6 +-
+ 13 files changed, 361 insertions(+), 15 deletions(-)
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/bgra_nv12.comp
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/bgra_nv12.spv
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm120/bgra_nv12.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm75/bgra_nv12.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm80/bgra_nv12.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm86/bgra_nv12.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm89/bgra_nv12.bin
+ create mode 100644 nvidia-prolapse/driver-source/native/shaders/sm90/bgra_nv12.bin
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/bgra_nv12.comp b/nvidia-prolapse/driver-source/native/shaders/bgra_nv12.comp
+new file mode 100644
+index 0000000..fdba9bf
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/shaders/bgra_nv12.comp
+@@ -0,0 +1,57 @@
++// BGRA (bytes B, G, R, A/X) -> pitch-linear NV12, BT.709 video range, bit-exact with the CPU
++// conversion it replaces (src/video/enc/layout.rs bgra_rows): the same fixed-point coefficients,
++// rounding and arithmetic right shifts, chroma from the 2x2 sum, the last column and row repeated
++// for odd sizes. One invocation: 4 columns x 2 rows of luma and the 2 CbCr pairs below them.
++// Columns past the width land in the row padding of the outputs (pitches are 64-byte multiples).
++#version 450
++layout(local_size_x = 16, local_size_y = 8) in;
++layout(set = 0, binding = 0, std430) readonly buffer Src { uint px[]; };
++layout(set = 0, binding = 1, std430) writeonly buffer Luma { uint luma[]; };
++layout(set = 0, binding = 2, std430) writeonly buffer Chroma { uint chroma[]; };
++layout(push_constant) uniform Push {
++    uint width;
++    uint height;
++    uint src_pitch;    // bytes
++    uint luma_pitch;   // bytes
++    uint chroma_pitch; // bytes
++} p;
++
++ivec3 rgb(uint x, uint y)
++{
++    uint v = px[(y * p.src_pitch) / 4u + x];
++    return ivec3(int((v >> 16) & 255u), int((v >> 8) & 255u), int(v & 255u));
++}
++
++uint y_of(ivec3 c)
++{
++    return uint(16 + ((47 * c.r + 157 * c.g + 16 * c.b + 128) >> 8)) & 255u;
++}
++
++void main()
++{
++    uint x0 = gl_GlobalInvocationID.x * 4u;
++    uint y0 = gl_GlobalInvocationID.y * 2u;
++    if (x0 >= p.width || y0 >= p.height)
++        return;
++    uint last = p.width - 1u;
++    uint y1 = min(y0 + 1u, p.height - 1u);
++    uint l0 = 0u, l1 = 0u;
++    for (uint i = 0u; i < 4u; i++) {
++        uint x = min(x0 + i, last);
++        l0 |= y_of(rgb(x, y0)) << (8u * i);
++        l1 |= y_of(rgb(x, y1)) << (8u * i);
++    }
++    luma[(y0 * p.luma_pitch) / 4u + x0 / 4u] = l0;
++    if (y0 + 1u < p.height)
++        luma[((y0 + 1u) * p.luma_pitch) / 4u + x0 / 4u] = l1;
++    uint uv = 0u;
++    for (uint j = 0u; j < 2u; j++) {
++        uint xa = min(x0 + 2u * j, last);
++        uint xb = min(x0 + 2u * j + 1u, last);
++        ivec3 s = rgb(xa, y0) + rgb(xb, y0) + rgb(xa, y1) + rgb(xb, y1);
++        uint u = uint(128 + ((-26 * s.r - 87 * s.g + 112 * s.b + 512) >> 10)) & 255u;
++        uint v = uint(128 + ((112 * s.r - 102 * s.g - 10 * s.b + 512) >> 10)) & 255u;
++        uv |= (u | v << 8u) << (16u * j);
++    }
++    chroma[((y0 / 2u) * p.chroma_pitch) / 4u + x0 / 4u] = uv;
++}
+diff --git a/nvidia-prolapse/driver-source/native/shaders/bgra_nv12.spv b/nvidia-prolapse/driver-source/native/shaders/bgra_nv12.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..1315141ffeef4a7104401957dd649d05c6662d8e
+GIT binary patch
+literal 7504
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm120/bgra_nv12.bin b/nvidia-prolapse/driver-source/native/shaders/sm120/bgra_nv12.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b92a53867e1f1e91a138f7dad1ec10fe09a91cf
+GIT binary patch
+literal 4656
+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
+VZ$Qa~;Xkze_JxmcfW|xI833=vmk$5{
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm75/bgra_nv12.bin b/nvidia-prolapse/driver-source/native/shaders/sm75/bgra_nv12.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..081de2b0beeb38696bf917b02efc137b749157c9
+GIT binary patch
+literal 4480
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm80/bgra_nv12.bin b/nvidia-prolapse/driver-source/native/shaders/sm80/bgra_nv12.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..84fa4fc6ed57f45492b260219c32ecb544d600e0
+GIT binary patch
+literal 4480
+zcmX?H$p8VW3=9lRd<=&x86kW%1_lNvJ_bpcydnbwLlcM(l~-b5U^v9bz*NHwQP0o7
+z!Ei#JL9mDcEbw1}kAdNYKZ9fiGXoO?1H*qF1_p*>{0vMrOblQXK<W?aGw@V_)H5;^
+z2z+2>IK$5%Sj5N#lK(FO(%;V@S;52z=7aPf;%5jg{tvN_L4bkb5I=)!B?ChMSfqg&
+z#CPvxU{FBf^Heb~F)%VR6eN6LX1K!7;9ki9(#gQU08uYf0anaV^78{T!!>>eN0@&>
+z@{jl#B;b6IfB6}FIU(v{`kAV@7(nJT@G~$l9N}kRs$yYa0QnHaKg7=<P{9dyKjVY{
+z>>&3ERB&<q2LTZO2uPlV1;qUi;veE?P^n^NVqjuq_|L!x_MdnW7bh3k$_8do_=y)W
+zGlOh^*)Lha`X3a&ta6NC^(s|dTyXs-_!$I>*jPak0yAH-f(xvk3#9%SKZ9fi8yiSJ
+zIDSCxEn?<^t3SriAW+4|2D1MDgO6bMOI9#5!_|Z3+5dyQ`~OKj*nWX39*}khuzHaF
+zRlErK6Z{N~l^ksLAOl~@@qp4>V<j^WobSZPz*ND{&;XK$hM!mkH?xBa0|PkL59u?A
+zRq!!8!uk9RVinBHPB8uneg>5aKEAo2^ac$-l?rBNeFg>wekfnEf}0x@eqjHC+*icR
+z%*VjMzzq$5!3u7WcNqQ)fYKj7gLn}{Jvh9<>iJl?LFR+hp8$m)A0IqCz~RTu1(yeh
+z4<E>QNO&9qspsZ~s|U;TBf<xyze)(C9ikp&UzIRI9vprGe8}O|SjjB}=Qn}EPZTZu
+z1i2C6=g%NkA;OIse%#!s;U^-38h+f|pzsrgho7JzYWQ(;i!d-S2!g`n5I=)pg$N|S
+z!^2NR1f(7jexj@(_2Bdf4nI**czA&PUnIf>mj{QBm?$VYfYTE={6s|H>cR5ji0}dF
+zuaW?1M+!elggiL>M8%N9tFcl<0?r4OXBC2I;U^^m51&*03@R0ZQlRh<gocM$g_H;)
+zd_n0^L<Anbr$FfuH9RFNq@+OMfk=OXf*=P=fx-`*AG!Z?fYPH3BtJ`52!i>7ApQ|h
+z`e6q1nL&Jze=E4T1z_nB%oh}d^TFi{Gc%lj2;@F)r1Svd3kt&Be+0y5M#^s>`?$G5
+z?g6_O9R5)ALFMrYeg>f;W@bT<d;j%;%Ll;<K~RB?lz&*j=>-x0TwGxPgZvAQe=aU~
+ze1hCx#KH=f2gk1zxcEcFKMM<7Jy>2E5x*e)RV*OwNb%2#kUs?~f4EqX<GZm^Pzugx
+z;%8v0;6{so5kW-!^E0YcaEpNApBo<kB8cz<hp(U@YWxcdBIhT`3P^qchbJh17jbig
+z!cPPq9!T+j0+gS)LFIwK{{xWn2o&BRf&YIX;f?8DK@Nm_<r!2exCK$&E64$lZ?Jng
+zI8fco!GY>t^!&~NP7kpBj>Ucfg#G&1>=!__UqArWegOge_CwM;!hQj?_!1O_+kXOF
+z-igA^2i30?0^slvfXAPpDBL~Au;o{D{|g9!@+;VWtoc;{oIeFX`4gO9Ilz1l5FeC2
+zG4iW`06c$!^D74joDYs4^!zG-2tROs<v@u~Q2mCQU!ms1^DD%BZfJfLtKjB>`~Ofs
+zgII+C7jk%sRd8{^!}Aa*e;}2Qpzx|<Vq#!Mv{zIrP~%Uff{P23{$S-L$bFy;3Qqsv
+z@M8kEN0>nE5m5LPadCnC537%bDi|34|Nn3Q|3Du*sQm+KzkvM51q;t2CQxy}0IpAt
+zf$|F%sJwvW7jSvS1XcjEPpF841Ec_!e*~(ym>5_Xkje}0{|u}Q4B+<6DSn2wN(L^F
+zefBQ}co+^bg4(N`p!OcPy?PCMdvpS*!UDA)5AidA+M@+<zC43U6%!{syiS42S0w*~
+z%LA};A^riEk4WwZ$yafpxt9~&y&Rwh7}&i>7zws#8!MR*?XeanhQ>-Zr1pg#sC~tR
+zi2ry7u?luJIRAt`gFq28GdryQIRYwQ*%9qICO(G7N=`)k#EFkVtb&6buK$ocgIEO@
+zC!7y84;0>9pz;u${<)Y?(<3(<oDT|*A}&OG3#^`-9WD>%^KioXNa}gu<})!N(m$yF
+zV`GE!kATVp4(4Z|20FC7P^sYN3J3WY$`>eNVgfag!RZfd9~(PdKbX(X3Fm|As|pSd
+zPy>nk1++f^)z1!c54gR+#so?)98mL_DmWNG>cRaBP=2dm=SoAeU!{VH37npx>Ot*Y
+zxc*b1_CFISej1oS_JQMv8PWa$#}5mlJ_N@PJEA=ejvrPQ)c9d#X9d|0axd6Cc0~IL
+zY#t|~J_VacD85-)(c&Aeeb3E;E&dSUO=^6jwr|8LSXkik1Bq`|{P7Lxe<AE=Au+xo
+z`VsNX!VHfuaQR9ozL}X(<C~Qgt{)uV%&hF7#ug~P!Q}_@e~@}udr_!@k@5fk|MiIS
+zlm#r$0xM4|n3+NSFPQ&Ssu&p=SP<pAWCa^oJsVWLWCatL&jjTQRIsoh>j(AE;Nc4{
+zj~T(`JtM5VuV7+ARgV-OVD-$*p!5MQzrpnbxO)aEA3^*IHa1lKsQFo_h?xac9>U6d
+z$qGnzf|(~)ft26D_AxOb+Xw3Jg6bofdVwki1_lmjeQ^xb{$*kVna>2RPX($N|1)r+
+U)F0sN3oDO(;o}LQ@dtSZ0P8|$U;qFB
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm86/bgra_nv12.bin b/nvidia-prolapse/driver-source/native/shaders/sm86/bgra_nv12.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..caf54355add997eb779a309fa0514a2eddeabb51
+GIT binary patch
+literal 4480
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm89/bgra_nv12.bin b/nvidia-prolapse/driver-source/native/shaders/sm89/bgra_nv12.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..caf54355add997eb779a309fa0514a2eddeabb51
+GIT binary patch
+literal 4480
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/shaders/sm90/bgra_nv12.bin b/nvidia-prolapse/driver-source/native/shaders/sm90/bgra_nv12.bin
+new file mode 100644
+index 0000000000000000000000000000000000000000..2302dd9dba51e7816a94fb97d98035f07191fc27
+GIT binary patch
+literal 4480
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/compute.rs b/nvidia-prolapse/driver-source/native/src/video/compute.rs
+index 7468fe2..941f96b 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/compute.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/compute.rs
+@@ -225,6 +225,7 @@ impl ComputeEngine {
+         Ok(address)
+     }
+ 
++    #[cfg(test)]
+     /// Forgets every program so the next ones are written from the start of the code heap again
+     /// (same addresses, new code). Waits for every launch first.
+     pub(crate) fn reset_code(&mut self, drm: i32) -> VResult<()> {
+@@ -369,7 +370,7 @@ mod tests {
+     use crate::video::kernels::{ABI, KERNELS, QMD_SAMPLES, TEST_KERNELS};
+ 
+     fn test_kernel(name: &str, sm: u32) -> &'static Kernel {
+-        TEST_KERNELS.iter().find(|k| k.name == name && k.sm == sm).unwrap()
++        KERNELS.iter().chain(TEST_KERNELS).find(|k| k.name == name && k.sm == sm).unwrap()
+     }
+ 
+     /// The runtime packing reproduces Mesa's nak_fill_qmd for every shader model and QMD
+diff --git a/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs b/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
+index e690836..53774e4 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
+@@ -805,15 +805,30 @@ impl Encoder {
+         let ingest = self.ingest.as_mut().unwrap();
+         ingest.copy(&self.rm, key, src, &dst)
+     }
+-    /// Like [`Encoder::load_dmabuf`] for a one-plane BGRA dma-buf (`bytes_per_sample` 4): the
+-    /// copy engine brings the visible region into a pitch-linear staging buffer and the CPU converts
+-    /// it with [`Encoder::load_bgra`]. This GPU has no compute path here, so colour conversion
+-    /// is the one step that still touches pixels on the CPU.
++    /// Like [`Encoder::load_dmabuf`] for a one-plane BGRA dma-buf (`bytes_per_sample` 4). With
++    /// validated compute kernels the GPU converts it into the slot (see
++    /// [`ingest::Ingest::bgra_to_nv12`]); otherwise the copy engine brings the visible region into
++    /// a pitch-linear staging buffer and the CPU converts it with [`Encoder::load_bgra`]. Both
++    /// produce the same bytes.
+     pub fn load_dmabuf_bgra(&mut self, key: u64, src: &ingest::Source) -> VResult<()> {
+-        self.input_slot()?;
++        let ds = self.input_slot()?;
+         if src.bytes_per_sample != 4 || self.bps != 1 || self.cfg.chroma444 {
+             return Err(invalid("BGRA dma-buf needs an 8-bit 4:2:0 encoder"));
+         }
++        self.aq_valid[ds] = false;
++        if self.ingest.is_none() {
++            self.ingest = Some(ingest::Ingest::new(&self.rm)?);
++        }
++        let tiled = ingest::Destination::Tiled {
++            luma: self.input[ds].gpu,
++            chroma: self.input[ds].gpu + self.luma_sz as u64,
++            pitch: (self.pitch * self.bps) as u32,
++            width: self.cfg.width as u32,
++            height: self.cfg.height as u32,
++        };
++        if self.ingest.as_mut().unwrap().bgra_to_nv12(&self.rm, key, src, &tiled)? {
++            return Ok(());
++        }
+         let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+         let pitch = up(w * 4, 64);
+         if self.stage.size < pitch * h {
+@@ -825,11 +840,7 @@ impl Encoder {
+             width: w as u32,
+             height: h as u32,
+         };
+-        if self.ingest.is_none() {
+-            self.ingest = Some(ingest::Ingest::new(&self.rm)?);
+-        }
+-        let ingest = self.ingest.as_mut().unwrap();
+-        ingest.copy(&self.rm, key, src, &dst)?;
++        self.ingest.as_mut().unwrap().copy(&self.rm, key, src, &dst)?;
+         let stage = std::mem::take(&mut self.stage);
+         let result = self.load_bgra(&stage.bytes()[..pitch * h], pitch);
+         self.stage = stage;
+diff --git a/nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs b/nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs
+index f4dc43c..24952d1 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/enc/ingest.rs
+@@ -9,7 +9,8 @@
+ //! encoder's own address space once per key and stay mapped until [`Ingest::forget`].
+ use super::super::{
+     channel::wait_sync_file,
+-    session::{vram, CopyEngine},
++    compute::ComputeEngine,
++    session::{vram, CopyEngine, VramBuffer},
+     VResult, VideoError,
+ };
+ use crate::{
+@@ -75,6 +76,10 @@ struct Import {
+ pub(crate) struct Ingest {
+     engine: CopyEngine,
+     imports: HashMap<u64, Vec<Import>>,
++    /// BGRA conversion: the compute engine (`None` inside: this GPU has no validated kernels)
++    /// and the VRAM scratch for the linear BGRA copy and the linear NV12 result.
++    compute: Option<Option<ComputeEngine>>,
++    scratch: Option<(VramBuffer, usize)>,
+ }
+ 
+ /// Destination of a copy: both planes of one NVENC input slot (block linear, two GOBs high; the
+@@ -95,9 +100,93 @@ impl Ingest {
+         Ok(Self {
+             engine: CopyEngine::new(&rm.device, &rm.space)?,
+             imports: HashMap::new(),
++            compute: None,
++            scratch: None,
+         })
+     }
+ 
++    /// Converts a one-plane BGRA `source` (bytes B, G, R, A/X) into the tiled NV12 slot `dst` on
++    /// the GPU: the copy engine brings the visible region into a linear VRAM scratch, the
++    /// `bgra_nv12` kernel converts it there (bit-exact with the CPU conversion), and the copy
++    /// engine tiles luma and CbCr into the slot. No pixel crosses the CPU. Returns `Ok(false)`,
++    /// having done nothing, when this GPU's compute kernels are not validated.
++    pub fn bgra_to_nv12(
++        &mut self,
++        rm: &super::super::venc::NvVencDevice,
++        key: u64,
++        source: &Source,
++        dst: &Destination,
++    ) -> VResult<bool> {
++        let &Destination::Tiled { luma, chroma, pitch, width, height } = dst else {
++            return Err(VideoError::Invalid("BGRA conversion needs a tiled NVENC slot".into()));
++        };
++        if self.compute.is_none() {
++            self.compute = Some(match ComputeEngine::supported(&rm.device)? {
++                Some(_) => Some(ComputeEngine::new(&rm.device, &rm.space)?),
++                None => None,
++            });
++        }
++        if self.compute.as_ref().is_some_and(|c| c.is_none()) {
++            return Ok(false);
++        }
++        let (w, h) = (width as usize, height as usize);
++        let even = (w + 1) & !1;
++        let src_pitch = (w * 4).next_multiple_of(64);
++        let luma_pitch = w.next_multiple_of(64);
++        let chroma_pitch = even.next_multiple_of(64);
++        let luma_at = (src_pitch * h).next_multiple_of(256);
++        let chroma_at = (luma_at + luma_pitch * h).next_multiple_of(256);
++        let bytes = chroma_at + chroma_pitch * h.div_ceil(2);
++        if self.scratch.as_ref().is_none_or(|s| s.1 < bytes) {
++            self.scratch = None;
++            let size = bytes.next_multiple_of(1 << 16);
++            self.scratch = Some((vram(&rm.device, &rm.space, size)?, size));
++        }
++        let base = self.scratch.as_ref().unwrap().0.gpu.address();
++        let linear = Destination::Linear { address: base, pitch: src_pitch as u32, width, height };
++        self.copy(rm, key, source, &linear)?;
++
++        let compute = self.compute.as_mut().unwrap().as_mut().unwrap();
++        let kernel = compute.kernel("bgra_nv12")?;
++        let push: Vec<u8> = [width, height, src_pitch as u32, luma_pitch as u32, chroma_pitch as u32]
++            .iter()
++            .flat_map(|v| v.to_le_bytes())
++            .collect();
++        let bindings = [
++            (0, base, (src_pitch * h) as u32),
++            (1, base + luma_at as u64, (luma_pitch * h) as u32),
++            (2, base + chroma_at as u64, (chroma_pitch * h.div_ceil(2)) as u32),
++        ];
++        let groups = [
++            (w.div_ceil(4) as u32).div_ceil(kernel.workgroup[0]),
++            (h.div_ceil(2) as u32).div_ceil(kernel.workgroup[1]),
++            1,
++        ];
++        let token = compute.launch(&rm.space, kernel, &bindings, &push, groups)?;
++        compute.wait(rm.drm.as_raw_fd(), token)?;
++
++        let mut words = Vec::with_capacity(48);
++        method(&mut words, 4, 0, &[self.engine.copy_class]); // SET_OBJECT
++        for (at, line_pitch, line, rows, slot) in [
++            (luma_at, luma_pitch, w, h, luma),
++            (chroma_at, chroma_pitch, even, h.div_ceil(2), chroma),
++        ] {
++            let plane = Plane { fd: -1, offset: at as u64, pitch: line_pitch as u32 };
++            Self::rectangle(
++                &mut words,
++                Layout::Linear,
++                &plane,
++                base + at as u64,
++                Target::Tiled(slot, pitch),
++                line as u32,
++                rows as u32,
++                bytes as u64,
++            )?;
++        }
++        self.run(rm, &words)?;
++        Ok(true)
++    }
++
+     pub fn forget(&mut self, key: u64) {
+         self.imports.remove(&key);
+     }
+@@ -575,4 +664,90 @@ mod tests {
+         }
+         eprintln!("{cases} cases byte-exact");
+     }
++
++    /// Stage-3 acceptance: the GPU BGRA conversion (`bgra_to_nv12`) writes the NVENC input slot
++    /// byte for byte as the CPU conversion of the encoder's fallback (`layout::in_tile_bgra`),
++    /// padding included. Patterns: per-channel extremes, solid colours, a chroma checkerboard and
++    /// a pseudo-random image whose X/A byte is garbage; sizes odd and even, crossing tile and
++    /// GOB boundaries; linear sources with padded pitches and block-linear ones.
++    #[test]
++    #[ignore = "local NVIDIA GPU: compute BGRA -> NV12 into a tiled NVENC input slot"]
++    fn bgra_to_nv12_matches_cpu() {
++        use crate::video::{enc::layout::in_tile_bgra, session::vram, venc::NvVencDevice};
++        let rm = NvVencDevice::open_on(None).unwrap();
++        let mut ingest = Ingest::new(&rm).unwrap();
++        let up = |v: usize, a: usize| v.div_ceil(a) * a;
++        let patterns: [(&str, fn(usize, usize, usize) -> [u8; 4]); 5] = [
++            ("extremes", |x, y, _| {
++                let v = |b: usize| if (x >> b ^ y) & 1 == 0 { 0 } else { 255 };
++                [v(0), v(1), v(2), 0x5a]
++            }),
++            ("white", |_, _, _| [255, 255, 255, 255]),
++            ("red", |_, _, _| [0, 0, 255, 0]),
++            ("chroma checker", |x, y, _| if (x ^ y) & 1 == 0 { [255, 0, 0, 0] } else { [0, 0, 255, 0] }),
++            ("noise", |x, y, s| {
++                let h = ((x * 0x9e37_79b1 ^ y * 0x85eb_ca77 ^ s * 0xc2b2_ae3d) as u32).wrapping_mul(0x27d4_eb2f);
++                h.to_le_bytes()
++            }),
++        ];
++        let mut cases = 0;
++        for (w, h) in [(1usize, 1usize), (3, 5), (64, 16), (70, 37), (642, 362), (1920, 1080)] {
++            for layout in [Layout::Linear, Layout::BlockLinear { log2_height: 1 }, Layout::BlockLinear { log2_height: 4 }] {
++                for extra in [0usize, 128] {
++                    let (src_pitch, src_rows) = match layout {
++                        Layout::Linear => (up(w * 4, 64) + extra, h),
++                        Layout::BlockLinear { log2_height } => (up(w * 4, 64) + extra, up(h, 8 << log2_height)),
++                    };
++                    let size = up(src_pitch * src_rows, 1 << 16);
++                    let memory = rm.device.allocate_vram(size).unwrap();
++                    let mut map = memory.map().unwrap();
++                    let fd = crate::external::export(&memory, rm.drm.as_fd()).unwrap();
++                    let pitch = up(w, 64);
++                    let luma_sz = pitch * up(h, 32);
++                    let slot_sz = luma_sz + pitch * up(h.div_ceil(2), 16);
++                    for (name, pattern) in &patterns {
++                        let mut image = vec![0u8; size];
++                        let mut linear = vec![0u8; w * 4 * h];
++                        for y in 0..h {
++                            for x in 0..w {
++                                let px = pattern(x, y, cases);
++                                linear[(y * w + x) * 4..][..4].copy_from_slice(&px);
++                                for (k, b) in px.iter().enumerate() {
++                                    let o = match layout {
++                                        Layout::Linear => y * src_pitch + x * 4 + k,
++                                        Layout::BlockLinear { log2_height } => bl_offset(x * 4 + k, y, src_pitch, log2_height),
++                                    };
++                                    image[o] = *b;
++                                }
++                            }
++                        }
++                        for (i, c) in image.chunks(4).enumerate() {
++                            map.write_u32(i * 4, u32::from_le_bytes(c.try_into().unwrap())).unwrap();
++                        }
++                        crate::platform::device_full_barrier();
++                        let plane = Plane { fd: fd.as_raw_fd(), offset: 0, pitch: src_pitch as u32 };
++                        let source = Source { planes: [plane; 3], layout, bytes_per_sample: 4, chroma444: false };
++                        let slot = vram(&rm.device, &rm.space, slot_sz).unwrap();
++                        let dst = Destination::Tiled {
++                            luma: slot.gpu.address(),
++                            chroma: slot.gpu.address() + luma_sz as u64,
++                            pitch: pitch as u32,
++                            width: w as u32,
++                            height: h as u32,
++                        };
++                        assert!(ingest.bgra_to_nv12(&rm, cases as u64 + 1, &source, &dst).unwrap(), "compute not available");
++                        ingest.forget(cases as u64 + 1);
++                        let got = get(&slot, slot_sz);
++                        let mut want = vec![0u8; slot_sz];
++                        let (l, c) = want.split_at_mut(luma_sz);
++                        in_tile_bgra(l, c, &linear, w * 4, w, h, pitch);
++                        let tag = format!("{name} {w}x{h} {layout:?} pitch {src_pitch}");
++                        assert_eq!(first_mismatch(&got, &want), None, "{tag}");
++                        cases += 1;
++                    }
++                }
++            }
++        }
++        eprintln!("{cases} BGRA cases byte-exact with the CPU conversion");
++    }
+ }
+diff --git a/nvidia-prolapse/driver-source/native/src/video/kernels.rs b/nvidia-prolapse/driver-source/native/src/video/kernels.rs
+index 678b3da..98db950 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/kernels.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/kernels.rs
+@@ -8,6 +8,84 @@ pub(crate) const ABI: u32 = 1;
+ 
+ /// Production kernels, every shader model.
+ pub(crate) static KERNELS: &[Kernel] = &[
++    Kernel {
++        name: "bgra_nv12",
++        sm: 75,
++        compute_class: 0xc5c0,
++        code: include_bytes!("../../shaders/sm75/bgra_nv12.bin"),
++        registers: 32,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [16, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 572784640, 1048610, 65544, 1187841, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "bgra_nv12",
++        sm: 80,
++        compute_class: 0xc6c0,
++        code: include_bytes!("../../shaders/sm80/bgra_nv12.bin"),
++        registers: 32,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [16, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 1409548288, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "bgra_nv12",
++        sm: 86,
++        compute_class: 0xc7c0,
++        code: include_bytes!("../../shaders/sm86/bgra_nv12.bin"),
++        registers: 32,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [16, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 872677376, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "bgra_nv12",
++        sm: 89,
++        compute_class: 0xc9c0,
++        code: include_bytes!("../../shaders/sm89/bgra_nv12.bin"),
++        registers: 32,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [16, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 0, 0, 0, 0, 0, 872677376, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1544, 41)], &[(8, 1032, 41)], &[(0, 384, 32)], &[(0, 416, 16)], &[(0, 448, 16)]],
++    },
++    Kernel {
++        name: "bgra_nv12",
++        sm: 90,
++        compute_class: 0xcbc0,
++        code: include_bytes!("../../shaders/sm90/bgra_nv12.bin"),
++        registers: 32,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [16, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 524304, 2097153, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1224, 41)], &[(8, 1538, 41)], &[(0, 1024, 32)], &[(0, 1056, 16)], &[(0, 1088, 16)]],
++    },
++    Kernel {
++        name: "bgra_nv12",
++        sm: 120,
++        compute_class: 0xcec0,
++        code: include_bytes!("../../shaders/sm120/bgra_nv12.bin"),
++        registers: 40,
++        shared_bytes: 0,
++        barriers: 0,
++        workgroup: [16, 8, 1],
++        cbuf_bytes: 1152,
++        qmd: &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 524304, 10241, 11798528, 0, 0, 0, 0, 0, 0, 37748736, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
++        runs: [&[(8, 1028, 41)], &[(8, 1346, 41)], &[(0, 1248, 32)], &[(0, 1280, 16)], &[(0, 1312, 16)]],
++    },
+ ];
+ 
+ /// Kernels for the engine's own hardware tests.
+@@ -175,6 +253,10 @@ pub(crate) static TEST_KERNELS: &[Kernel] = &[
+ /// runtime packing must reproduce them bit for bit.
+ #[cfg(test)]
+ pub(crate) static QMD_SAMPLES: &[(&str, u32, [u64; 5], &[u32])] = &[
++    ("bgra_nv12", 75, [536296022915328, 459258987084800, 2106699644, 11249, 11989], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2106699644, 11249, 11989, 0, 0, 572784640, 1048610, 65544, 1187841, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2429090816, 37855665, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 636532992, 124866, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 75, [365262520915200, 266643138387968, 1808638154, 44208, 38947], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 1808638154, 44208, 38947, 0, 0, 572784640, 1048610, 65544, 1187841, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2978717696, 37810818, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1322194176, 85044, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 75, [143643240508416, 32814141868800, 3266500016, 26159, 40817], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3266500016, 26159, 40817, 0, 0, 572784640, 1048610, 65544, 1187841, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 591727360, 37756376, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2354260992, 33444, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 75, [553663107038976, 426721054522624, 3357701257, 65145, 55261], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3357701257, 65145, 55261, 0, 0, 572784640, 1048610, 65544, 1187841, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3168763136, 37848089, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3167878912, 128909, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 75, [536296022915328, 459258987084800, 2106699644, 11249, 11989], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2106699644, 11249, 11989, 0, 0, 572784640, 4194338, 65537, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2429090816, 37855665, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 636532992, 124866, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 75, [365262520915200, 266643138387968, 1808638154, 44208, 38947], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 1808638154, 44208, 38947, 0, 0, 572784640, 4194338, 65537, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2978717696, 37810818, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1322194176, 85044, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 75, [143643240508416, 32814141868800, 3266500016, 26159, 40817], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3266500016, 26159, 40817, 0, 0, 572784640, 4194338, 65537, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 591727360, 37756376, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2354260992, 33444, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+@@ -183,6 +265,10 @@ pub(crate) static QMD_SAMPLES: &[(&str, u32, [u64; 5], &[u32])] = &[
+     ("mix", 75, [365262520915200, 266643138387968, 1808638154, 44208, 38947], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 1808638154, 44208, 38947, 0, 0, 572784640, 524322, 65544, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2978717696, 37810818, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1322194176, 85044, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("mix", 75, [143643240508416, 32814141868800, 3266500016, 26159, 40817], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3266500016, 26159, 40817, 0, 0, 572784640, 524322, 65544, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 591727360, 37756376, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2354260992, 33444, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("mix", 75, [553663107038976, 426721054522624, 3357701257, 65145, 55261], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3357701257, 65145, 55261, 0, 0, 572784640, 524322, 65544, 1185793, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3168763136, 37848089, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3167878912, 128909, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 80, [412496371229952, 541398177044480, 2528698529, 51797, 20351], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2528698529, 51797, 20351, 0, 0, 1409548288, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 369514496, 37874790, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3417154816, 96041, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 80, [165418381568512, 86795180677632, 3663106249, 64774, 55595], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3663106249, 64774, 55595, 0, 0, 1409548288, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2481560064, 37768944, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2011130368, 38514, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 80, [260823755410944, 40890522155008, 2265457508, 31394, 56132], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2265457508, 31394, 56132, 0, 0, 1409548288, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2433497088, 37758256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3276426752, 60727, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 80, [359267005365504, 334638220101632, 2001680981, 6331, 28579], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2001680981, 6331, 28579, 0, 0, 1409548288, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 138201088, 37826650, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1580989696, 83648, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 80, [412496371229952, 541398177044480, 2528698529, 51797, 20351], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2528698529, 51797, 20351, 0, 0, 1409548288, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 369514496, 37874790, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3417154816, 96041, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 80, [165418381568512, 86795180677632, 3663106249, 64774, 55595], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3663106249, 64774, 55595, 0, 0, 1409548288, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2481560064, 37768944, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2011130368, 38514, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 80, [260823755410944, 40890522155008, 2265457508, 31394, 56132], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2265457508, 31394, 56132, 0, 0, 1409548288, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2433497088, 37758256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3276426752, 60727, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+@@ -191,6 +277,10 @@ pub(crate) static QMD_SAMPLES: &[(&str, u32, [u64; 5], &[u32])] = &[
+     ("mix", 80, [165418381568512, 86795180677632, 3663106249, 64774, 55595], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3663106249, 64774, 55595, 0, 0, 1409548288, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2481560064, 37768944, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2011130368, 38514, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("mix", 80, [260823755410944, 40890522155008, 2265457508, 31394, 56132], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2265457508, 31394, 56132, 0, 0, 1409548288, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2433497088, 37758256, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3276426752, 60727, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("mix", 80, [359267005365504, 334638220101632, 2001680981, 6331, 28579], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 2001680981, 6331, 28579, 0, 0, 1409548288, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 138201088, 37826650, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1580989696, 83648, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 86, [38756807838720, 77015251574784, 3035097191, 21811, 30386], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3035097191, 21811, 30386, 0, 0, 872677376, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2192990208, 37766667, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3317926912, 9023, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 86, [150785395720960, 546517575531008, 734507209, 50133, 10037], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 734507209, 50133, 10037, 0, 0, 872677376, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 166984192, 37875982, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1978860288, 35107, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 86, [401440373294080, 500942141235712, 205213039, 24569, 22081], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 205213039, 24569, 22081, 0, 0, 872677376, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2925634048, 37865370, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2665038848, 93467, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 86, [351171664726016, 336728809480448, 3810430487, 27504, 48989], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3810430487, 27504, 48989, 0, 0, 872677376, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3373474048, 37827136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2253703168, 81763, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 86, [38756807838720, 77015251574784, 3035097191, 21811, 30386], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3035097191, 21811, 30386, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2192990208, 37766667, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3317926912, 9023, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 86, [150785395720960, 546517575531008, 734507209, 50133, 10037], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 734507209, 50133, 10037, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 166984192, 37875982, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1978860288, 35107, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 86, [401440373294080, 500942141235712, 205213039, 24569, 22081], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 205213039, 24569, 22081, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2925634048, 37865370, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2665038848, 93467, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+@@ -199,6 +289,10 @@ pub(crate) static QMD_SAMPLES: &[(&str, u32, [u64; 5], &[u32])] = &[
+     ("mix", 86, [150785395720960, 546517575531008, 734507209, 50133, 10037], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 734507209, 50133, 10037, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 166984192, 37875982, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1978860288, 35107, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("mix", 86, [401440373294080, 500942141235712, 205213039, 24569, 22081], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 205213039, 24569, 22081, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2925634048, 37865370, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2665038848, 93467, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("mix", 86, [351171664726016, 336728809480448, 3810430487, 27504, 48989], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3810430487, 27504, 48989, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3373474048, 37827136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2253703168, 81763, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 89, [414836979564544, 126298765550592, 3288296522, 6818, 35404], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3288296522, 6818, 35404, 0, 0, 872677376, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 957244416, 37778142, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3268313088, 96586, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 89, [143468902797312, 213428819536128, 3565174985, 10044, 20026], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3565174985, 10044, 20026, 0, 0, 872677376, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3304663296, 37798428, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4110209024, 33403, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 89, [471748682235648, 168017997354752, 1322574452, 53925, 5056], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 1322574452, 53925, 5056, 0, 0, 872677376, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3171702528, 37787855, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2359344896, 109837, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 89, [347123994406144, 56299127459328, 419837944, 5323, 59194], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 419837944, 5323, 59194, 0, 0, 872677376, 1048624, 65544, 139265, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 696143360, 37761844, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 442576128, 80821, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 89, [414836979564544, 126298765550592, 3288296522, 6818, 35404], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3288296522, 6818, 35404, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 957244416, 37778142, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3268313088, 96586, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 89, [143468902797312, 213428819536128, 3565174985, 10044, 20026], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3565174985, 10044, 20026, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3304663296, 37798428, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4110209024, 33403, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 89, [471748682235648, 168017997354752, 1322574452, 53925, 5056], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 1322574452, 53925, 5056, 0, 0, 872677376, 4194352, 65537, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3171702528, 37787855, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2359344896, 109837, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+@@ -207,6 +301,10 @@ pub(crate) static QMD_SAMPLES: &[(&str, u32, [u64; 5], &[u32])] = &[
+     ("mix", 89, [143468902797312, 213428819536128, 3565174985, 10044, 20026], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 3565174985, 10044, 20026, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3304663296, 37798428, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4110209024, 33403, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("mix", 89, [471748682235648, 168017997354752, 1322574452, 53925, 5056], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 1322574452, 53925, 5056, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3171702528, 37787855, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2359344896, 109837, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("mix", 89, [347123994406144, 56299127459328, 419837944, 5323, 59194], &[0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 67108864, 419837944, 5323, 59194, 0, 0, 872677376, 524336, 65544, 137217, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 696143360, 37761844, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 442576128, 80821, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 90, [164897067858944, 142726603542528, 3372696299, 1821, 37076], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3372696299, 1821, 37076, 0, 524304, 2097153, 388463616, 38393, 0, 0, 0, 0, 0, 0, 0, 0, 1015153728, 37749255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 90, [328680056296448, 290049218678528, 3077075145, 40372, 23355], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3077075145, 40372, 23355, 0, 524304, 2097153, 3389002752, 76526, 0, 0, 0, 0, 0, 0, 0, 0, 828544572, 37749791, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 90, [495184785216000, 57043282727680, 263372491, 41865, 21226], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 263372491, 41865, 21226, 0, 524304, 2097153, 825790976, 115294, 0, 0, 0, 0, 0, 0, 0, 0, 2243062348, 37748943, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 90, [533424755439872, 150472551259392, 3584607726, 19774, 40750], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3584607726, 19774, 40750, 0, 524304, 2097153, 2702178560, 124197, 0, 0, 0, 0, 0, 0, 0, 0, 1786502516, 37749283, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 90, [164897067858944, 142726603542528, 3372696299, 1821, 37076], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3372696299, 1821, 37076, 0, 65600, 1572865, 388463616, 38393, 0, 0, 0, 0, 0, 0, 0, 0, 1015153728, 37749255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 90, [328680056296448, 290049218678528, 3077075145, 40372, 23355], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3077075145, 40372, 23355, 0, 65600, 1572865, 3389002752, 76526, 0, 0, 0, 0, 0, 0, 0, 0, 828544572, 37749791, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 90, [495184785216000, 57043282727680, 263372491, 41865, 21226], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 263372491, 41865, 21226, 0, 65600, 1572865, 825790976, 115294, 0, 0, 0, 0, 0, 0, 0, 0, 2243062348, 37748943, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+@@ -215,6 +313,10 @@ pub(crate) static QMD_SAMPLES: &[(&str, u32, [u64; 5], &[u32])] = &[
+     ("mix", 90, [328680056296448, 290049218678528, 3077075145, 40372, 23355], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3077075145, 40372, 23355, 0, 524296, 1572865, 3389002752, 76526, 0, 0, 0, 0, 0, 0, 0, 0, 828544572, 37749791, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("mix", 90, [495184785216000, 57043282727680, 263372491, 41865, 21226], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 263372491, 41865, 21226, 0, 524296, 1572865, 825790976, 115294, 0, 0, 0, 0, 0, 0, 0, 0, 2243062348, 37748943, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("mix", 90, [533424755439872, 150472551259392, 3584607726, 19774, 40750], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 16777216, 64, 7809, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3584607726, 19774, 40750, 0, 524296, 1572865, 2702178560, 124197, 0, 0, 0, 0, 0, 0, 0, 0, 1786502516, 37749283, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 120, [547999064588544, 72611789879552, 1609722313, 48502, 21714], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1872318480, 7974, 524304, 10241, 11798528, 0, 0, 1609722313, 48502, 21714, 687850724, 37749000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 120, [255515127058944, 336861379259648, 1318981832, 32699, 57707], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1007034656, 3718, 524304, 10241, 11798528, 0, 0, 1318981832, 32699, 57707, 2124113332, 37749961, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 120, [72367967788800, 105501564445696, 2847052032, 7739, 47581], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 397424112, 1053, 524304, 10241, 11798528, 0, 0, 2847052032, 7739, 47581, 3489470096, 37749119, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
++    ("bgra_nv12", 120, [492948052241664, 160925498153984, 4038420664, 60105, 11728], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1452850896, 7173, 524304, 10241, 11798528, 0, 0, 4038420664, 60105, 11728, 1905040496, 37749321, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 120, [547999064588544, 72611789879552, 1609722313, 48502, 21714], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1872318480, 7974, 65600, 6145, 11798528, 0, 0, 1609722313, 48502, 21714, 687850724, 37749000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 120, [255515127058944, 336861379259648, 1318981832, 32699, 57707], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1007034656, 3718, 65600, 6145, 11798528, 0, 0, 1318981832, 32699, 57707, 2124113332, 37749961, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+     ("fill", 120, [72367967788800, 105501564445696, 2847052032, 7739, 47581], &[0, 0, 0, 0, 18808832, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5243136, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 397424112, 1053, 65600, 6145, 11798528, 0, 0, 2847052032, 7739, 47581, 3489470096, 37749119, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+diff --git a/nvidia-prolapse/driver-source/native/tools/gen-kernels.py b/nvidia-prolapse/driver-source/native/tools/gen-kernels.py
+index ea1d061..6923004 100755
+--- a/nvidia-prolapse/driver-source/native/tools/gen-kernels.py
++++ b/nvidia-prolapse/driver-source/native/tools/gen-kernels.py
+@@ -23,11 +23,11 @@ GEN = ROOT / "build/nak-host/src/nouveau/native-bridge/nv-nak-gen"
+ MESA_PIN = "ddaf85e353442d9d7f192fdcf1823e652e3f2ee3"  # compiler/build.py PIN (mesa-26.2.5)
+ SHADERS = NATIVE / "shaders"
+ OUT_RS = NATIVE / "src/video/kernels.rs"
+-# Shader models with generated kernels. Runtime use is further limited to the models in
+-# compute.rs VALIDATED_SM (hardware-tested); the rest only have unit-tested QMD packing.
++# Shader models with generated kernels. Runtime use is further limited to the compute classes in
++# compute.rs VALIDATED_CLASSES (hardware-tested); the rest only have unit-tested QMD packing.
+ SMS = (75, 80, 86, 89, 90, 120)
+ # (name, test-only): test kernels exist for the hardware tests of the engine itself.
+-KERNELS = (("fill", True), ("mix", True))
++KERNELS = (("bgra_nv12", False), ("fill", True), ("mix", True))
+ VARIABLES = ("program", "cbuf", "grid_x", "grid_y", "grid_z")
+ ABI = 1
+ 
+-- 
+2.56.0
+

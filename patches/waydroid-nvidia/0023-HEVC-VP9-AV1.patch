@@ -1,0 +1,424 @@
+From ee44d7bba230e399f7f00638bce182e1b1375a56 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Mon, 26 Oct 2026 13:48:21 +0800
+Subject: [PATCH 23/37] =?utf-8?q?=E8=A7=86=E9=A2=91=EF=BC=9AHEVC=E3=80=81V?=
+ =?utf-8?q?P9=E3=80=81AV1=20=E6=94=AF=E6=8C=81=E7=94=B1=E5=AE=A2=E6=88=B7?=
+ =?utf-8?q?=E7=AB=AF=E8=A7=A3=E6=9E=90=E5=A5=BD=E7=9A=84=E5=8F=82=E6=95=B0?=
+ =?utf-8?q?=E9=A9=B1=E5=8A=A8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+- HEVC：session_inputs() 和按参数构建描述符的 build_picture()
+- VP9：VA 参数和参考映射桥接，复用四套概率上下文、刷新/重置规则与计数回读
+- AV1：Av1Codec/Av1Decoder::build_picture() 接受已解析的帧头和权威参考映射，复用 CDF、DPB、
+  运动场与分段机制；补参考映射、CDF 继承、分段保存的回归测试
+原有码流驱动路径行为不变
+---
+ .../native/src/video/av1/codec.rs             |  19 +++
+ .../native/src/video/av1/header.rs            |   2 +-
+ .../driver-source/native/src/video/av1/mod.rs |  38 +++++
+ .../native/src/video/av1/tests.rs             |  31 ++++
+ .../native/src/video/hevc/codec.rs            |  43 ++++++
+ .../driver-source/native/src/video/vp9.rs     | 134 +++++++++++++++++-
+ 6 files changed, 260 insertions(+), 7 deletions(-)
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/av1/codec.rs b/nvidia-prolapse/driver-source/native/src/video/av1/codec.rs
+index 11214df..974e392 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/av1/codec.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/av1/codec.rs
+@@ -151,6 +151,25 @@ impl Av1Decoder {
+             None => self.cdf + (idx * CDF_BUFFER_SIZE) as u64,
+         }
+     }
++    /// Stage a client-parsed picture for the existing allocation/command machinery.
++    /// Each reference is (codec DPB slot, session surface).
++    pub fn build_picture(
++        &mut self,
++        seq: super::header::SequenceHeader,
++        hdr: super::header::FrameHeader,
++        bitstream: Vec<u8>,
++        tiles: Vec<super::header::TileRange>,
++        references: [Option<(usize, usize)>; 8],
++    ) -> VResult<usize> {
++        let j = self.c.build_picture(seq, hdr, bitstream, tiles,
++            references.map(|r| r.map(|r| r.0))).map_err(err)?;
++        for (slot, surface) in references.into_iter().flatten() {
++            self.slot_surface[slot] = Some(Surf::Session(surface));
++        }
++        let slot = j.slot;
++        self.current = Some(Box::new(j));
++        Ok(slot)
++    }
+ }
+ 
+ /// Count the frames a temporal unit decodes (OBU_FRAME / OBU_FRAME_HEADER without show_existing_frame).
+diff --git a/nvidia-prolapse/driver-source/native/src/video/av1/header.rs b/nvidia-prolapse/driver-source/native/src/video/av1/header.rs
+index 27e9921..6ca4d00 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/av1/header.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/av1/header.rs
+@@ -1194,7 +1194,7 @@ impl ParserState {
+         Ok(())
+     }
+ 
+-    fn skip_mode_allowed(&self, seq: &SequenceHeader, h: &mut FrameHeader) -> bool {
++    pub(super) fn skip_mode_allowed(&self, seq: &SequenceHeader, h: &mut FrameHeader) -> bool {
+         if h.frame_is_intra || !h.reference_select || !seq.enable_order_hint {
+             return false;
+         }
+diff --git a/nvidia-prolapse/driver-source/native/src/video/av1/mod.rs b/nvidia-prolapse/driver-source/native/src/video/av1/mod.rs
+index b48e257..ae89682 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/av1/mod.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/av1/mod.rs
+@@ -138,6 +138,44 @@ impl Av1Codec {
+         }
+     }
+ 
++    /// Build a client-parsed picture using the client's authoritative reference map.
++    /// Slots name previously decoded pictures, not AV1 reference-map indices.
++    pub fn build_picture(
++        &mut self,
++        seq: SequenceHeader,
++        mut hdr: FrameHeader,
++        bitstream: Vec<u8>,
++        tiles: Vec<TileRange>,
++        references: [Option<usize>; 8],
++    ) -> Result<PictureJob> {
++        if references.iter().flatten().any(|&s| s >= DPB_SLOTS) {
++            return Err(Av1Error::Invalid("reference slot out of range"));
++        }
++        if hdr.ref_frame_idx.iter().any(|&i| i >= 8) || hdr.primary_ref_frame > PRIMARY_REF_NONE {
++            return Err(Av1Error::Invalid("reference index out of range"));
++        }
++        self.ref_map = references;
++        for (i, slot) in references.iter().enumerate() {
++            if let Some(slot) = slot {
++                self.parser.refs[i].order_hint = self.slots[*slot].rec.order_hint;
++            }
++        }
++        if !hdr.frame_is_intra {
++            for i in 0..7 {
++                let slot = references[hdr.ref_frame_idx[i] as usize]
++                    .ok_or(Av1Error::Invalid("missing client reference"))?;
++                hdr.order_hints[i] = self.slots[slot].rec.order_hint;
++                hdr.ref_frame_sign_bias[i] = header::get_relative_dist(
++                    &seq, hdr.order_hints[i], hdr.order_hint,
++                ) > 0;
++            }
++        }
++        if hdr.skip_mode_present && !self.parser.skip_mode_allowed(&seq, &mut hdr) {
++            return Err(Av1Error::Invalid("invalid skip-mode references"));
++        }
++        self.parser.seq = Some(seq);
++        self.finish_frame(hdr, bitstream, tiles)
++    }
+     pub fn ref_map(&self) -> [Option<usize>; 8] {
+         self.ref_map
+     }
+diff --git a/nvidia-prolapse/driver-source/native/src/video/av1/tests.rs b/nvidia-prolapse/driver-source/native/src/video/av1/tests.rs
+index fa802cd..73be20a 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/av1/tests.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/av1/tests.rs
+@@ -75,6 +75,37 @@ fn qctx_thresholds() {
+         [0, 0, 1, 1, 2, 2, 3, 3]
+     );
+ }
++#[test]
++fn client_picture_preserves_reference_cdf_and_segmentation() {
++    let mut codec = Av1Codec::new();
++    let seq = SequenceHeader { bit_depth: 8, ..Default::default() };
++    let mut hdr = FrameHeader {
++        frame_is_intra: true,
++        primary_ref_frame: PRIMARY_REF_NONE,
++        base_q_idx: 40,
++        upscaled_width: 64,
++        frame_width: 64,
++        frame_height: 64,
++        mi_cols: 16,
++        mi_rows: 16,
++        segmentation_enabled: true,
++        ..Default::default()
++    };
++    let first = codec.build_picture(seq.clone(), hdr.clone(), vec![], vec![], [None; 8]).unwrap();
++    assert_eq!(first.cdf_default_qctx, Some(1));
++    hdr.frame_is_intra = false;
++    hdr.frame_type = header::INTER_FRAME;
++    hdr.primary_ref_frame = 0;
++    hdr.disable_frame_end_update_cdf = true;
++    let second = codec.build_picture(seq.clone(), hdr.clone(), vec![], vec![], [Some(first.slot); 8]).unwrap();
++    assert_ne!(second.slot, first.slot);
++    assert_eq!(second.cdf_read, first.cdf_write);
++    assert_eq!(second.cdf_default_qctx, None);
++    assert_eq!(second.seg_read, Some(first.slot));
++    let third = codec.build_picture(seq, hdr, vec![], vec![], [Some(second.slot); 8]).unwrap();
++    assert_eq!(third.cdf_read, first.cdf_write);
++    assert_eq!(third.ref_slots, [Some(second.slot); 7]);
++}
+ 
+ /// Dump every picture job of the IVF streams in $AV1_IVF_DIR to $AV1_OUT_DIR (descriptor block + job
+ /// summary) for comparison with stock captures (compare script
+diff --git a/nvidia-prolapse/driver-source/native/src/video/hevc/codec.rs b/nvidia-prolapse/driver-source/native/src/video/hevc/codec.rs
+index d086d3f..982474d 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/hevc/codec.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/hevc/codec.rs
+@@ -119,6 +119,49 @@ impl HevcDecoder {
+             gen: NvdecGen::of(decoder_class),
+         })
+     }
++
++    /// Session-owned layout for externally supplied HEVC picture parameters.
++    pub fn session_inputs(&self) -> SessionInputs {
++        self.dec.inputs
++    }
++
++    /// Submit a parameter-driven picture with hardware slots mapped to session surfaces.
++    pub fn build_picture(
++        &self,
++        ctx: &BuildContext,
++        d: &mut [u8],
++        setup: &[u8],
++        slots: &[Option<usize>; SLOTS],
++        control: u32,
++    ) -> VResult<Vec<u32>> {
++        d[..SETUP_SIZE].copy_from_slice(setup);
++        let cur = ctx.surfaces[ctx.current];
++        let mut w = Vec::new();
++        let reloc = |w: &mut Vec<u32>, m, va| ctx.reloc(w, m, va);
++        method(&mut w, 4, 0x200, &[super::APP_ID_HEVC]);
++        method(&mut w, 4, 0x400, &[control]);
++        reloc(&mut w, 0x404, ctx.descriptor);
++        reloc(&mut w, 0x408, ctx.bitstream);
++        for (i, slot) in slots.iter().enumerate() {
++            let s = slot.map_or(cur, |s| ctx.surfaces[s]);
++            reloc(&mut w, 0x430 + 4 * i as u32, s.luma);
++            reloc(&mut w, 0x474 + 4 * i as u32, s.chroma);
++        }
++        reloc(&mut w, 0x414, self.colmv);
++        reloc(&mut w, 0x424, ctx.descriptor + STATUS);
++        method(&mut w, 4, 0x40c, &[ctx.picture_index]);
++        reloc(&mut w, 0x580, ctx.descriptor + super::desc::SCALING_LIST_OFFSET as u64);
++        reloc(&mut w, 0x584, ctx.descriptor + super::desc::TILE_SIZES_OFFSET as u64);
++        reloc(&mut w, 0x588, self.filter);
++        if self.gen.ga10x_plus() {
++            reloc(&mut w, 0x4c8, self.intra_top);
++        }
++        if self.gen.blackwell_b() {
++            reloc(&mut w, 0x4dc, self.buf_4dc);
++        }
++        method(&mut w, 4, 0x300, &[0]);
++        Ok(w)
++    }
+ }
+ 
+ impl CodecDecoder for HevcDecoder {
+diff --git a/nvidia-prolapse/driver-source/native/src/video/vp9.rs b/nvidia-prolapse/driver-source/native/src/video/vp9.rs
+index 1d2638a..4e8c1ea 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/vp9.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/vp9.rs
+@@ -52,6 +52,26 @@ struct Pending {
+     header: FrameHeader,
+ }
+ 
++/// External reference bindings for a VA picture. Probabilities and raw segment
++/// quantizer/filter deltas still come from the complete VP9 frame headers: VA's
++/// slice ABI contains derived dequant/filter tables, not those syntax values.
++#[derive(Default)]
++pub struct VaPicture {
++    pub references: [Option<(usize, u32, u32)>; 8],
++    pub width: u32,
++    pub height: u32,
++    pub fields: u32,
++    pub filter_level: u8,
++    pub sharpness: u8,
++    pub tile_cols: u32,
++    pub tile_rows: u32,
++    pub uncompressed_size: usize,
++    pub header_size: usize,
++    pub tree_probs: [u8; 7],
++    pub pred_probs: [u8; 3],
++    pub segment_flags: [u16; 8],
++}
++
+ pub struct Vp9Decoder {
+     st: Vp9State,
+     frames: VecDeque<Vec<u8>>,
+@@ -77,6 +97,7 @@ pub struct Vp9Decoder {
+     bit_depth: u32,
+     /// Per-generation gates of the session's NVDEC class.
+     gen: NvdecGen,
++    va_picture: Option<VaPicture>,
+ }
+ 
+ impl Vp9Decoder {
+@@ -99,6 +120,22 @@ impl Vp9Decoder {
+             frame_len: 0,
+             bit_depth,
+             gen: NvdecGen::of(decoder_class),
++            va_picture: None,
++        }
++    }
++
++    /// Bind VA references before parsing/submitting one complete coded frame.
++    pub fn set_va_picture(&mut self, picture: VaPicture) {
++        self.va_picture = Some(picture);
++    }
++
++    fn reference(&self, index: usize) -> Option<(usize, u32, u32)> {
++        match &self.va_picture {
++            Some(p) => p.references[index],
++            None => self.st.slot_surface(index).map(|s| {
++                let (w, h) = self.st.slot_size(index);
++                (s, w, h)
++            }),
+         }
+     }
+ 
+@@ -172,7 +209,7 @@ impl Vp9Decoder {
+         if !key {
+             // Stock fills ref dims for every non-key frame, intra-only included.
+             for i in 0..3 {
+-                let (w, hh) = self.st.slot_size(h.ref_frame_idx[i]);
++                let (_, w, hh) = self.reference(h.ref_frame_idx[i]).unwrap_or((ctx.current, h.width, h.height));
+                 p.refs[i] = dims(w, hh);
+             }
+         }
+@@ -181,7 +218,9 @@ impl Vp9Decoder {
+             // vp9_decodeframe.c:1584-1590): every reference must satisfy it for
+             // the engine, which has no per-ref scale fallback here.
+             for i in 0..3 {
+-                let (rw, rh) = self.st.slot_size(h.ref_frame_idx[i]);
++                let (_, rw, rh) = self.reference(h.ref_frame_idx[i]).ok_or_else(|| {
++                    VideoError::Invalid("VP9: missing active VA reference".into())
++                })?;
+                 if 2 * h.width < rw || 2 * h.height < rh || h.width > 16 * rw || h.height > 16 * rh
+                 {
+                     return Err(VideoError::Unsupported(format!(
+@@ -349,7 +388,45 @@ impl CodecDecoder for Vp9Decoder {
+         if frame.len() == 1 && frame[0] == 0 {
+             return self.next_job(); // libvpx skips 1-byte zero frames
+         }
+-        let h = self.st.parse(&frame).map_err(bitstream_error)?;
++        let mut h = self.st.parse(&frame).map_err(bitstream_error)?;
++        if let Some(p) = &self.va_picture {
++            if h.show_existing_frame {
++                return Err(VideoError::Unsupported("VP9 VA show_existing_frame has no coded picture".into()));
++            }
++            if (h.width, h.height) != (p.width, p.height)
++                || h.uncompressed_size != p.uncompressed_size || h.header_size != p.header_size
++            {
++                return Err(VideoError::Invalid("VP9 VA dimensions/header lengths disagree with frame".into()));
++            }
++            let f = p.fields;
++            h.frame_type = (f >> 2) & 1;
++            h.show_frame = f & (1 << 3) != 0;
++            h.error_resilient = f & (1 << 4) != 0;
++            h.intra_only = f & (1 << 5) != 0;
++            h.allow_high_precision_mv = f & (1 << 6) != 0;
++            h.interp_filter = ((f >> 7) & 7) as u8;
++            h.frame_parallel = f & (1 << 10) != 0;
++            h.reset_frame_context = (f >> 11) & 3;
++            h.refresh_frame_context = f & (1 << 13) != 0;
++            h.frame_context_idx = ((f >> 14) & 3) as usize;
++            h.ref_frame_idx = [((f >> 19) & 7) as usize, ((f >> 23) & 7) as usize, ((f >> 27) & 7) as usize];
++            h.sign_bias = [0, ((f >> 22) & 1) as u8, ((f >> 26) & 1) as u8, ((f >> 30) & 1) as u8];
++            h.lossless = f & (1 << 31) != 0;
++            h.filter_level = p.filter_level;
++            h.sharpness = p.sharpness;
++            h.log2_tile_cols = p.tile_cols;
++            h.log2_tile_rows = p.tile_rows;
++            self.st.seg.enabled = f & (1 << 16) != 0;
++            self.st.seg.temporal_update = f & (1 << 17) != 0;
++            self.st.seg.update_map = f & (1 << 18) != 0;
++            self.st.seg.tree_probs = p.tree_probs;
++            self.st.seg.pred_probs = p.pred_probs;
++            for (i, flags) in p.segment_flags.iter().enumerate() {
++                self.st.seg.feature_enabled[i][2] = flags & 1 != 0;
++                self.st.seg.feature_data[i][2] = ((flags >> 1) & 3) as i16;
++                self.st.seg.feature_enabled[i][3] = flags & 8 != 0;
++            }
++        }
+         if self.st.bit_depth != self.bit_depth {
+             return Err(VideoError::Unsupported(format!(
+                 "VP9 {}-bit frame in a {}-bit session",
+@@ -396,7 +473,7 @@ impl CodecDecoder for Vp9Decoder {
+             .to_vec();
+         let readback = (!h.error_resilient && !h.frame_parallel)
+             .then(|| COUNTS..COUNTS + std::mem::size_of::<Vp9EntropyCounts>());
+-        let show = h.show_frame;
++        let show = self.va_picture.is_some() || h.show_frame;
+         // stream_len is the whole frame (stock), the engine reads from the
+         // first tile (frameTagSize + offsetToDctParts).
+         let job = DecodeJob {
+@@ -450,7 +527,7 @@ impl CodecDecoder for Vp9Decoder {
+             let si = if h.frame_type == KEY_FRAME {
+                 cur
+             } else {
+-                self.st.slot_surface(h.ref_frame_idx[i]).unwrap_or(cur)
++                self.reference(h.ref_frame_idx[i]).map(|r| r.0).unwrap_or(cur)
+             };
+             r(&mut w, 0x430 + 4 * i as u32, s(si).luma);
+             r(&mut w, 0x474 + 4 * i as u32, s(si).chroma);
+@@ -509,7 +586,10 @@ impl CodecDecoder for Vp9Decoder {
+             .map_err(bitstream_error)
+     }
+     fn referenced(&self) -> Vec<usize> {
+-        self.st.referenced().collect()
++        match &self.va_picture {
++            Some(p) => p.references.iter().flatten().map(|r| r.0).collect(),
++            None => self.st.referenced().collect(),
++        }
+     }
+     fn flush(&mut self) {
+         let max = self.max;
+@@ -527,6 +607,48 @@ impl CodecDecoder for Vp9Decoder {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[test]
++    fn va_references_override_parser_slots() {
++        let mut d = Vp9Decoder::new(0xc9b0, 640, 480, 8);
++        let mut p = VaPicture::default();
++        p.references[3] = Some((19, 320, 240));
++        d.set_va_picture(p);
++        assert_eq!(d.reference(3), Some((19, 320, 240)));
++        assert_eq!(d.reference(0), None);
++        assert_eq!(d.referenced(), vec![19]);
++    }
++
++    #[test]
++    fn va_hidden_picture_still_produces_output() {
++        let ivf = include_bytes!("testdata/vp9_160x144.ivf");
++        let frames = crate::vp9::ivf_frames(ivf).unwrap();
++        let mut frame = frames[0].to_vec();
++        frame[0] &= !2; // profile 0 key frame, show_frame = 0
++        let mut st = Vp9State::default();
++        let h = st.parse(&frame).unwrap();
++        assert!(!h.show_frame);
++        let mut d = Vp9Decoder::new(0xc9b0, 160, 144, 8);
++        d.set_va_picture(VaPicture {
++            width: h.width, height: h.height,
++            fields: 3 | (u32::from(h.error_resilient) << 4)
++                | (u32::from(h.frame_parallel) << 10)
++                | (u32::from(h.refresh_frame_context) << 13)
++                | ((h.frame_context_idx as u32) << 14)
++                | (u32::from(h.lossless) << 31),
++            filter_level: h.filter_level, sharpness: h.sharpness,
++            tile_cols: h.log2_tile_cols, tile_rows: h.log2_tile_rows,
++            uncompressed_size: h.uncompressed_size, header_size: h.header_size,
++            tree_probs: st.seg.tree_probs, pred_probs: st.seg.pred_probs,
++            ..Default::default()
++        });
++        d.push_unit(&frame).unwrap();
++        match d.next_job().unwrap().unwrap() {
++            Job::Decode(job) => assert!(job.show),
++            _ => panic!("hidden VA frame must decode"),
++        }
++        assert!(d.next_job().unwrap().is_none());
++    }
++
+     #[test]
+     fn stock_derived_fields() {
+         // Stock: 1080p gptimer 81.6e6, 4K 324e6; ext_108 widths.
+-- 
+2.56.0
+

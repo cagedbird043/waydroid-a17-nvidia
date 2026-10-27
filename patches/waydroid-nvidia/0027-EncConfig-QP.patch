@@ -1,0 +1,104 @@
+From 8eb73410af44e1a82da37f849a078edcf4755378 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Mon, 26 Oct 2026 17:38:10 +0800
+Subject: [PATCH 27/37] =?utf-8?q?=E8=A7=86=E9=A2=91=E7=BC=96=E7=A0=81?=
+ =?utf-8?q?=EF=BC=9AEncConfig=20=E5=A2=9E=E5=8A=A0=E5=8F=AF=E9=80=89?=
+ =?utf-8?q?=E7=9A=84=E6=9C=80=E5=B0=8F/=E6=9C=80=E5=A4=A7=20QP?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+通过 NVENC 每帧的 minQP/maxQP 生效（H.264/HEVC 0..51，AV1 0..255）；
+两项默认 None，原有配置的 picture setup 与 C 核心逐字节一致（176 组对照）
+---
+ .../native/src/video/enc/encoder.rs           | 37 +++++++++++++++++++
+ .../driver-source/native/src/video/enc/mod.rs |  4 ++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs b/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
+index d630645..0e559ed 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
+@@ -35,6 +35,10 @@ pub struct EncConfig {
+     pub height: i32,
+     pub qp_i: i32,
+     pub qp_p: i32,
++    /// Optional native quantizer bounds (H.264/HEVC 0..51, AV1 0..255).
++    /// None preserves the mickys setup bytes, including HEVC's signed ten-bit minimum.
++    pub min_qp: Option<u8>,
++    pub max_qp: Option<u8>,
+     pub num_refs: i32,
+     pub dpb_extra: i32,
+     pub engine: i32,
+@@ -866,6 +870,17 @@ impl Encoder {
+         let qb = (c.qp_p + 2).min(51);
+         r.QP = [c.qp_p as u8, qb as u8, c.qp_i as u8];
+         r.maxQP = [51; 3];
++        if let Some(q) = c.min_qp {
++            r.minQP = [q.min(51); 3];
++        }
++        if let Some(q) = c.max_qp {
++            r.maxQP = [q.min(51).max(c.min_qp.unwrap_or(0).min(51)); 3];
++        }
++        if c.min_qp.is_some() || c.max_qp.is_some() {
++            for q in &mut r.QP {
++                *q = (*q).clamp(r.minQP[0], r.maxQP[0]);
++            }
++        }
+         r.rhopbi = [256; 3];
+         r.framerate = c.fps;
+         r.gop_length = u32::MAX;
+@@ -1102,6 +1117,17 @@ impl Encoder {
+         r.QP = [c.qp_p as u8, qb as u8, c.qp_i as u8];
+         r.minQP = [if c.bit_depth > 8 { 244 } else { 0 }; 3];
+         r.maxQP = [51; 3];
++        if let Some(q) = c.min_qp {
++            r.minQP = [q.min(51); 3];
++        }
++        if let Some(q) = c.max_qp {
++            r.maxQP = [q.min(51).max(c.min_qp.unwrap_or(0).min(51)); 3];
++        }
++        if c.min_qp.is_some() || c.max_qp.is_some() {
++            for q in &mut r.QP {
++                *q = (*q).clamp(c.min_qp.unwrap_or(0).min(51), r.maxQP[0]);
++            }
++        }
+         r.rhopbi = [256; 3];
+         r.framerate = c.fps;
+         r.gop_length = if c.idr_period > 0 {
+@@ -1472,6 +1498,17 @@ impl Encoder {
+             r.hrd_type = 2;
+             r.QP = [c.qp_p as u8, (c.qp_p + 16).min(255) as u8, c.qp_i as u8];
+             r.maxQP = [255; 3];
++            if let Some(q) = c.min_qp {
++                r.minQP = [q; 3];
++            }
++            if let Some(q) = c.max_qp {
++                r.maxQP = [q.max(c.min_qp.unwrap_or(0)); 3];
++            }
++            if c.min_qp.is_some() || c.max_qp.is_some() {
++                for q in &mut r.QP {
++                    *q = (*q).clamp(r.minQP[0], r.maxQP[0]);
++                }
++            }
+             r.maxQPD = 32;
+             r.baseQPD = 16;
+             r.rhopbi = if vbr {
+diff --git a/nvidia-prolapse/driver-source/native/src/video/enc/mod.rs b/nvidia-prolapse/driver-source/native/src/video/enc/mod.rs
+index 639f075..391abc4 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/enc/mod.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/enc/mod.rs
+@@ -19,6 +19,10 @@
+ //! widened for `-10`), `-bf N`, `-refs N`, `-depth N`, `-slices N`, `-aq N`,
+ //! `-quality`, `-two-pass`, `-lossless`, `-no-cu8`, `-vbv KBITS`, `-maxrate KBPS`,
+ //! `-colour P T M`, `-mdcv HEX48`, `-cll HEX8`, `-full-range`, and `-pci BDF`.
++//!
++//! `EncConfig::min_qp` / `max_qp` optionally constrain native RC quantizers
++//! (H.264/HEVC 0..51, AV1 0..255), through the driver's per-picture minQP/maxQP
++//! arrays. Both default to `None`, retaining the original C core's setup bytes.
+ pub mod av1hdr;
+ pub mod av1probs;
+ mod av1tables;
+-- 
+2.56.0
+
