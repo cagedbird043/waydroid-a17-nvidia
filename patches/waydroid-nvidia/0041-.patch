@@ -1,0 +1,235 @@
+From 5fa3455060deae52e60151e9a9d3b7e40067a615 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Wed, 28 Oct 2026 00:13:56 +0800
+Subject: [PATCH 41/43] =?utf-8?q?=E5=AE=8C=E5=96=84=E7=BC=96=E7=A0=81?=
+ =?utf-8?q?=E9=94=99=E8=AF=AF=E6=9D=A5=E6=BA=90=E4=B8=8E=E5=88=86=E5=B8=A6?=
+ =?utf-8?q?=E8=BE=93=E5=85=A5=E8=BD=AC=E6=8D=A2?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../driver-source/native/src/video/channel.rs |  8 +++++
+ .../native/src/video/enc/encoder.rs           | 33 ++++++++++---------
+ .../native/src/video/enc/error.rs             | 16 +++++++--
+ .../driver-source/native/src/video/ffi_enc.rs |  9 ++---
+ nvidia-prolapse/media/c2/NvC2Encoder.cpp      | 26 +++------------
+ 5 files changed, 48 insertions(+), 44 deletions(-)
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/channel.rs b/nvidia-prolapse/driver-source/native/src/video/channel.rs
+index 240cddb..1eae522 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/channel.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/channel.rs
+@@ -327,6 +327,14 @@ impl Drop for EngineChannel {
+ mod tests {
+     use super::nvdec_usermode_class;
+     #[test]
++    fn fence_timeout_keeps_structured_ticket() {
++        use std::os::fd::AsRawFd;
++        let (reader,_writer)=std::os::unix::net::UnixStream::pair().unwrap();
++        let e=super::wait_sync_file_enc(reader.as_raw_fd(),std::time::Duration::ZERO,42).unwrap_err();
++        assert!(matches!(e,crate::video::enc::EncError::ChannelTimeout {ticket:42}));
++        assert!(!e.recoverable());
++    }
++    #[test]
+     fn usermode_class_matches_stock_per_generation() {
+         // Usermode subsets of the per-generation class lists (0xc361 allocated
+         // by stock on GA106/550 and AD102/610, 0xc661 on GB202/615 in rmtrace).
+diff --git a/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs b/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
+index 14df802..f749a76 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/enc/encoder.rs
+@@ -266,12 +266,15 @@ impl Encoder {
+         Self::open_on(cfg, None)
+     }
+     pub fn open_on(cfg: &EncConfig, pci: Option<[u32; 4]>) -> VResult<Self> {
++        Self::open_checked(cfg,pci).map_err(Into::into)
++    }
++    pub(crate) fn open_checked(cfg:&EncConfig,pci:Option<[u32;4]>)->Result<Self,EncError> {
+         // The host C core's rm_shim.c chan_create supports NVENC0 only.
+         if cfg.engine != 0 {
+-            return Err(VideoError::Unsupported("only NVENC0 is supported".into()));
++            return Err(EncError::UnsupportedConfig {feature:"only NVENC0 is supported"});
+         }
+         if cfg.width <= 0 || cfg.height <= 0 {
+-            return Err(invalid("non-positive encode dimensions"));
++            return Err(EncError::InvalidConfig {field:"dimensions"});
+         }
+         let mut c = cfg.clone();
+         c.num_refs = c.num_refs.clamp(1, if c.codec == ENC_AV1 { 4 } else { 3 });
+@@ -287,7 +290,7 @@ impl Encoder {
+             c.qp_p = 0;
+             c.rc_mode = 0;
+         }
+-        let mut rm = NvVencDevice::open_on(pci)?;
++        let mut rm = NvVencDevice::open_on(pci).map_err(|source|EncError::DeviceOpen {source})?;
+         let class = rm
+             .classes
+             .iter()
+@@ -298,9 +301,7 @@ impl Encoder {
+         let hevc = c.codec == ENC_HEVC;
+         let av1 = c.codec == ENC_AV1;
+         if av1 && class != 0xc9b7 {
+-            return Err(VideoError::Unsupported(format!(
+-                "this GPU's NVENC (class {class:#x}) has no AV1"
+-            )));
++            return Err(EncError::UnsupportedConfig {feature:"GPU NVENC class has no AV1"});
+         }
+         if (!hevc && !av1) || c.bit_depth != 10 {
+             c.bit_depth = 8;
+@@ -473,7 +474,8 @@ impl Encoder {
+             ps.nal_cpb_fullness = (0.5 * c.vbv_bits as f64 * 16.0) as i32;
+             ps.vcl_cpb_fullness = ps.nal_cpb_fullness;
+         }
+-        let chan = EngineChannel::new(&rm.device, &rm.space, NV2080_ENGINE_TYPE_NVENC0, class, 0)?;
++        let chan = EngineChannel::new(&rm.device, &rm.space, NV2080_ENGINE_TYPE_NVENC0, class, 0)
++            .map_err(|source|EncError::ChannelInit {stage:"channel/timeline construction",source})?;
+         let av1_hq = av1 && (cfg.quality || cfg.bframes > 0);
+         let assembly_capacity = bs[0].size.checked_mul(2).and_then(|n| n.checked_add(65536))
+             .ok_or_else(|| VideoError::NoMemory("encoder assembly size overflow".into()))?;
+@@ -484,6 +486,11 @@ impl Encoder {
+         conversion_scratch.try_reserve_exact(up(w * 2,64) * 48)
+             .map_err(|e|VideoError::NoMemory(e.to_string()))?;
+         conversion_scratch.resize(up(w * 2,64) * 48,0);
++        let mut av1_hid=Vec::new();
++        if av1 && c.bframes>0 {
++            av1_hid.try_reserve_exact(bs[0].size+65536)
++                .map_err(|e|VideoError::NoMemory(e.to_string()))?;
++        }
+         Ok(Self {
+             chan,
+             ingest: None,
+@@ -539,11 +546,7 @@ impl Encoder {
+             conversion_scratch,
+             #[cfg(test)]
+             completion_fault: 0,
+-            av1_hid: if av1 {
+-                Vec::with_capacity(bs_capacity(mbs))
+-            } else {
+-                Vec::new()
+-            },
++            av1_hid,
+             av1_hid_slot: 0,
+             av1_hid_disp: -1,
+             av1_last_shown: -1,
+@@ -942,9 +945,6 @@ impl Encoder {
+         Ok(())
+     }
+ }
+-fn bs_capacity(mbs: usize) -> usize {
+-    up(mbs * 384 + (1 << 20), 65536) + 4096
+-}
+ fn tile_widened(dst: &mut [u8], src: &[u8], stride: usize, w: usize, h: usize, pitch: usize) {
+     for r in 0..h {
+         for c in 0..w {
+@@ -2266,7 +2266,8 @@ impl Encoder {
+             *tile = off.checked_add(size).and_then(|end| bs.get(off..end))
+                 .ok_or(EncError::Av1TileRange { tile: i, offset: off, bytes: size, capacity: bs.len() })?;
+         }
+-        let required = tiles[..nt].iter().try_fold(self.av1_hid.len() + 65536usize,
++        let prefix=if fp.hidden {0}else{self.av1_hid.len()};
++        let required = tiles[..nt].iter().try_fold(prefix + 65536usize,
+             |sum, tile| sum.checked_add(tile.len())).ok_or(EncError::OutputAssemblyCapacity)?;
+         if out.capacity() < required || (fp.hidden && self.av1_hid.capacity() < required) {
+             return Err(EncError::OutputAssemblyCapacity);
+diff --git a/nvidia-prolapse/driver-source/native/src/video/enc/error.rs b/nvidia-prolapse/driver-source/native/src/video/enc/error.rs
+index caf3ee5..21a2ddc 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/enc/error.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/enc/error.rs
+@@ -6,9 +6,11 @@ pub enum EncError {
+     InvalidInputPlane { plane: usize, reason: &'static str },
+     InputSlotsBusy,
+     InvalidUpdate { field: &'static str },
++    InvalidConfig { field: &'static str },
++    UnsupportedConfig { feature: &'static str },
+     DeviceOpen { source: VideoError },
+-    ChannelSubmit { source: VideoError },
+-    Completion { ticket: u32, source: VideoError },
++    ResourceInit { resource: &'static str, source: VideoError },
++    ChannelInit { stage: &'static str, source: VideoError },
+     ChannelOperation { stage: &'static str, source: VideoError },
+     PutReadbackMismatch { expected: u32, observed: u32 },
+     ChannelTimeout { ticket: u64 },
+@@ -40,6 +42,14 @@ impl std::fmt::Display for EncError {
+ impl std::error::Error for EncError {}
+ impl From<EncError> for VideoError {
+     fn from(e: EncError) -> Self {
+-        if e.recoverable() { Self::Invalid(e.to_string()) } else { Self::DeviceLost(e.to_string()) }
++        match e {
++            EncError::UnsupportedConfig {feature} => Self::Unsupported(feature.into()),
++            EncError::ResourceInit {source:VideoError::NoMemory(message),..} => Self::NoMemory(message),
++            _ if e.recoverable() => Self::Invalid(e.to_string()),
++            _ => Self::DeviceLost(e.to_string()),
++        }
+     }
+ }
++impl From<VideoError> for EncError {
++    fn from(source:VideoError)->Self {Self::ResourceInit {resource:"encoder allocation/mapping",source}}
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/video/ffi_enc.rs b/nvidia-prolapse/driver-source/native/src/video/ffi_enc.rs
+index 20e7154..8b81783 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/ffi_enc.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/ffi_enc.rs
+@@ -143,10 +143,11 @@ unsafe extern "C" fn nv_venc_sess_create(c: *const NvVencSessCfg, out: *mut *mut
+     unsafe { *out = ptr::null_mut(); }
+     let status = pure(|| {
+         let c = unsafe { c.as_ref() }.ok_or(invalid("null config"))?;
+-        let cfg=config(c)?;
+-        let encoder=Encoder::open_on(&cfg, if c.pci_present!=0 {
+-            Some([c.pci_domain,c.pci_bus,c.pci_device,c.pci_function]) } else {None})
+-            .map_err(|source| EncError::DeviceOpen {source})?;
++        let cfg=config(c).map_err(|e|match e {
++            EncError::InvalidUpdate {field}=>EncError::InvalidConfig {field},other=>other,
++        })?;
++        let encoder=Encoder::open_checked(&cfg, if c.pci_present!=0 {
++            Some([c.pci_domain,c.pci_bus,c.pci_device,c.pci_function]) } else {None})?;
+         let mut config=Vec::new();
+         config.try_reserve_exact(65536).map_err(|_| EncError::OutputAssemblyCapacity)?;
+         if c.codec==2 { encoder.av1_config(&mut config); } else { encoder.headers(&mut config); }
+diff --git a/nvidia-prolapse/media/c2/NvC2Encoder.cpp b/nvidia-prolapse/media/c2/NvC2Encoder.cpp
+index e5d68c9..accb992 100644
+--- a/nvidia-prolapse/media/c2/NvC2Encoder.cpp
++++ b/nvidia-prolapse/media/c2/NvC2Encoder.cpp
+@@ -341,8 +341,11 @@ public:
+                : mBitrateMode->value == C2Config::BITRATE_IGNORE ? EncoderConfig::CONST_QP
+                                                                   : EncoderConfig::VBR;
+         c.bitrate = mBitrate->value;
+-        c.fps = fps();
+-        c.idr_period = idrPeriod();
++        const double rate = mFrameRate->value;
++        uint64_t bits;
++        memcpy(&bits, &rate, sizeof(bits));
++        c.fps = 0;
++        nv_venc_c2_timing(bits, mSyncFramePeriod->value, &c.fps, &c.idr_period);
+         if (mCodec == NV_VIDEO_CODEC_H264) {
+             switch (mProfileLevel->profile) {
+             case C2Config::PROFILE_AVC_MAIN: c.h264_profile = 77; break;
+@@ -361,25 +364,6 @@ public:
+         c.matrix = h273_matrix(mCodedColorAspects->matrix);
+         return c;
+     }
+-    uint32_t fps() const {
+-        const double rate = mFrameRate->value;
+-        uint64_t bits;
+-        memcpy(&bits, &rate, sizeof(bits));
+-        uint32_t f = 0, period = 0;
+-        nv_venc_c2_timing(bits, mSyncFramePeriod->value, &f, &period);
+-        return f;
+-    }
+-    uint32_t bitrate() const { return mBitrate->value; }
+-    /* pictures between sync frames: 0 = only the first (negative interval), 1 = every picture (interval 0) */
+-    uint32_t idrPeriod() const
+-    {
+-        const double rate = mFrameRate->value;
+-        uint64_t bits;
+-        memcpy(&bits, &rate, sizeof(bits));
+-        uint32_t f = 0, period = 0;
+-        nv_venc_c2_timing(bits, mSyncFramePeriod->value, &f, &period);
+-        return period;
+-    }
+     bool prependHeaders() const { return mPrependHeader->value == C2Config::PREPEND_HEADER_TO_ALL_SYNC; }
+     bool syncRequested() const { return mRequestSync->value; }
+     /* the getters above read the parameters: call them under lock() */
+-- 
+2.56.0
+

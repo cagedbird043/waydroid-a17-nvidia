@@ -1,0 +1,40 @@
+From 4d8b06d5a2e336fba75733ef307e7e0c36e5f2a5 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Wed, 28 Oct 2026 00:16:15 +0800
+Subject: [PATCH 42/43] =?utf-8?q?=E6=8C=89=20C2=20=E5=AE=9E=E9=99=85?=
+ =?utf-8?q?=E6=A0=B9=E5=B9=B3=E9=9D=A2=E5=81=8F=E7=A7=BB=E6=8E=A5=E5=8F=97?=
+ =?utf-8?q?=20BGRX?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ nvidia-prolapse/driver-source/native/src/video/ffi_enc.rs | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/nvidia-prolapse/driver-source/native/src/video/ffi_enc.rs b/nvidia-prolapse/driver-source/native/src/video/ffi_enc.rs
+index 8b81783..8927504 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/ffi_enc.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/ffi_enc.rs
+@@ -254,9 +254,6 @@ fn input(v:&NvVencC2View,w:u32,h:u32)->Result<(u32,[NvVencPlane;3]),EncError> {
+         let slot=&mut roots[p.root_index as usize];
+         if slot.is_some_and(|old|old!=root) {return Err(invalid("root relation"));}
+         *slot=Some(root);
+-        let root_plane=&ps[p.root_index as usize];
+-        if root_plane.root_offset!=0 || root_plane.root_index!=p.root_index
+-            || root_plane.data as usize!=root {return Err(invalid("root descriptor"));}
+     }
+     if roots.iter().filter(|r|r.is_some()).count()!=v.root_planes as usize {
+         return Err(invalid("root plane count"));
+@@ -375,7 +372,7 @@ mod tests {
+                     v.planes[i].data=(0x20000+v.planes[i].root_offset as usize) as *const u8;}
+             }
+         } else {
+-            let root=if format==3 {0}else{2};
++            let root=0;
+             let offsets=if format==3 {[0,1,2,3]}else{[2,1,0,3]};
+             for (i,off) in offsets.into_iter().enumerate() {
+                 v.planes[i].root_index=root;v.planes[i].root_offset=off;
+-- 
+2.56.0
+

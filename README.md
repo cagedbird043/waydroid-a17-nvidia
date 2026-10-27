@@ -41,6 +41,9 @@ KDE window.
 | 🔓 | **Root** | KernelSU on the host kernel, with modules (Zygisk Next, LSPosed and friends). |
 | 🛒 | **Google apps** | Use ATV's GAPPS system image; Play Store is certified. |
 
+The hardware encoding core is now Rust, with the same H.264/HEVC/AV1 support and encoding performance within 10% of
+the previous core in our 720p tests. The Codec2 sandbox policy now permits its logging socket, including cold starts.
+
 ### 📸 Screenshots
 
 | Chrome: everything hardware accelerated | YouTube on NVDEC |
@@ -154,6 +157,9 @@ Waydroid 里的 LineageOS 24.0（Android 17），显卡、视频引擎、root �
 | 🖱️ | **鼠标当触摸** | 在不认鼠标拖动的应用（Play 商店等 Compose 界面）里，拖动变成手指滑动。 |
 | 🔓 | **Root** | 宿主内核上的 KernelSU，支持模块（Zygisk Next、LSPosed 等）。 |
 | 🛒 | **Google 应用** | 用 ATV 的 GAPPS system 镜像，Play 商店已认证。 |
+
+硬件编码核心现已 Rust 化，继续支持 H.264/HEVC/AV1；本机 720p 实测编码性能与原核心相差不超过 10%。
+同时补齐 Codec2 沙箱的日志套接字权限，覆盖服务冷启动。
 
 ### 📸 截图
 

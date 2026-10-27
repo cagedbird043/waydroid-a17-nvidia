@@ -1,0 +1,224 @@
+From 4b022bc65d8ead132d86d4d90cd7b3518d613744 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Tue, 27 Oct 2026 23:40:46 +0800
+Subject: [PATCH 38/43] =?utf-8?q?=E9=98=B6=E6=AE=B5=E9=9B=B6=EF=BC=9A?=
+ =?utf-8?q?=E8=AE=B0=E5=BD=95C=E7=BC=96=E7=A0=81=E8=80=97=E6=97=B6?=
+ =?utf-8?q?=E5=9F=BA=E7=BA=BF=E5=B9=B6=E5=A2=9E=E5=8A=A0=E5=AE=A2=E6=88=B7?=
+ =?utf-8?q?=E7=AB=AF=E7=94=9F=E5=91=BD=E5=91=A8=E6=9C=9F=E6=B5=8B=E8=AF=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ nvidia-prolapse/media/test/c2_smoke.cpp     | 60 +++++++++++++++++++++
+ nvidia-prolapse/media/test/enc-benchmark.py | 49 +++++++++++++++++
+ nvidia-prolapse/media/test/enc_bench.c      | 54 +++++++++++++++++++
+ 3 files changed, 163 insertions(+)
+ create mode 100755 nvidia-prolapse/media/test/enc-benchmark.py
+ create mode 100644 nvidia-prolapse/media/test/enc_bench.c
+
+diff --git a/nvidia-prolapse/media/test/c2_smoke.cpp b/nvidia-prolapse/media/test/c2_smoke.cpp
+index f113f2e..37cf6dd 100644
+--- a/nvidia-prolapse/media/test/c2_smoke.cpp
++++ b/nvidia-prolapse/media/test/c2_smoke.cpp
+@@ -86,10 +86,59 @@ int main(int argc, char **argv)
+         fprintf(stderr, "start failed\n");
+         return 2;
+     }
++    const char *mode = argc > 3 ? argv[3] : "normal";
++    if (!strcmp(mode, "destroy")) {
++        ssize_t slot = AMediaCodec_dequeueInputBuffer(codec, 100000);
++        if (slot < 0) return 3;
++        size_t capacity = 0;
++        uint8_t *data = AMediaCodec_getInputBuffer(codec, slot, &capacity);
++        ssize_t size = AMediaExtractor_readSampleData(ex, data, capacity);
++        if (size <= 0 || AMediaCodec_queueInputBuffer(codec, slot, 0, size, 0, 0) != AMEDIA_OK) return 3;
++        if (AMediaCodec_stop(codec) != AMEDIA_OK || AMediaCodec_delete(codec) != AMEDIA_OK) return 3;
++        AMediaFormat_delete(fmt);
++        AMediaExtractor_delete(ex);
++        close(fd);
++        puts("destroy: OK (queued work)");
++        return 0;
++    } else if (!strcmp(mode, "error")) {
++        ssize_t slot = AMediaCodec_dequeueInputBuffer(codec, 100000);
++        if (slot < 0) return 3;
++        size_t capacity = 0;
++        uint8_t *data = AMediaCodec_getInputBuffer(codec, slot, &capacity);
++        if (!data || capacity < 128) return 3;
++        memset(data, 0xff, 128); // No start code/NAL: exercise the service's malformed-bitstream path.
++        media_status_t status = AMediaCodec_queueInputBuffer(codec, slot, 0, 128, 0,
++                                                            AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
++        bool rejected = status != AMEDIA_OK;
++        bool eos = false;
++        size_t pictures = 0;
++        for (int guard = 0; !rejected && !eos && guard < 100; guard++) {
++            AMediaCodecBufferInfo result = {};
++            ssize_t output = AMediaCodec_dequeueOutputBuffer(codec, &result, 20000);
++            if (output >= 0) {
++                if (result.size > 0) pictures++;
++                eos = (result.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0;
++                AMediaCodec_releaseOutputBuffer(codec, output, false);
++            } else if (output != AMEDIACODEC_INFO_TRY_AGAIN_LATER &&
++                       output != AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED &&
++                       output != AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) {
++                status = static_cast<media_status_t>(output);
++                rejected = true;
++            }
++        }
++        AMediaCodec_stop(codec);
++        AMediaCodec_delete(codec);
++        AMediaFormat_delete(fmt);
++        AMediaExtractor_delete(ex);
++        close(fd);
++        printf("error: rejected malformed bitstream, status=%d, eos=%d, pictures=%zu\n", status, eos, pictures);
++        return (rejected || eos) && pictures == 0 ? 0 : 3;
++    }
+ 
+     AMediaCodecBufferInfo info;
+     size_t frames = 0, bad = 0, input_done = 0;
+     bool eos_queued = false;
++    bool flushed = false;
+     for (int guard = 0; guard < 10000; guard++) {
+         if (!input_done) {
+             ssize_t in = AMediaCodec_dequeueInputBuffer(codec, 10000);
+@@ -116,11 +165,22 @@ int main(int argc, char **argv)
+                  * writes YV12/P010 into it. Its size must cover the display window. */
+                 size_t cap = 0;
+                 uint8_t *data = AMediaCodec_getOutputBuffer(codec, (size_t)out, &cap);
++                // Negative-test hook: exercise the same null-buffer invariant as a broken codec.
++                if (!strcmp(mode, "bad-buffer") && frames == 0) data = nullptr;
+                 if (!data || (size_t)info.size < (size_t)w * h * 3 / 2)
+                     bad++;
+                 frames++;
+             }
+             AMediaCodec_releaseOutputBuffer(codec, (size_t)out, false);
++            if (!strcmp(mode, "flush") && !flushed && frames >= 15) {
++                if (AMediaCodec_flush(codec) != AMEDIA_OK) return 3;
++                AMediaExtractor_seekTo(ex, 0, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
++                frames = bad = input_done = 0;
++                eos_queued = false;
++                flushed = true;
++                puts("flush: OK");
++                continue;
++            }
+             if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
+                 break;
+         } else if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+diff --git a/nvidia-prolapse/media/test/enc-benchmark.py b/nvidia-prolapse/media/test/enc-benchmark.py
+new file mode 100755
+index 0000000..75e8691
+--- /dev/null
++++ b/nvidia-prolapse/media/test/enc-benchmark.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""C encoder baseline: 330 input frames, discard 30, 5 alternating-order repetitions."""
++import argparse
++import csv
++import hashlib
++import json
++import math
++import pathlib
++import statistics
++import subprocess
++
++p = argparse.ArgumentParser()
++p.add_argument('out', type=pathlib.Path)
++a = p.parse_args()
++m = pathlib.Path(__file__).resolve().parents[1]
++native = m.parent / 'driver-source/native'
++lib = native / 'target/release'
++a.out.mkdir(parents=True, exist_ok=True)
++
++def command(args, log):
++    with (a.out / log).open('w') as f:
++        subprocess.run(args, cwd=m, stdout=f, stderr=subprocess.STDOUT, check=True)
++
++command(['make', 'nvenc-test', f'NV_VIDEO_LIB=-L{lib} -lnv_bionic_native -Wl,-rpath,{lib}'], 'build.log')
++binary = a.out.resolve() / 'enc_bench'
++command(['gcc', '-std=gnu11', '-O2', '-Icore/nvenc', '-Icore/nvenc/mickys', '-Icore/nvenc/include', '-Icore/nvenc/include/sdk', 'test/enc_bench.c', *map(str, sorted((m / 'out/host/enc').rglob('*.o'))), f'-L{lib}', '-lnv_bionic_native', f'-Wl,-rpath,{lib}', '-lm', '-o', str(binary)], 'bench-build.log')
++input_path = a.out.resolve() / 'input.nv12'
++command(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=30', '-frames:v', '330', '-pix_fmt', 'nv12', '-f', 'rawvideo', '-y', str(input_path)], 'input-generation.log')
++runs = []
++for repeat in range(5):
++    cases = [(codec, rc) for codec in range(3) for rc in (0, 2)]
++    if repeat % 2: cases.reverse()
++    for codec, rc in cases:
++        ident = f'c-{codec}-{rc}-{repeat}'
++        with (a.out / (ident + '.csv')).open('w') as stdout, (a.out / (ident + '.log')).open('w') as stderr:
++            r = subprocess.run([str(binary), str(codec), str(rc), str(input_path)], stdout=stdout, stderr=stderr)
++        runs.append({'id': ident, 'exit': r.returncode})
++        (a.out / 'runs.json').write_text(json.dumps(runs, indent=2))
++        if r.returncode: raise SystemExit(r.returncode)
++summary = {}
++for codec in range(3):
++    for rc in (0, 2):
++        samples = [list(csv.DictReader((a.out / f'c-{codec}-{rc}-{repeat}.csv').open())) for repeat in range(5)]
++        assert all(len(s) == 300 for s in samples)
++        summary[f'{codec}-{rc}'] = {key: {'median': statistics.median(statistics.median(float(row[key]) for row in sample) for sample in samples), 'p95': sorted(float(row[key]) for sample in samples for row in sample)[math.ceil(.95 * 1500) - 1]} for key in ('engine_ms', 'total_ms')}
++(a.out / 'statistics.json').write_text(json.dumps(summary, indent=2))
++(a.out / 'input.sha256').write_text(hashlib.file_digest(input_path.open('rb'), 'sha256').hexdigest() + '\n')
++input_path.unlink()
++print(json.dumps(summary, indent=2))
+diff --git a/nvidia-prolapse/media/test/enc_bench.c b/nvidia-prolapse/media/test/enc_bench.c
+new file mode 100644
+index 0000000..d5ede66
+--- /dev/null
++++ b/nvidia-prolapse/media/test/enc_bench.c
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: MIT
++ * Timed C baseline: enc_bench CODEC RC INPUT_NV12.
++ * Input is fully resident before open; CSV is emitted only after close.
++ * Engine time is EncFrame.ms, including submission/wait, not GPU-only time.
++ */
++#define _POSIX_C_SOURCE 200809L
++#include "enc.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++
++static double now(void)
++{
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
++}
++
++int main(int argc, char **argv)
++{
++    if (argc != 4) return 2;
++    EncConfig cfg = {
++        .codec = atoi(argv[1]), .width = 1280, .height = 720,
++        .qp_i = 26, .qp_p = 28, .num_refs = 1, .fps = 30,
++        .h264_profile = 100, .cabac = true, .rc_mode = atoi(argv[2]),
++    };
++    if (cfg.codec == ENC_AV1) { cfg.qp_i = 90; cfg.qp_p = 110; }
++    if (cfg.rc_mode) cfg.bitrate = 4000000;
++    const size_t frame = 1280 * 720 * 3 / 2, bytes = frame * 330;
++    unsigned char *input = malloc(bytes);
++    FILE *f = fopen(argv[3], "rb");
++    if (!input || !f || fread(input, 1, bytes, f) != bytes) return 3;
++    fclose(f);
++    double engine[330], total[330];
++    size_t sizes[330];
++    Enc e;
++    if (enc_open(&e, &cfg)) return 4;
++    for (int n = 0; n < 330; n++) {
++        EncFrame fr;
++        unsigned char *p = input + frame * n;
++        double t = now();
++        enc_load_nv12(&e, p, 1280, p + 1280 * 720, 1280);
++        if (enc_encode(&e, false, &fr)) { enc_close(&e); return 5; }
++        total[n] = now() - t;
++        engine[n] = fr.ms;
++        sizes[n] = fr.size;
++    }
++    enc_close(&e);
++    free(input);
++    puts("frame,engine_ms,total_ms,bytes");
++    for (int n = 30; n < 330; n++)
++        printf("%d,%.9f,%.9f,%zu\n", n, engine[n], total[n], sizes[n]);
++    return 0;
++}
+-- 
+2.56.0
+

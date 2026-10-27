@@ -1,6 +1,6 @@
 {
-  "path": "nvidia/build/native-a17-rm1027",
-  "build_record_sha256": "bb44c2b3d7ad00779ec1bbcff0f223fe0b03ec93897bf1fc6d8d95e9393be584",
-  "release": "v0.2.0-rc11-a17-rm1027",
-  "nvk_commit": "f68c50229411c3fcf9ede453d0ea8a51a693f624"
+  "path": "nvidia/build/native-a17-c2rust1",
+  "build_record_sha256": "abd99df6e106b405df8ac4e1d4ff3226e570d7f11355d1ce91963a61f9abd326",
+  "release": "v0.2.0-rc11-a17-c2rust1",
+  "nvk_commit": "96f3e220e3896e56bc0704a4d810083f70e7ee93"
 }

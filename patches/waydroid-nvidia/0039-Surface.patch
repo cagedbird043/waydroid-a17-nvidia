@@ -1,0 +1,173 @@
+From 783743bcae3e0f3f87f50eccf2a8a0617275c444 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Tue, 27 Oct 2026 23:50:31 +0800
+Subject: [PATCH 39/43] =?utf-8?q?=E8=A1=A5=E9=BD=90=E6=97=A5=E5=BF=97?=
+ =?utf-8?q?=E5=A5=97=E6=8E=A5=E5=AD=97=E7=AD=96=E7=95=A5=E5=B9=B6=E5=A2=9E?=
+ =?utf-8?q?=E5=8A=A0=20Surface=20=E8=A7=A3=E7=A0=81=E5=9B=9E=E5=BD=92?=
+ =?utf-8?q?=E5=AE=A2=E6=88=B7=E7=AB=AF?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ nvidia-prolapse/media/Makefile                |   7 ++
+ ...id.hardware.media.c2@1.2-nvprolapse.policy |   7 ++
+ .../media/test/c2_surface_smoke.cpp           | 112 ++++++++++++++++++
+ 3 files changed, 126 insertions(+)
+ create mode 100644 nvidia-prolapse/media/test/c2_surface_smoke.cpp
+
+diff --git a/nvidia-prolapse/media/Makefile b/nvidia-prolapse/media/Makefile
+index 1abdc4f..e6e1cd3 100644
+--- a/nvidia-prolapse/media/Makefile
++++ b/nvidia-prolapse/media/Makefile
+@@ -123,6 +123,13 @@ out/android/c2_enc_smoke: test/c2_enc_smoke.cpp Makefile
+ 	@mkdir -p $(@D)
+ 	$(NDK_CXX) -std=c++17 -O2 -Wall -Wextra -Werror -static-libstdc++ -o $@ test/c2_enc_smoke.cpp -lmediandk -llog
+ 
++# Surface-output NDK client (AImageReader PRIVATE buffers).
++.PHONY: c2-surface-smoke
++c2-surface-smoke: out/android/c2_surface_smoke
++out/android/c2_surface_smoke: test/c2_surface_smoke.cpp Makefile
++	@mkdir -p $(@D)
++	$(NDK_CXX) -std=c++17 -O2 -Wall -Wextra -Werror -static-libstdc++ -o $@ $< -lmediandk -landroid -llog
++
+ android: out/android/libnvc2_core.a
+ out/android/libnvc2_core.a: $(CORE) $(HDRS) Makefile
+ 	@mkdir -p $(@D)/obj
+diff --git a/nvidia-prolapse/media/odm/etc/seccomp_policy/android.hardware.media.c2@1.2-nvprolapse.policy b/nvidia-prolapse/media/odm/etc/seccomp_policy/android.hardware.media.c2@1.2-nvprolapse.policy
+index 4dd1685..4cbb8f1 100644
+--- a/nvidia-prolapse/media/odm/etc/seccomp_policy/android.hardware.media.c2@1.2-nvprolapse.policy
++++ b/nvidia-prolapse/media/odm/etc/seccomp_policy/android.hardware.media.c2@1.2-nvprolapse.policy
+@@ -83,4 +83,11 @@ dup3: 1
+ rt_sigprocmask: 1
+ sched_getaffinity: 1
+ 
++# Android liblog opens/reconnects /dev/socket/logdw after filter installation.
++# minijail's generated Android x86_64 libconstants.c defines these constants;
++# util.c parse_constant accepts pipe-separated constant expressions.
++socket: arg0 == AF_UNIX && arg1 == SOCK_DGRAM && arg2 == 0 || arg0 == AF_UNIX && arg1 == SOCK_DGRAM|SOCK_CLOEXEC && arg2 == 0 || arg0 == AF_UNIX && arg1 == SOCK_DGRAM|SOCK_NONBLOCK && arg2 == 0 || arg0 == AF_UNIX && arg1 == SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK && arg2 == 0
++# seccomp cannot dereference sockaddr; the peer path is not filterable here.
++connect: 1
++
+ @include /system/etc/seccomp_policy/crash_dump.x86_64.policy
+diff --git a/nvidia-prolapse/media/test/c2_surface_smoke.cpp b/nvidia-prolapse/media/test/c2_surface_smoke.cpp
+new file mode 100644
+index 0000000..c4c0dc1
+--- /dev/null
++++ b/nvidia-prolapse/media/test/c2_surface_smoke.cpp
+@@ -0,0 +1,112 @@
++/* SPDX-License-Identifier: MIT
++ * Surface-output MediaCodec regression. Every rendered frame must be acquired
++ * and released before the next output, keeping the four-slot reader bounded.
++ */
++#include <cstdio>
++#include <cstring>
++#include <chrono>
++#include <thread>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <media/NdkMediaCodec.h>
++#include <media/NdkMediaExtractor.h>
++#include <media/NdkImageReader.h>
++
++int main(int argc, char **argv) {
++    if (argc != 3) { fprintf(stderr, "usage: c2_surface_smoke input.mp4 component\n"); return 2; }
++    int rc = 1, fd = -1;
++    AMediaExtractor *ex = AMediaExtractor_new();
++    AMediaFormat *fmt = nullptr;
++    AMediaCodec *codec = nullptr;
++    AImageReader *reader = nullptr;
++    bool started = false, sent_eos = false, got_eos = false;
++    size_t inputs = 0, outputs = 0, images = 0;
++    auto run = [&]() -> bool {
++        struct stat st{};
++        fd = open(argv[1], O_RDONLY | O_CLOEXEC);
++        if (fd < 0 || fstat(fd, &st) || !ex ||
++            AMediaExtractor_setDataSourceFd(ex, fd, 0, st.st_size) != AMEDIA_OK) return false;
++        for (size_t i = 0; i < AMediaExtractor_getTrackCount(ex); ++i) {
++            auto *f = AMediaExtractor_getTrackFormat(ex, i);
++            const char *mime = nullptr;
++            if (AMediaFormat_getString(f, AMEDIAFORMAT_KEY_MIME, &mime) && !strncmp(mime, "video/", 6)) {
++                fmt = f;
++                if (AMediaExtractor_selectTrack(ex, i) != AMEDIA_OK) return false;
++                break;
++            }
++            AMediaFormat_delete(f);
++        }
++        int32_t w = 0, h = 0;
++        if (!fmt || !AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_WIDTH, &w) ||
++            !AMediaFormat_getInt32(fmt, AMEDIAFORMAT_KEY_HEIGHT, &h) || w <= 0 || h <= 0) return false;
++        if (AImageReader_new(w, h, AIMAGE_FORMAT_PRIVATE, 4, &reader) != AMEDIA_OK) return false;
++        ANativeWindow *window = nullptr;
++        if (AImageReader_getWindow(reader, &window) != AMEDIA_OK) return false;
++        codec = AMediaCodec_createCodecByName(argv[2]);
++        char *name = nullptr;
++        if (!codec || AMediaCodec_getName(codec, &name) != AMEDIA_OK) return false;
++        bool same = !strcmp(name, argv[2]);
++        printf("component=%s requested=%s\n", name, argv[2]);
++        AMediaCodec_releaseName(codec, name);
++        if (!same || AMediaCodec_configure(codec, fmt, window, nullptr, 0) != AMEDIA_OK ||
++            AMediaCodec_start(codec) != AMEDIA_OK) return false;
++        started = true;
++        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
++        while (!got_eos && std::chrono::steady_clock::now() < deadline) {
++            if (!sent_eos) {
++                ssize_t in = AMediaCodec_dequeueInputBuffer(codec, 1000);
++                if (in >= 0) {
++                    size_t cap = 0;
++                    auto *buf = AMediaCodec_getInputBuffer(codec, in, &cap);
++                    if (!buf) return false;
++                    ssize_t n = AMediaExtractor_readSampleData(ex, buf, cap);
++                    uint32_t flags = n < 0 ? AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM : 0;
++                    if (n >= 0 && static_cast<size_t>(n) > cap) return false;
++                    if (AMediaCodec_queueInputBuffer(codec, in, 0, n < 0 ? 0 : n,
++                            n < 0 ? 0 : AMediaExtractor_getSampleTime(ex), flags) != AMEDIA_OK) return false;
++                    if (n < 0) sent_eos = true;
++                    else { ++inputs; AMediaExtractor_advance(ex); }
++                } else if (in != AMEDIACODEC_INFO_TRY_AGAIN_LATER) return false;
++            }
++            AMediaCodecBufferInfo info{};
++            ssize_t out = AMediaCodec_dequeueOutputBuffer(codec, &info, 1000);
++            if (out >= 0) {
++                bool frame = info.size > 0 && !(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG);
++                if (AMediaCodec_releaseOutputBuffer(codec, out, frame) != AMEDIA_OK) return false;
++                if (frame) {
++                    ++outputs;
++                    AImage *image = nullptr;
++                    auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++                    media_status_t status;
++                    do {
++                        status = AImageReader_acquireNextImage(reader, &image);
++                        if (status == AMEDIA_OK) break;
++                        if (status != AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE) return false;
++                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++                    } while (std::chrono::steady_clock::now() < until);
++                    if (!image) return false;
++                    ++images;
++                    AImage_delete(image);
++                }
++                got_eos = info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM;
++            } else if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
++                auto *f = AMediaCodec_getOutputFormat(codec);
++                if (!f) return false;
++                AMediaFormat_delete(f);
++            } else if (out != AMEDIACODEC_INFO_TRY_AGAIN_LATER &&
++                       out != AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) return false;
++        }
++        return inputs == 60 && outputs == 60 && images == 60 && sent_eos && got_eos;
++    };
++    if (run()) rc = 0;
++    if (started && AMediaCodec_stop(codec) != AMEDIA_OK) rc = 1;
++    if (codec && AMediaCodec_delete(codec) != AMEDIA_OK) rc = 1;
++    if (reader) AImageReader_delete(reader);
++    if (fmt) AMediaFormat_delete(fmt);
++    if (ex) AMediaExtractor_delete(ex);
++    if (fd >= 0) close(fd);
++    printf("%s: %zu input, %zu output, %zu images, EOS=%d, errors=%d, destroyed=1\n",
++           argv[2], inputs, outputs, images, got_eos, rc != 0);
++    return rc;
++}
+-- 
+2.56.0
+

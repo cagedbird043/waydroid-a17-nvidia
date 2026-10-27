@@ -2,10 +2,12 @@
 
 当前状态、测试结果和移植记录见 `reports/porting.md`；构建、测试、发版流程见 `.agents/skills/`。
 
-## 现状（2026-10-25）
+## 现状（2026-10-28）
 
 - system：ATV LineageOS 24.0 GAPPS 版 `20261017`，Play 商店已认证。
 - vendor：自编 nvidia-prolapse；ANGLE → NVK，HWUI skiavk，NVDEC 硬解，NVENC 硬编（H.264/HEVC/AV1，Chrome WebCodecs 与 WebRTC 已实测）。
+- Codec2 编码核心使用 Rust，五种输入格式与 H.264/HEVC/AV1 已验证；能力枚举与 XML 使用同一快照，组件列表保持 4 解码 + 3 编码。
+- Codec2 seccomp 策略补齐日志 socket/connect 权限；冷启动与稳态 syscall 按实参核对，Surface 解码与网页编码有独立回归门禁。
 - 多窗口（`persist.waydroid.multi_windows=true`）：freeform 卡片 + 带 KDE 边框的桌面窗口。
 - 宿主输入法：text-input-v3 → `WaydroidHostIme`。
 - 剪贴板：ext-data-control，主机复制经输入法推送进 Android；主机侧 Python 剪贴板服务已删除。
