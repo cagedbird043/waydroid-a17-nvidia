@@ -57,18 +57,29 @@ async function rtc(mime) {
   await new Promise((res) => setTimeout(res, 8000));
   const r = { mime };
   for (const s of (await a.getStats()).values()) if (s.type === 'outbound-rtp')
-    Object.assign(r, { encoded: s.framesEncoded, size: `${s.frameWidth}x${s.frameHeight}`, fps: s.framesPerSecond,
+    Object.assign(r, { encoded: s.framesEncoded, width: s.frameWidth, height: s.frameHeight, size: `${s.frameWidth}x${s.frameHeight}`, fps: s.framesPerSecond,
                        kbps: Math.round(s.bytesSent * 8 / 8000), limit: s.qualityLimitationReason });
   for (const s of (await b.getStats()).values()) if (s.type === 'inbound-rtp') r.decoded = s.framesDecoded;
   a.close(); b.close(); stream.getTracks().forEach((t) => t.stop());
   return r;
 }
 
+const run = new URLSearchParams(location.search).get('run');
+async function report(path, data) {
+  const response = await fetch(path, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({run, ...data}) });
+  if (!response.ok) throw new Error(await response.text());
+}
+async function test(id, kind, value, fn) {
+  await report('/case/start', {id}); // Host acknowledges a fresh logcat window before the encoder opens.
+  const result = await fn(value).catch(e => ({error: String(e)}));
+  await report('/case/result', {id, kind, result});
+  log(id + ' ' + JSON.stringify(result));
+}
 (async () => {
-  for (const c of ['avc1.42001f', 'avc1.640028', 'hvc1.1.6.L93.B0', 'av01.0.04M.08'])
-    log('webcodecs ' + JSON.stringify(await webcodecs(c).catch((e) => ({ codec: c, error: String(e) }))));
-  for (const m of ['video/H264', 'video/H265', 'video/AV1'])
-    log('webrtc ' + JSON.stringify(await rtc(m).catch((e) => ({ mime: m, error: String(e) }))));
+  const codecs = ['avc1.42001f', 'avc1.640028', 'hvc1.1.6.L93.B0', 'av01.0.04M.08'];
+  for (let i = 0; i < codecs.length; i++) await test('wc-' + i, 'webcodecs', codecs[i], webcodecs);
+  const mimes = ['video/H264', 'video/H265', 'video/AV1'];
+  for (let i = 0; i < mimes.length; i++) await test('rtc-' + i, 'webrtc', mimes[i], rtc);
   log('DONE');
-})();
+})().catch(e => log('FAILED: ' + String(e)));
 </script>

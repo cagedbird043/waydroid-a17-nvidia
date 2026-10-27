@@ -32,20 +32,33 @@ $T/guest.sh 'logcat -d -s nvc2 nvc2-enc | tail'   # root shell 进容器
 
 ```bash
 make -C "$WS/nvidia/waydroid-nvidia/nvidia-prolapse/media" c2-smoke c2-enc-smoke   # 首次
-$T/codec-smoke.sh
+CODEC_SMOKE_OUT=/tmp/codec-evidence $T/codec-smoke.sh
 ```
 
 期望：四种解码各 60 帧、0 bad buffers；三种编码各 60 进 60 出，宿主 FFmpeg 解码 0 错误（H.264 为 Constrained Baseline）。
 编码器开关 `persist.waydroid.nvidia_video_encode`、解码器开关 `persist.waydroid.nvidia_video_decode`（`waydroid prop set`）。
+脚本按组件名创建解码器，保留每个客户端及 FFmpeg/ffprobe 退出码，严格要求四解码各 60 帧/0 坏缓冲、三编码各 60 入/60 出、宿主 ffprobe 各 60 帧且 FFmpeg 无错误。另跑运行中 flush 后完整重播、有未完成工作时销毁、128 字节 0xff 坏码流输入（须零图像，收到 EOS 或明确错误）。反向门禁：`CODEC_SMOKE_FAULT=client-failure|wrong-name|truncated|bad-buffer`（逐一运行，均应非零；bad-buffer 为客户端首张图像的空缓冲故障注入）。输出目录保留原始日志与退出码。宿主 C 编码计时用 `M/test/enc-benchmark.py OUT`，330 帧去前 30、五次交替顺序，生成逐帧 CSV 与统计 JSON。
+
+### Surface 与 seccomp 窗口
+
+```bash
+$T/surface-smoke.sh "$WS/reports/codec2-rust/phase0/surface/run"
+CODEC_SMOKE_OUT="$WS/reports/codec2-rust/phase0/seccomp/run/clients" \
+  $T/seccomp-check.sh "$WS/reports/codec2-rust/phase0/seccomp/run" \
+  "$WS/nvidia/waydroid-nvidia/nvidia-prolapse/media/odm/etc/seccomp_policy/android.hardware.media.c2@1.2-nvprolapse.policy"
+```
+
+Surface 脚本编译 `c2_surface_smoke`，四个指定组件各断言 60 输入、60 输出、60 张 PRIVATE Image、EOS 和正常销毁；每个退出码保存在 `exit-codes.tsv`。
+seccomp 脚本第二参数可留空（使用当前策略），其后可传自定义稳态负载命令，默认跑 `codec-smoke.sh`。冷窗口由 init `ctl.sigstop_on` 在 exec 前暂停，attach 后恢复并等待 Store；稳态窗口 attach 后跑客户端。以成功的非 NULL `PR_SET_SECCOMP` 为界，递归展开实际 guest include，保存安装前后 syscall 集合、逐调用实参及覆盖结论；未覆盖、未知参数谓词或 SIGSYS 均失败，不能用“无 SIGSYS”替代策略对照。
+提供策略文件时仅临时只读 bind 该文件，核对部署 SHA256，EXIT 时关闭 sigstop、停止服务、卸自身 bind、重启服务并核对原 SHA256。两个脚本共用 `/tmp/wd-guest.lock`；持锁上层用 `WD_GUEST_LOCKED=1` 调用，避免嵌套锁。
 
 ## Chrome 硬件编码
 
 ```bash
-$T/web-encode-test.sh       # 打开 scripts/web/index.html，约 45 秒后打印服务端打开的编码器
+WEB_ENCODE_OUT=/tmp/web-evidence $T/web-encode-test.sh 150
 ```
 
-结果显示在页面上，截 Chrome 窗口读取。`chrome://gpu` 的 Video Encode 应为 Hardware accelerated。
-WebRTC 分辨率由带宽估计决定，8 秒内停在 960×540 不算失败；`nvc2-enc` 没有日志行才是走了软件编码。
+仅在 guest Chrome 中打开页面。每个用例有 run UUID 与独立 ID；页面开始前 POST 请求宿主清空 logcat 并等待确认，结束后 POST JSON，宿主立即归档该窗口日志。WebCodecs 四项严格要求 60 输出、有关键帧、无错误；WebRTC 三项要求编码帧数 > 0、宽高至少 960×540，且各自窗口内有对应 AVC/HEVC/AV1 组件打开日志。证据目录含每项 JSON、logcat、开窗时间和总退出状态；超时、缺项或任一断言失败均非零。
 
 ## 截图与桌面
 
