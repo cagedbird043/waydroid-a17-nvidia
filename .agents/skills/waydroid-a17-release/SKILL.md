@@ -23,13 +23,20 @@ tag `a17-YYYYMMDD-N`（同一天第 N 版），pkgver `YYYYMMDD.N`。native bund
 6. **回归**（`waydroid-a17-test` skill）：会话起来、GLES 是 ANGLE/NVK、`codec-smoke.sh`、`web-encode-test.sh`，
    加上这一版改动相关的场景（卡片、桌面窗口、输入法、剪贴板、文件共享、KernelSU）。
 7. **推送**：`git tag <tag> && git push origin HEAD <tag>`。
-8. **Release**：
+8. **Release**：先建草稿，再逐个上传（`gh release create` 带资产时任一上传断掉就会删掉整个 Release），
+   断了就对同一个文件重跑 `--clobber`：
    ```bash
-   gh release create <tag> vendor.img.zst.part0* vendor.img.zst.sha256 waydroid-a17-nvidia-native-x86_64.tar.zst \
-       --title "vendor <tag>" --notes-file <说明> --latest
+   gh release create <tag> --draft --title "vendor <tag>" --notes-file <说明>
+   for f in vendor.img.zst.part0* vendor.img.zst.sha256 waydroid-a17-nvidia-native-x86_64.tar.zst; do
+       gh release upload <tag> "$f" --clobber
+   done
+   gh release edit <tag> --draft=false --latest
    ```
-   说明格式见 [references/release-notes.md](references/release-notes.md)。上传约 7 分钟。
-9. **AUR**：`$R/aur-publish.sh <tag>`：删掉本地资产，按线上 URL 重算校验和、真下载重建一次、`.SRCINFO`，
+   说明格式见 [references/release-notes.md](references/release-notes.md)。发布前用
+   `gh api repos/cagedbird043/waydroid-a17-nvidia/releases --jq '.[] | select(.draft) | .assets[] | "\(.digest) \(.name)"'`
+   对照本地 `sha256sum`，7 个都要有。
+9. **AUR**：`$R/aur-publish.sh <tag>`（Release 必须已发布）：Release 资产的校验和取 GitHub API 记录的 `digest`，
+   不下载；tag/commit 源码包由 GitHub 现打，哈希与本地 `git archive` 不同，下载后计算。然后生成 `.SRCINFO`，
    提交 `AUR：<tag> 的校验和与 .SRCINFO` 并推送本仓库和 AUR。
 10. 汇报：门禁结果、回归数字、各提交号、Release 链接。
 
