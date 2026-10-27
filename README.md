@@ -43,6 +43,9 @@ KDE window.
 
 The hardware encoding core is now Rust, with the same H.264/HEVC/AV1 support and encoding performance within 10% of
 the previous core in our 720p tests. The Codec2 sandbox policy now permits its logging socket, including cold starts.
+The Codec2 decoding driver is also Rust. VP9 packets carrying multiple displayed frames now deliver every frame;
+codec-specific startup/replay data (CSD) is capped at 2 MiB, and gralloc buffer handles and plane layouts are validated
+before use to reject malformed buffers safely.
 
 ### 📸 Screenshots
 
@@ -160,6 +163,8 @@ Waydroid 里的 LineageOS 24.0（Android 17），显卡、视频引擎、root �
 
 硬件编码核心现已 Rust 化，继续支持 H.264/HEVC/AV1；本机 720p 实测编码性能与原核心相差不超过 10%。
 同时补齐 Codec2 沙箱的日志套接字权限，覆盖服务冷启动。
+Codec2 解码驱动也已 Rust 化：修复单个 VP9 输入含多张显示帧时的输出；启动与回放的编解码专用数据（CSD）
+设为 2 MiB 上限；使用前校验 gralloc 缓冲句柄、平面布局与访问范围，拒绝非法缓冲。
 
 ### 📸 截图
 

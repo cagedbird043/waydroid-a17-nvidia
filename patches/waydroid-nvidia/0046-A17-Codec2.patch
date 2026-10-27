@@ -1,0 +1,30 @@
+From 47083f7aad2a284428969f782d0437f8d859301b Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Wed, 28 Oct 2026 04:24:51 +0800
+Subject: [PATCH 46/46] =?utf-8?q?=E4=BD=BF=E7=94=A8=20A17=20Codec2=20?=
+ =?utf-8?q?=E5=8F=82=E6=95=B0=E9=94=99=E8=AF=AF=E6=9E=84=E9=80=A0=E5=99=A8?=
+ =?utf-8?q?=E6=8A=A5=E5=91=8A=E5=B0=BA=E5=AF=B8=E6=BA=A2=E5=87=BA?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ nvidia-prolapse/media/c2/NvC2Component.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/nvidia-prolapse/media/c2/NvC2Component.cpp b/nvidia-prolapse/media/c2/NvC2Component.cpp
+index 969b0ed..d4a9ac4 100644
+--- a/nvidia-prolapse/media/c2/NvC2Component.cpp
++++ b/nvidia-prolapse/media/c2/NvC2Component.cpp
+@@ -305,7 +305,7 @@ public:
+     {
+         uint32_t size;
+         if (nv_c2_dec_max_input_size(maxSize.v.width, maxSize.v.height, &size) != NV_C2_DEC_OK)
+-            return C2R::BadValue();
++            return C2R::Ok().plus(C2SettingResultBuilder::BadValue(me.F(me.v.value)));
+         me.set().value = size;
+         return C2R::Ok();
+     }
+-- 
+2.56.0
+

@@ -6,4 +6,4 @@ vendor.img.zst.sha256
 aur/*/src/
 aur/*/pkg/
 aur/*/*.tar.gz
-aur/*/*.part0*
+aur/*/*.part[0-9][0-9]

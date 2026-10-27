@@ -37,7 +37,6 @@ cc_binary {
         "android.hardware.media.c2@1.2-nvprolapse.xml",
     ],
     srcs: [
-        "media-src/core/nvc2_decoder.cpp",
         "media-src/core/nvc2_encoder.cpp",
         "media-src/c2/NvC2Component.cpp",
         "media-src/c2/NvC2Encoder.cpp",
@@ -48,7 +47,11 @@ cc_binary {
         "media-src/c2",
         "media-src/video",
     ],
-    include_dirs: ["external/minigbm/cros_gralloc"],
+    include_dirs: [
+        "external/minigbm/cros_gralloc",
+        "external/minigbm",
+        "external/libdrm/include/drm",
+    ],
     cflags: [
         "-Wall",
         "-Werror",
