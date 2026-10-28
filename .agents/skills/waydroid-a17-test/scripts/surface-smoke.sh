@@ -6,7 +6,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
 WS=${WAYDROID_A17_WS:-$(dirname "$REPO")}
 M=$WS/nvidia/waydroid-nvidia/nvidia-prolapse/media
-OUT=${1:-$WS/reports/codec2-rust/phase0/surface/$(date +%Y%m%d-%H%M%S)}
+OUT=${1:-/tmp/surface-evidence/$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT" || exit 1
 OUT=$(realpath "$OUT")
 if [[ ${WD_GUEST_LOCKED:-0} != 1 ]]; then

@@ -48,9 +48,9 @@ VP9 多显示帧回归：`make -C "$WS/nvidia/waydroid-nvidia/nvidia-prolapse/me
 ### Surface 与 seccomp 窗口
 
 ```bash
-$T/surface-smoke.sh "$WS/reports/codec2-rust/phase0/surface/run"
-CODEC_SMOKE_OUT="$WS/reports/codec2-rust/phase0/seccomp/run/clients" \
-  $T/seccomp-check.sh "$WS/reports/codec2-rust/phase0/seccomp/run" \
+$T/surface-smoke.sh /tmp/surface-evidence
+CODEC_SMOKE_OUT=/tmp/seccomp-evidence/clients \
+  $T/seccomp-check.sh /tmp/seccomp-evidence \
   "$WS/nvidia/waydroid-nvidia/nvidia-prolapse/media/odm/etc/seccomp_policy/android.hardware.media.c2@1.2-nvprolapse.policy"
 ```
 
