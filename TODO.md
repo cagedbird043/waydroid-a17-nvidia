@@ -22,6 +22,7 @@
 
 1. **重负载实测**：3DMark Wild Life Extreme（Vulkan，4K）12287–13096 分、约 74 FPS，无 Xid，同一进程连续多遍稳定。Basemark GPU（Vulkan 1.0、4K、Medium、离屏、Z Prepass 关）：宿主官方驱动 35657（BC7），Waydroid 29369（ETC2），约 82%。还没测真实 3D 游戏。
 2. **跟进 libvulkan 上游修复**：A17 loader 的 R8G8B8 swapchain 检查直接调用 1.1 的 `GetPhysicalDeviceImageFormatProperties2` 原始指针，1.0 实例为空即崩；本仓库靠 gralloc 不声称 BGR888 可渲染（`patches/external_minigbm/0009`）绕开。loader 修复已提交 LineageOS Gerrit（[509993](https://review.lineageos.org/c/LineageOS/android_frameworks_native/+/509993)）并报给 Google（[b/577380015](https://issuetracker.google.com/issues/577380015)），等审核。
+3. **下个版本门禁工具预检**：门禁开跑前检查 `dump.erofs` / `debugfs` / `readelf` / `unshare` 等所需工具，缺失时明确报出对应 Arch 包名，避免裸 `Errno 2`。
 
 ## 不做
 
