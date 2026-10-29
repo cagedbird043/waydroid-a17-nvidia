@@ -34,7 +34,7 @@ skill 在 `.agents/skills/`，`.claude/skills` 和 `.codex/skills` 是指向它�
 
 - 回复用户用简体中文。结论要实测；没验证的标 `[推测]`。
 - git 由 AI 操作。提交信息用中文，身份 `cagedbird043 <cagedbird043@gmail.com>`，不加任何 AI 署名。
-- 推送范围：本仓库、AUR `waydroid-a17-nvidia-bin` 和 `nvrm-vaapi-driver`、rustnv（`~/Projects/nvidia-vaapi-driver`）、
+- 推送范围：本仓库、AUR `waydroid-a17-nvidia-bin` 和 `nvrm-vaapi-driver`、rustnv（`~/Projects/waydroid-a17/rustnv`）、
   nvrm（`~/Projects/waydroid-a17/nvidia/nvrm`）。工作区的 `src/` 各仓库、`nvidia/waydroid-nvidia`、`nvidia/product`
   只在本地提交，不推送。推送、tag、Release 只在用户要求时做。
 - 不碰 NVIDIA 驱动和内核包、引导配置（包括 `lsm=`）、`@` 子卷；不重启、不注销。重启 Waydroid 会话可以。
