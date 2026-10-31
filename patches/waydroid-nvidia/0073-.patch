@@ -1,0 +1,72 @@
+From 5ca66e37b93f43b9df386e61f5a9cb13c686052a Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 19:40:32 +0800
+Subject: [PATCH] =?utf-8?q?=E6=B5=8B=E8=AF=95=EF=BC=9A=E9=97=B4=E6=8E=A5?=
+ =?utf-8?q?=E6=8B=B7=E8=B4=9D=E6=89=A9=E5=B1=95=E6=9C=AA=E6=9A=B4=E9=9C=B2?=
+ =?utf-8?q?=E6=97=B6=E6=98=8E=E7=A1=AE=E8=B7=B3=E8=BF=87?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ tools/native-vulkan-copy-indirect.c   | 18 +++++++++++++++++-
+ tools/native-vulkan-shaders/README.md |  7 ++++++-
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/tools/native-vulkan-copy-indirect.c b/tools/native-vulkan-copy-indirect.c
+index ff4b52c..db1a629 100644
+--- a/tools/native-vulkan-copy-indirect.c
++++ b/tools/native-vulkan-copy-indirect.c
+@@ -55,7 +55,7 @@ typedef void (VKAPI_PTR *PFN_vkCmdCopyMemoryIndirectKHR)(
+ #define INSTANCE_FUNCTIONS(X) \
+  X(DestroyInstance) X(EnumeratePhysicalDevices) X(GetPhysicalDeviceProperties) \
+  X(GetPhysicalDeviceQueueFamilyProperties) X(GetPhysicalDeviceMemoryProperties) \
+- X(GetPhysicalDeviceFeatures2) X(CreateDevice) X(GetDeviceProcAddr)
++ X(GetPhysicalDeviceFeatures2) X(EnumerateDeviceExtensionProperties) X(CreateDevice) X(GetDeviceProcAddr)
+ #define DEVICE_FUNCTIONS(X) \
+  X(DestroyDevice) X(GetDeviceQueue) X(CreateBuffer) X(DestroyBuffer) \
+  X(GetBufferMemoryRequirements) X(AllocateMemory) X(FreeMemory) X(BindBufferMemory) \
+@@ -190,6 +190,22 @@ int main(int argc, char **argv) {
+         puts("SKIP: no compute-only queue family");
+         return 77;
+     }
++    uint32_t extension_count = 0;
++    VK_CHECK(pEnumerateDeviceExtensionProperties(physical, NULL, &extension_count, NULL));
++    VkExtensionProperties *extensions = extension_count ? malloc(extension_count * sizeof(*extensions)) : NULL;
++    if (extension_count && !extensions) die("extension allocation failed");
++    if (extension_count)
++        VK_CHECK(pEnumerateDeviceExtensionProperties(physical, NULL, &extension_count, extensions));
++    int has_copy_indirect = 0;
++    for (uint32_t i = 0; i < extension_count; i++)
++        if (!strcmp(extensions[i].extensionName, "VK_KHR_copy_memory_indirect")) has_copy_indirect = 1;
++    free(extensions);
++    if (!has_copy_indirect) {
++        puts("SKIP: VK_KHR_copy_memory_indirect not exposed");
++        pDestroyInstance(instance, NULL);
++        dlclose(library);
++        return 77;
++    }
+     VkPhysicalDeviceCopyMemoryIndirectFeaturesKHR copy_features = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_KHR};
+     VkPhysicalDeviceVulkan12Features features12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+diff --git a/tools/native-vulkan-shaders/README.md b/tools/native-vulkan-shaders/README.md
+index da2d068..e53a1eb 100644
+--- a/tools/native-vulkan-shaders/README.md
++++ b/tools/native-vulkan-shaders/README.md
+@@ -71,7 +71,12 @@ check is reported as not applicable if every core feature is advertised.
+ public extension declarations when the SDK predates them) and records `vkCmdCopyMemoryIndirectKHR` on a
+ compute-only queue family, a transfer-write to shader-read barrier, then a
+ dispatch of `transform.spv` that reads the copied words; 1000 iterations, every
+-output word checked. It exits 77 when the device has no compute-only family:
++output word checked. It exits 77 when the device has no compute-only family or
++does not expose `VK_KHR_copy_memory_indirect`. Android builds using API 33 with
++the strict extension whitelist are expected to print
++`SKIP: VK_KHR_copy_memory_indirect not exposed` and exit 77: the extension is
++exposed only at Android API level 37 or later. This does not require changing
++the driver's configured platform SDK version.
+ 
+ ```sh
+ build/native-vulkan-probe/copy-indirect-host \
+-- 
+2.56.0
+
