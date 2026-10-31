@@ -1,0 +1,37 @@
+# check-upstream.sh 跳过的 Shiro836/waydroid-nvidia 提交：每行「短哈希 原因」。
+# 已经 cherry-pick 进 a17-local 的提交靠提交正文里的 `cherry picked from commit` 行识别，不用写在这里。
+# 已有等价实现
+941c7b0 media 测试与 nv_video ABI 2，本地 5465883
+fbcc066 media 测试与 nv_video ABI 2，本地 7768ade
+0445562 media 测试与 nv_video ABI 2，本地 883dee0
+3152d37 2D 图像的 3D 视图，本地 7b39af9
+45d12b1 formats 加锁，hwc 补丁 0002（9048b6a）
+b9f9421 本地 hwc 0003 按格式拒绝 LINEAR，更精确
+577b1ca window_owns_display_geometry() 已让单窗口应用决定显示尺寸
+212ada0 setup 和 vendor_image.py 已读 images_path
+# 不移植：glibc-shim
+4700081 glibc-shim
+ba909d0 glibc-shim
+7e2633c glibc-shim
+3044333 glibc-shim
+c4bf490 glibc-shim
+0c77c11 glibc-shim
+c8c9047 glibc-shim
+5afd8d3 glibc-shim
+788728d glibc-shim
+# 不移植：Venus/virglrenderer
+c049b21 Venus/virglrenderer
+dbf5e5f Venus/virglrenderer
+707af0a Venus/virglrenderer
+274c55b Venus/virglrenderer
+3d814a4 Venus/virglrenderer
+# 不移植：其他
+aad555e 上游换 hwcomposer 基线，所需的 keyboard enter 聚焦修复本地已有
+0b1f811 QMD V05，Ada 用 V03
+3482893 只对 sm >= 100 生效
+a8e2779 只对 sm >= 100 生效
+35b50ec 只改注释
+6b91422 文档或上游打包
+ad39473 文档或上游打包
+99189dc 文档或上游打包
+2ca2adf 文档或上游打包

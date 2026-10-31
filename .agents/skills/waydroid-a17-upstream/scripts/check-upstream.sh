@@ -10,6 +10,7 @@ NVRM=$WS/nvidia/nvrm
 BASES=$REPO/.agents/skills/waydroid-a17-build/references/patch-bases.md
 INSTALL=$REPO/aur/waydroid-a17-nvidia-bin/waydroid-a17-nvidia.install
 COMPAT=nvidia-prolapse/driver-source/native/src/compat_data.rs
+IGNORE=$SKILL/references/upstream-ignore.txt
 FETCH=1; [ "${1:-}" = --no-fetch ] && FETCH=0
 
 h() { printf '\n== %s\n' "$*"; }
@@ -19,9 +20,18 @@ h "waydroid-nvidia（Shiro836）"
 gh release list -R Shiro836/waydroid-nvidia --limit 3 | cat
 base=$(git -C "$WN" merge-base a17-local origin/main)
 echo "分叉点 $(git -C "$WN" log -1 --format='%h %ad %s' --date=short "$base")"
-echo "分叉点之后上游的非文档提交（逐条判断是否移植；a17-local 的移植提交用中文标题，git 认不出等价提交）："
-git -C "$WN" log --no-merges --reverse --format='  %h %ad %s' --date=short "$base..origin/main" \
-  | rg -v -i ' (README|release notes|rc[0-9]+ notes|docs:)' || echo "  （无）"
+echo "分叉点之后上游尚未处理的非文档提交（逐条判断是否移植；已 cherry-pick 进 a17-local 或 hardware/waydroid nvidia-a17 的和 $(basename "$IGNORE") 里的不列出）："
+picked=$( { git -C "$WN" log --format=%B "$base..a17-local"
+            git -C "$WS/src/hardware/waydroid" log --format=%B --grep='cherry picked from commit' nvidia-a17 2>/dev/null; } \
+          | rg -o 'cherry picked from commit ([0-9a-f]{40})' -r '$1' | sort -u)
+ignored=$(rg -o '^([0-9a-f]{7,40})\s' -r '$1' "$IGNORE")
+git -C "$WN" log --no-merges --reverse --format='%H %ad %s' --date=short "$base..origin/main" \
+  | rg -v -i ' (README|release notes|rc[0-9]+ notes|docs:)' \
+  | while read -r sha rest; do
+      grep -qx "$sha" <<<"$picked" && continue
+      for p in $ignored; do [[ $sha == "$p"* ]] && continue 2; done
+      echo "  ${sha:0:7} $rest"
+    done | rg . || echo "  （无）"
 
 h "WayDroid-ATV system 镜像"
 pin=$(rg -o 'releases/tag/([0-9]{8})' -r '$1' "$INSTALL" | head -1)
