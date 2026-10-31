@@ -12,6 +12,8 @@
 ![KDE Plasma](https://img.shields.io/badge/KDE%20Plasma-Wayland-1d99f3?logo=kde&logoColor=white)
 ![KernelSU](https://img.shields.io/badge/root-KernelSU-orange)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![Built with Claude Opus 5.5](https://img.shields.io/badge/built%20with-Claude%20Opus%205.5-d97757?logo=claude&logoColor=white)
+![Built with GPT 6.1 Sol](https://img.shields.io/badge/built%20with-GPT%206.1%20Sol-412991)
 
 [English](#english) · [中文](#中文) · Blog: [English](https://cagedbird.cn/2026/10/31/技术实践/系统工程/系统编程/Android/Waydroid-A17-NVIDIA-hardware-accelerated-Android-17-on-NVIDIA-Linux/) / [中文](https://cagedbird.cn/2026/10/31/技术实践/系统工程/系统编程/Android/Waydroid-A17-NVIDIA：N卡Linux桌面上的硬件加速Android17/)
 
@@ -128,6 +130,7 @@ Management → KWin Scripts → "Waydroid card placement".
 > [!NOTE]
 > A personal project, tested on one machine: RTX 4060 Laptop, NVIDIA open driver 615.78.08, KDE Plasma 6 Wayland,
 > Arch Linux. Widevine is L3, so streaming apps usually play SD. Issues and PRs are welcome; replies are not guaranteed.
+> Developed together with Claude Opus 5.5 and GPT 6.1 Sol.
 
 ### 🙏 Acknowledgements
 
@@ -243,6 +246,7 @@ sha256sum -c vendor.img.zst.sha256
 > [!NOTE]
 > 个人项目，只在一台机器上测过：RTX 4060 Laptop、NVIDIA open 驱动 615.78.08、KDE Plasma 6 Wayland、Arch Linux。
 > Widevine 是 L3，流媒体应用一般只给标清。欢迎 issue 和 PR，但不保证回复。
+> 本项目由 Claude Opus 5.5 和 GPT 6.1 Sol 共同参与开发。
 
 ### 🙏 致谢
 
