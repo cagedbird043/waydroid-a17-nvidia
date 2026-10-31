@@ -1,0 +1,158 @@
+From 79309156a7493f1d5e4ef5246a05875483ab3b04 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 17:26:14 +0800
+Subject: [PATCH 71/72] =?utf-8?q?=E6=B5=8B=E8=AF=95=EF=BC=9A=E8=A6=86?=
+ =?utf-8?q?=E7=9B=96=20graphics=20=E4=B8=8E=20compute=20=E9=98=9F=E5=88=97?=
+ =?utf-8?q?=E7=BB=84=E5=90=88=E5=92=8C=E5=8F=8D=E5=A4=8D=E9=94=80=E6=AF=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ tools/native-vulkan-multiqueue.c      | 62 ++++++++++++++++++++-------
+ tools/native-vulkan-shaders/README.md | 18 ++++++++
+ 2 files changed, 64 insertions(+), 16 deletions(-)
+
+diff --git a/tools/native-vulkan-multiqueue.c b/tools/native-vulkan-multiqueue.c
+index fc0b7e7..f59f0d0 100644
+--- a/tools/native-vulkan-multiqueue.c
++++ b/tools/native-vulkan-multiqueue.c
+@@ -1,6 +1,7 @@
+-/* Public Vulkan regression for two independently submitted graphics queues.
++/* Public Vulkan regression for independent graphics and compute queues.
+  * Each thread owns its queue, command pool, buffer and fence. The CPU start
+  * barrier deliberately races submissions; every completed GPU fill is checked.
++ * Device creation order and repeated destruction cover shared TSG lifetimes.
+  * No Waydroid lifecycle or private RM API is used. */
+ #define _GNU_SOURCE
+ #include <dlfcn.h>
+@@ -103,12 +104,37 @@ int main(int argc, char **argv) {
+  REQUIRE(family < families);
+  printf("graphics_family=%u queueCount=%u\n", family, qp[family].queueCount);
+  fflush(stdout);
+- REQUIRE(qp[family].queueCount >= 2);
++ REQUIRE(family == 0 && qp[family].queueCount == 2);
++ uint32_t compute = 0;
++ while (compute < families && (!(qp[compute].queueFlags & VK_QUEUE_COMPUTE_BIT) ||
++        (qp[compute].queueFlags & VK_QUEUE_GRAPHICS_BIT))) compute++;
++ REQUIRE(compute < families && compute > family && qp[compute].queueCount >= 2);
++ printf("compute_family=%u queueCount=%u\n", compute, qp[compute].queueCount);
++ struct { const char *name; unsigned graphics, compute; int compute_first; } cases[] = {
++  {"two-graphics", 2, 0, 0},
++  {"two-graphics-plus-compute", 2, 1, 0},
++  {"compute-create-info-first", 2, 1, 1},
++  {"compute-only", 0, 1, 1},
++  {"multiple-compute", 2, 2, 1},
++  {"multiple-compute-only", 0, 2, 1},
++ };
++ for (unsigned repeat = 0; repeat < 8; repeat++) {
++ for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
++ unsigned ng = cases[c].graphics, nc = cases[c].compute, total = ng + nc;
+  float priorities[2] = {0, 0};
+- VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+-  .queueFamilyIndex = family, .queueCount = 2, .pQueuePriorities = priorities};
++ VkDeviceQueueCreateInfo qci[2];
++ unsigned nci = 0;
++ for (unsigned slot = 0; slot < 2; slot++) {
++  int is_compute = cases[c].compute_first ? slot == 0 : slot == 1;
++  unsigned n = is_compute ? nc : ng;
++  if (!n) continue;
++  qci[nci++] = (VkDeviceQueueCreateInfo){.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++   .queueFamilyIndex = is_compute ? compute : family, .queueCount = n, .pQueuePriorities = priorities};
++ }
++ printf("case=%s repeat=%u queues=%u\n", cases[c].name, repeat, total);
++ fflush(stdout);
+  VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+-  .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci};
++  .queueCreateInfoCount = nci, .pQueueCreateInfos = qci};
+  VkDevice device;
+  CHECK(CreateDevice(physical, &dci, NULL, &device));
+  struct Api api;
+@@ -118,13 +144,16 @@ int main(int argc, char **argv) {
+  VkPhysicalDeviceMemoryProperties mp;
+  GetPhysicalDeviceMemoryProperties(physical, &mp);
+  pthread_barrier_t start;
+- REQUIRE(!pthread_barrier_init(&start, NULL, 2));
+- struct Worker workers[2] = {0};
+- pthread_t threads[2];
+- for (unsigned i = 0; i < 2; i++) {
++ REQUIRE(!pthread_barrier_init(&start, NULL, total));
++ struct Worker workers[4] = {0};
++ pthread_t threads[4];
++ for (unsigned i = 0; i < total; i++) {
+   struct Worker *w = &workers[i];
+   w->api = &api; w->device = device; w->index = i; w->start = &start;
+-  api.GetDeviceQueue(device, family, i, &w->queue);
++  uint32_t worker_family = i < ng ? family : compute;
++  api.GetDeviceQueue(device, worker_family, i < ng ? i : i - ng, &w->queue);
++  REQUIRE(w->queue);
++  for (unsigned j = 0; j < i; j++) REQUIRE(w->queue != workers[j].queue);
+   VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    .size = 4096, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+   CHECK(api.CreateBuffer(device, &bci, NULL, &w->buffer));
+@@ -140,7 +169,7 @@ int main(int argc, char **argv) {
+   CHECK(api.AllocateMemory(device, &mai, NULL, &w->memory));
+   CHECK(api.BindBufferMemory(device, w->buffer, w->memory, 0));
+   CHECK(api.MapMemory(device, w->memory, 0, VK_WHOLE_SIZE, 0, (void **)&w->mapped));
+-  VkCommandPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = family};
++  VkCommandPoolCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = worker_family};
+   CHECK(api.CreateCommandPool(device, &pci, NULL, &w->pool));
+   VkCommandBufferAllocateInfo cai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+    .commandPool = w->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+@@ -148,10 +177,9 @@ int main(int argc, char **argv) {
+   VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+   CHECK(api.CreateFence(device, &fci, NULL, &w->fence));
+  }
+- REQUIRE(workers[0].queue && workers[1].queue && workers[0].queue != workers[1].queue);
+- for (unsigned i = 0; i < 2; i++) REQUIRE(!pthread_create(&threads[i], NULL, run, &workers[i]));
+- for (unsigned i = 0; i < 2; i++) REQUIRE(!pthread_join(threads[i], NULL));
+- for (unsigned i = 0; i < 2; i++) {
++ for (unsigned i = 0; i < total; i++) REQUIRE(!pthread_create(&threads[i], NULL, run, &workers[i]));
++ for (unsigned i = 0; i < total; i++) REQUIRE(!pthread_join(threads[i], NULL));
++ for (unsigned i = 0; i < total; i++) {
+   struct Worker *w = &workers[i];
+   api.DestroyFence(device, w->fence, NULL);
+   api.DestroyCommandPool(device, w->pool, NULL);
+@@ -161,7 +189,9 @@ int main(int argc, char **argv) {
+  }
+  REQUIRE(!pthread_barrier_destroy(&start));
+  api.DestroyDevice(device, NULL);
++ }
++ }
+  DestroyInstance(instance, NULL);
+- puts("PASS: two concurrent graphics queues, 512 submissions, 524288 words checked");
++ puts("PASS: all graphics/compute queue combinations, 8 device lifecycle repetitions each");
+  return 0;
+ }
+diff --git a/tools/native-vulkan-shaders/README.md b/tools/native-vulkan-shaders/README.md
+index 3a264c9..392c603 100644
+--- a/tools/native-vulkan-shaders/README.md
++++ b/tools/native-vulkan-shaders/README.md
+@@ -76,6 +76,24 @@ build/native-vulkan-probe/copy-indirect-host \
+   --transform build/native-vulkan-probe/transform.spv
+ ```
+ 
++`../native-vulkan-multiqueue.c` requires graphics family 0 with exactly two
++queues and a compute-only family with at least two queues. It checks six device
++configurations: two graphics, two graphics plus compute, compute create-info
++first, compute-only, two graphics plus two compute, and two compute-only queues.
++Each configuration is created and destroyed eight times; every queue races
++256 fill/barrier/fence submissions and checks all 1024 output words each time.
++This directly loads the ICD; Android system-loader/HAL coverage is separate.
++
++```sh
++cc -std=c11 -Wall -Wextra -Werror tools/native-vulkan-multiqueue.c -ldl -pthread \
++  -o build/native-vulkan-probe/multiqueue-host
++"$NDK/bin/x86_64-linux-android33-clang" -std=c11 -Wall -Wextra -Werror \
++  tools/native-vulkan-multiqueue.c -ldl -pthread -o build/native-vulkan-probe/multiqueue-android
++build/native-vulkan-probe/multiqueue-host /absolute/path/to/libvulkan_nouveau.so
++# On Android, after staging the probe and its matching native libraries:
++/data/local/tmp/multiqueue-android /vendor_extra/lib64/libvulkan_nouveau.so
++```
++
+ For Mesa ICDs exporting `vk_icdGetInstanceProcAddr`, add `--icd` to direct
+ invocations. `../native-vulkan-regression.py` prepares the current full-NVK
+ compute, graphics, interop, host copy-indirect and HAL commands, and defaults to a dry run.
+-- 
+2.56.0
+

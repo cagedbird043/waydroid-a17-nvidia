@@ -1,0 +1,185 @@
+From 52598ddf009d3834c531a647e0f60fc94da9d02a Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 17:22:08 +0800
+Subject: [PATCH 65/72] =?utf-8?q?NAK=EF=BC=9A=E7=A7=BB=E6=A4=8D=E6=94=B6?=
+ =?utf-8?q?=E6=95=9B=20LICM=20=E4=B8=8E=E5=BE=AA=E7=8E=AF=20continue=20?=
+ =?utf-8?q?=E5=90=8C=E6=AD=A5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+仅移植适用于 Ada 的 LICM（sm >= 73）及 loop continue sync；不引入 Blackwell LDCX 优化。
+
+(cherry picked from commit fd986b6788c55442ccf9b4d610795ae732fc4993)
+---
+ .../driver-source/native/mesa/build.py        |  3 +
+ .../native/mesa/nak-licm-convergent.patch     | 67 ++++++++++++++++++
+ .../native/mesa/nak-loop-continue-sync.patch  | 68 +++++++++++++++++++
+ 3 files changed, 138 insertions(+)
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nak-licm-convergent.patch
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nak-loop-continue-sync.patch
+
+diff --git a/nvidia-prolapse/driver-source/native/mesa/build.py b/nvidia-prolapse/driver-source/native/mesa/build.py
+index b8c170e..0e25928 100755
+--- a/nvidia-prolapse/driver-source/native/mesa/build.py
++++ b/nvidia-prolapse/driver-source/native/mesa/build.py
+@@ -223,6 +223,9 @@ NVK_PATCH_LIST = [
+     # cache sequence with IGNORE_VEID, CWD slot count on GB20x); SKED
+     # cache invalidates then happen only in that WFI-ALL form.
+     HERE / "nvk-stock-compute-init.patch",
++    # Hoist convergent loop invariants and sync only real continue edges.
++    HERE / "nak-licm-convergent.patch",
++    HERE / "nak-loop-continue-sync.patch",
+ ]
+ 
+ def prepared_stamp(source, inputs):
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nak-licm-convergent.patch b/nvidia-prolapse/driver-source/native/mesa/nak-licm-convergent.patch
+new file mode 100644
+index 0000000..2db394b
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nak-licm-convergent.patch
+@@ -0,0 +1,67 @@
++diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
++index b03b38e24ee1..12f93a0c48e4 100644
++--- a/src/nouveau/compiler/nak_nir.c
+++++ b/src/nouveau/compiler/nak_nir.c
++@@ -1550,6 +1550,46 @@ nak_nir_gather_mesh_outputs(nir_shader *nir, struct lower_mesh_intrinsics_ctx *c
++    return progress;
++ }
++ 
+++/* nir_opt_licm filter: a convergent ALU result, constant or constant-buffer
+++ * load whose loop is entered in uniform control flow.  Such a value is held
+++ * in a uniform register (from_nir places convergent values of uniform blocks
+++ * there), which does not count against the GPR budget.
+++ *
+++ * ALU ops never trap and a bound constant buffer (ldc_nv) is always valid, so
+++ * those may be hoisted from any block of the loop.  A bindless load (ldcx_nv)
+++ * goes through a handle the shader may only use under a condition, so it is
+++ * only hoisted from blocks every iteration that leaves the loop executes.
+++ */
+++static bool
+++nak_licm_filter(nir_instr *instr, nir_loop *loop, bool dominates_exit)
+++{
+++   if (nir_loop_predecessor_block(loop)->divergent)
+++      return false;
+++
+++   switch (instr->type) {
+++   case nir_instr_type_load_const:
+++      return true;
+++
+++   case nir_instr_type_alu:
+++      return !nir_instr_as_alu(instr)->def.divergent;
+++
+++   case nir_instr_type_intrinsic: {
+++      nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+++      if (intrin->intrinsic != nir_intrinsic_ldc_nv &&
+++          intrin->intrinsic != nir_intrinsic_ldcx_nv)
+++         return false;
+++      if (intrin->intrinsic == nir_intrinsic_ldcx_nv && !dominates_exit)
+++         return false;
+++      if (nir_intrinsic_access(intrin) & ACCESS_NON_UNIFORM)
+++         return false;
+++      return !intrin->def.divergent;
+++   }
+++
+++   default:
+++      return false;
+++   }
+++}
+++
++ void
++ nak_postprocess_nir(nir_shader *nir,
++                     const struct nak_compiler *nak,
++@@ -1793,6 +1833,15 @@ nak_postprocess_nir(nir_shader *nir,
++       }
++    } while (progress);
++ 
+++   /* Hoist convergent loop-invariant values out of loops that sit in
+++    * uniform control flow.  They land in uniform registers, so this costs no
+++    * GPRs, and every iteration stops re-loading or re-computing them.
+++    */
+++   if (nak->sm >= 73) {
+++      nir_divergence_analysis(nir);
+++      OPT(nir, nir_opt_licm, nak_licm_filter);
+++   }
+++
++    OPT(nir, nir_opt_move, nir_move_comparisons | nir_move_load_ubo);
++ 
++    if (nak->sm < 70) {
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nak-loop-continue-sync.patch b/nvidia-prolapse/driver-source/native/mesa/nak-loop-continue-sync.patch
+new file mode 100644
+index 0000000..030496f
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nak-loop-continue-sync.patch
+@@ -0,0 +1,68 @@
++diff --git a/src/nouveau/compiler/nak_nir_lower_cf.c b/src/nouveau/compiler/nak_nir_lower_cf.c
++index 078ed9d340bc..9839be510704 100644
++--- a/src/nouveau/compiler/nak_nir_lower_cf.c
+++++ b/src/nouveau/compiler/nak_nir_lower_cf.c
++@@ -249,6 +249,41 @@ block_is_merge(const nir_block *block)
++    return num_preds > 1;
++ }
++ 
+++static bool
+++cf_list_has_continue(struct exec_list *cf_list)
+++{
+++   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+++      switch (node->type) {
+++      case nir_cf_node_block: {
+++         nir_instr *last = nir_block_last_instr(nir_cf_node_as_block(node));
+++         if (last && last->type == nir_instr_type_jump &&
+++             nir_instr_as_jump(last)->type == nir_jump_continue)
+++            return true;
+++         break;
+++      }
+++      case nir_cf_node_if: {
+++         nir_if *nif = nir_cf_node_as_if(node);
+++         if (cf_list_has_continue(&nif->then_list) ||
+++             cf_list_has_continue(&nif->else_list))
+++            return true;
+++         break;
+++      }
+++      case nir_cf_node_loop:
+++         /* A continue in a nested loop targets that loop */
+++         break;
+++      default:
+++         UNREACHABLE("Unknown CF node type");
+++      }
+++   }
+++   return false;
+++}
+++
+++static bool
+++loop_has_continue(nir_loop *loop)
+++{
+++   return cf_list_has_continue(&loop->body);
+++}
+++
++ static void
++ lower_cf_list(nir_builder *b, nir_def *esc_reg, struct scope *parent_scope,
++               struct exec_list *cf_list)
++@@ -347,10 +382,20 @@ lower_cf_list(nir_builder *b, nir_def *esc_reg, struct scope *parent_scope,
++          nir_goto(b, head_block);
++          push_block(b, head_block, break_scope.divergent);
++ 
+++         /* The continue scope only needs a sync when some invocations can
+++          * reach the end of an iteration ahead of others, i.e. when the body
+++          * continues.  Otherwise every invocation still in the loop gets
+++          * there together: a divergent if in the body syncs its own merge
+++          * (parent_scope_will_sync() never relies on a continue scope
+++          * without a sync) and a divergent break leaves for the break scope,
+++          * which syncs.  A sync on every iteration costs a BSSY/BSYNC pair
+++          * plus an escape check per trip.
+++          */
++          struct scope cont_scope = push_scope(b, SCOPE_TYPE_LOOP_CONT,
++                                               &break_scope,
++                                               nir_loop_is_divergent(loop),
++-                                              nir_loop_is_divergent(loop),
+++                                              nir_loop_is_divergent(loop) &&
+++                                              loop_has_continue(loop),
++                                               cont_block);
++ 
++          lower_cf_list(b, esc_reg, &cont_scope, &loop->body);
+-- 
+2.56.0
+

@@ -1,0 +1,1394 @@
+From 821c50c5b994650eb1bd7ad99a172fd5f2f21947 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 17:22:02 +0800
+Subject: [PATCH 63/72] =?utf-8?q?NVK=EF=BC=9A=E9=80=9A=E8=BF=87=20QMD=20?=
+ =?utf-8?q?=E4=BE=9D=E8=B5=96=E5=AE=9E=E7=8E=B0=E8=AE=A1=E7=AE=97=E5=B1=8F?=
+ =?utf-8?q?=E9=9A=9C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit ab7b5539eb69c7347dada7a73588c7d5fee4b1f6)
+---
+ .../driver-source/native/mesa/build.py        |   8 +-
+ .../native/mesa/nak-qmd-dependency.patch      | 222 +++++
+ .../native/mesa/nvk-cs-join-qmd.patch         | 758 ++++++++++++++++++
+ .../driver-source/native/mesa/tests/README.md |  30 +
+ .../native/mesa/tests/vk-cs-join-reuse.c      | 276 +++++++
+ .../native/mesa/tests/vk-cs-join-reuse.glsl   |  17 +
+ 6 files changed, 1310 insertions(+), 1 deletion(-)
+ mode change 100644 => 100755 nvidia-prolapse/driver-source/native/mesa/build.py
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nak-qmd-dependency.patch
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nvk-cs-join-qmd.patch
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/tests/vk-cs-join-reuse.c
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/tests/vk-cs-join-reuse.glsl
+
+diff --git a/nvidia-prolapse/driver-source/native/mesa/build.py b/nvidia-prolapse/driver-source/native/mesa/build.py
+old mode 100644
+new mode 100755
+index c52c965..6a6e15f
+--- a/nvidia-prolapse/driver-source/native/mesa/build.py
++++ b/nvidia-prolapse/driver-source/native/mesa/build.py
+@@ -146,7 +146,8 @@ NVK_PATCHES = ("build-compat.patch", "rm-integration.patch", "pascal-a-clear.pat
+                "mesa-disk-cache-evict-invalid-item.patch", "nvk-android-app-disk-cache.patch",
+                "nvk-shader-upload-publish.patch", "nvk-shader-prefetch-in-range.patch",
+                "nvk-prevolta-modifier-memory-types.patch", "nvk-3d-view-of-2d-image.patch",
+-               "nvk-pixel-shader-barrier.patch", "nak-qmd-cwd-membar.patch")
++               "nvk-pixel-shader-barrier.patch", "nak-qmd-cwd-membar.patch",
++               "nak-qmd-dependency.patch", "nvk-cs-join-qmd.patch")
+ 
+ GL_TRIPLES = {"android": "x86_64-linux-android", "android32": "i686-linux-android"}
+ # Android: distinct library names so the image's own Mesa (libEGL_mesa.so,
+@@ -205,6 +206,11 @@ NVK_PATCH_LIST = [
+     # CWD_MEMBAR_TYPE = L1_MEMBAR, as NVIDIA's driver does.
+     HERE / "nvk-pixel-shader-barrier.patch",
+     HERE / "nak-qmd-cwd-membar.patch",
++    # Blackwell B: compute -> compute barriers order through QMD
++    # dependencies (an empty join QMD per barrier, host dependency
++    # decrements) instead of WAIT_FOR_IDLE, as NVIDIA's driver does.
++    HERE / "nak-qmd-dependency.patch",
++    HERE / "nvk-cs-join-qmd.patch",
+ ]
+ 
+ def prepared_stamp(source, inputs):
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nak-qmd-dependency.patch b/nvidia-prolapse/driver-source/native/mesa/nak-qmd-dependency.patch
+new file mode 100644
+index 0000000..198a839
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nak-qmd-dependency.patch
+@@ -0,0 +1,222 @@
++nak: QMD dependency field setters for Blackwell B
++
++NVIDIA's driver (libnvidia-eglcore.so 615.78.08) orders compute work with QMD dependencies:
++DEPENDENCE_COUNTER, DEPENDENT_QMD{0,1} {ENABLE, ACTION = DECREMENT_DEPENDENCE, PREFETCH,
++POINTER} and the per-QMD INVALIDATE_{TEXTURE_DATA,SHADER_DATA,SHADER_CONSTANT}_CACHE bits
++(writers E 0xd32f60, E 0xd33340, E 0xd334a0, E 0xd33fb0), plus empty QMDs with CTA 1x1x1 and
++grid 0 (E 0xd34709).  Expose setters for those fields (clcec0qmd.h layout) to NVK.  Only the
++Blackwell B layout is supported; any other class aborts with a named reason.
++
++diff --git a/src/nouveau/compiler/nak.h b/src/nouveau/compiler/nak.h
++index 54a31230f642..fc5c1ad65f86 100644
++--- a/src/nouveau/compiler/nak.h
+++++ b/src/nouveau/compiler/nak.h
++@@ -334,6 +334,23 @@ struct nak_qmd_cbuf_desc_layout {
++ struct nak_qmd_cbuf_desc_layout
++ nak_get_qmd_cbuf_desc_layout(const struct nv_device_info *dev, uint8_t idx);
++ 
+++/* QMD dependency fields (Blackwell B compute only; other classes abort). */
+++void nak_qmd_set_empty_grid(const struct nv_device_info *dev,
+++                            void *qmd, size_t qmd_size);
+++void nak_qmd_set_dependence_counter(const struct nv_device_info *dev,
+++                                    void *qmd, size_t qmd_size,
+++                                    uint32_t counter);
+++void nak_qmd_set_dependent_qmd(const struct nv_device_info *dev,
+++                               void *qmd, size_t qmd_size,
+++                               uint32_t slot, uint64_t dep_addr);
+++bool nak_qmd_dependent_qmd_enabled(const struct nv_device_info *dev,
+++                                   void *qmd, size_t qmd_size,
+++                                   uint32_t slot);
+++void nak_qmd_set_invalidates(const struct nv_device_info *dev,
+++                             void *qmd, size_t qmd_size,
+++                             bool texture_data, bool shader_data,
+++                             bool shader_constant);
+++
++ #ifdef __cplusplus
++ }
++ #endif
++diff --git a/src/nouveau/compiler/nak/qmd.rs b/src/nouveau/compiler/nak/qmd.rs
++index 6b54e7153b94..35f9c2e29103 100644
++--- a/src/nouveau/compiler/nak/qmd.rs
+++++ b/src/nouveau/compiler/nak/qmd.rs
++@@ -625,6 +625,16 @@ mod qmd_5_0 {
++     }
++ 
++     impl Qmd5_0 {
+++        pub fn from_words(words: &[u32]) -> Self {
+++            let mut qmd = [0; 96];
+++            qmd.copy_from_slice(words);
+++            Self { qmd }
+++        }
+++
+++        pub fn qmd_words(&self) -> [u32; 96] {
+++            self.qmd
+++        }
+++
++         /// L1 membar when each CTA completes, so the grid's stores are
++         /// visible in L2 once the CWD retires it.  NVIDIA's own driver
++         /// (libnvidia-eglcore.so 615.78.08) has CWD_MEMBAR_TYPE = L1_MEMBAR
++@@ -634,6 +644,65 @@ mod qmd_5_0 {
++             set_enum!(bv, clcdc0, QMDV05_00, CWD_MEMBAR_TYPE, L1_MEMBAR);
++         }
++     }
+++
+++    /// Dependency fields of a Blackwell B (cec0) QMD, as laid out in
+++    /// clcec0qmd.h.  NVIDIA's driver (libnvidia-eglcore.so 615.78.08,
+++    /// E 0xd32f60 / E 0xd33340 / E 0xd334a0 / E 0xd33fb0) writes exactly
+++    /// these bits: DEPENDENCE_COUNTER, DEPENDENT_QMD{0,1} enable / action /
+++    /// prefetch / pointer and the per-QMD cache invalidates.
+++    pub mod cec0 {
+++        use crate::qmd::*;
+++        use nvidia_headers::classes::clcec0::qmd::*;
+++
+++        pub fn set_dependence_counter(qmd: &mut [u32], counter: u16) {
+++            let mut bv = QMDBitView::new(qmd);
+++            bv.set_field(QMDV05_00_DEPENDENCE_COUNTER, counter);
+++        }
+++
+++        pub fn set_dependent_qmd(qmd: &mut [u32], slot: usize, addr: u64) {
+++            assert!(addr % 256 == 0);
+++            let mut bv = QMDBitView::new(qmd);
+++            bv.set_field(
+++                QMDV05_00_DEPENDENT_QMD_ENABLE(slot),
+++                QMDV05_00_DEPENDENT_QMD_ENABLE_TRUE,
+++            );
+++            bv.set_field(
+++                QMDV05_00_DEPENDENT_QMD_ACTION(slot),
+++                QMDV05_00_DEPENDENT_QMD_ACTION_QMD_DECREMENT_DEPENDENCE,
+++            );
+++            bv.set_field(
+++                QMDV05_00_DEPENDENT_QMD_PREFETCH(slot),
+++                QMDV05_00_DEPENDENT_QMD_PREFETCH_TRUE,
+++            );
+++            bv.set_field(
+++                QMDV05_00_DEPENDENT_QMD_POINTER(slot),
+++                u32::try_from(addr >> 8).unwrap(),
+++            );
+++        }
+++
+++        pub fn dependent_qmd_enabled(qmd: &mut [u32], slot: usize) -> bool {
+++            let bv = QMDBitView::new(qmd);
+++            bv.get_bit_range_u64(QMDV05_00_DEPENDENT_QMD_ENABLE(slot)) != 0
+++        }
+++
+++        pub fn set_invalidates(
+++            qmd: &mut [u32],
+++            texture_data: bool,
+++            shader_data: bool,
+++            shader_constant: bool,
+++        ) {
+++            let mut bv = QMDBitView::new(qmd);
+++            if texture_data {
+++                bv.set_field(QMDV05_00_INVALIDATE_TEXTURE_DATA_CACHE, 1_u32);
+++            }
+++            if shader_data {
+++                bv.set_field(QMDV05_00_INVALIDATE_SHADER_DATA_CACHE, 1_u32);
+++            }
+++            if shader_constant {
+++                bv.set_field(QMDV05_00_INVALIDATE_SHADER_CONSTANT_CACHE, 1_u32);
+++            }
+++        }
+++    }
++ }
++ use qmd_5_0::Qmd5_0;
++ 
++@@ -794,3 +863,97 @@ pub extern "C" fn nak_get_qmd_cbuf_desc_layout(
++         panic!("Unsupported shader model");
++     }
++ }
+++
+++/// The QMD words of `qmd` for a class with QMD dependency support (only
+++/// Blackwell B for now: the only class whose dependency layout has been
+++/// measured on hardware).
+++fn dep_qmd<'a>(
+++    dev: &nv_device_info,
+++    qmd: *mut ::std::os::raw::c_void,
+++    qmd_size: usize,
+++) -> &'a mut [u32] {
+++    assert!(
+++        dev.cls_compute == clcec0::BLACKWELL_COMPUTE_B,
+++        "QMD dependencies are only supported on Blackwell B compute"
+++    );
+++    assert!(!qmd.is_null());
+++    assert!(qmd_size == size_of::<Qmd5_0>());
+++    unsafe { std::slice::from_raw_parts_mut(qmd as *mut u32, qmd_size / 4) }
+++}
+++
+++#[no_mangle]
+++pub extern "C" fn nak_qmd_set_empty_grid(
+++    dev: &nv_device_info,
+++    qmd: *mut ::std::os::raw::c_void,
+++    qmd_size: usize,
+++) {
+++    // Keep everything of the template and only set CTA 1x1x1 / grid 0,
+++    // as the proprietary driver builds its empty QMDs (E 0xd34709).
+++    let words = dep_qmd(dev, qmd, qmd_size);
+++    let mut q = Qmd5_0::from_words(words);
+++    q.set_global_size(0, 0, 0);
+++    q.set_local_size(1, 1, 1);
+++    words.copy_from_slice(&q.qmd_words());
+++}
+++
+++#[no_mangle]
+++pub extern "C" fn nak_qmd_set_dependence_counter(
+++    dev: &nv_device_info,
+++    qmd: *mut ::std::os::raw::c_void,
+++    qmd_size: usize,
+++    counter: u32,
+++) {
+++    let counter = u16::try_from(counter)
+++        .expect("QMD dependence counter exceeds the 16-bit field");
+++    qmd_5_0::cec0::set_dependence_counter(
+++        dep_qmd(dev, qmd, qmd_size),
+++        counter,
+++    );
+++}
+++
+++#[no_mangle]
+++pub extern "C" fn nak_qmd_set_dependent_qmd(
+++    dev: &nv_device_info,
+++    qmd: *mut ::std::os::raw::c_void,
+++    qmd_size: usize,
+++    slot: u32,
+++    dep_addr: u64,
+++) {
+++    assert!(slot < 2);
+++    qmd_5_0::cec0::set_dependent_qmd(
+++        dep_qmd(dev, qmd, qmd_size),
+++        slot as usize,
+++        dep_addr,
+++    );
+++}
+++
+++#[no_mangle]
+++pub extern "C" fn nak_qmd_dependent_qmd_enabled(
+++    dev: &nv_device_info,
+++    qmd: *mut ::std::os::raw::c_void,
+++    qmd_size: usize,
+++    slot: u32,
+++) -> bool {
+++    assert!(slot < 2);
+++    qmd_5_0::cec0::dependent_qmd_enabled(
+++        dep_qmd(dev, qmd, qmd_size),
+++        slot as usize,
+++    )
+++}
+++
+++#[no_mangle]
+++pub extern "C" fn nak_qmd_set_invalidates(
+++    dev: &nv_device_info,
+++    qmd: *mut ::std::os::raw::c_void,
+++    qmd_size: usize,
+++    texture_data: bool,
+++    shader_data: bool,
+++    shader_constant: bool,
+++) {
+++    qmd_5_0::cec0::set_invalidates(
+++        dep_qmd(dev, qmd, qmd_size),
+++        texture_data,
+++        shader_data,
+++        shader_constant,
+++    );
+++}
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-cs-join-qmd.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-cs-join-qmd.patch
+new file mode 100644
+index 0000000..3d5c608
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-cs-join-qmd.patch
+@@ -0,0 +1,758 @@
++nvk: compute -> compute barriers through QMD dependencies on Blackwell B
++
++NVIDIA's driver (libnvidia-eglcore.so 615.78.08: dispatch hook E 0xd35a90, join QMD
++E 0xd345d0, consumer link E 0xd33fb0, launch kick E 0xd36060) never waits for idle for a
++compute -> compute barrier.  Every dispatch decrements an empty "join" QMD through
++DEPENDENT_QMD0; at the first dispatch after a barrier the host releases the join QMD
++(SEND_SIGNALING_PCAS2_B DECREMENT_DEPENDENCE), which then starts that dispatch (DEPENDENCE_COUNTER
++1) with the destination's cache invalidates; further dispatches hang off it through empty link
++QMDs on DEPENDENT_QMD1, and each launch is followed by one more count and one host decrement on
++the QMD it waits on.  Join and link QMDs are loaded inline from the push buffer and patched in
++place until the command buffer ends, so every execution starts from the recorded counters.
++
++Do the same for barriers whose source and destination are only compute shaders (shader reads and
++writes) on Blackwell B compute.  The chain never crosses a command buffer, a secondary, an
++internal dispatch, an indirect dispatch or conditional rendering; it is released before anything
++that waits for idle, and is limited to 0x24 QMDs before the method path is used again, as the
++proprietary driver limits it.  Every other barrier and every other class keep WAIT_FOR_IDLE.
++
++diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
++index 07738ae55e00..0903caeffb4f 100644
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
++@@ -130,6 +130,9 @@ nvk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
++    cmd->push_mem_limit = NULL;
++    cmd->push = (struct nv_push) {0};
++    cmd->cond_render_mem = NULL;
+++   memset(&cmd->cs_join, 0, sizeof(cmd->cs_join));
+++   cmd->cs_join_cond_render = false;
+++   cmd->cs_join_covered = false;
++ 
++    util_dynarray_clear(&cmd->pushes);
++    util_dynarray_clear(&cmd->copy_memory_indirect_temps);
++@@ -363,10 +366,17 @@ nvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
++ 
++    nvk_reset_cmd_buffer(&cmd->vk, 0);
++ 
++-   if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)
+++   if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
++       cmd->state.inherited_pipeline_statistics =
++          pBeginInfo->pInheritanceInfo->pipelineStatistics;
++ 
+++      const VkCommandBufferInheritanceConditionalRenderingInfoEXT *cond =
+++         vk_find_struct_const(pBeginInfo->pInheritanceInfo->pNext,
+++                              COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT);
+++      cmd->cs_join_cond_render = cond != NULL &&
+++                                 cond->conditionalRenderingEnable;
+++   }
+++
++    /* Start with a nop so we have at least something to submit */
++    struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++    P_MTHD(p, NV90B5, NOP);
++@@ -393,6 +403,7 @@ nvk_EndCommandBuffer(VkCommandBuffer commandBuffer)
++ {
++    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++ 
+++   nvk_cmd_cs_join_close(cmd);
++    nvk_cmd_buffer_flush_push(cmd, false);
++ 
++    /* We only need to flush the memory objects we own because, if there are
++@@ -415,6 +426,8 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
++    if (commandBufferCount == 0)
++       return;
++ 
+++   nvk_cmd_cs_join_close(cmd);
+++   cmd->cs_join_covered = false;
++    nvk_cmd_buffer_flush_push(cmd, false);
++ 
++    for (uint32_t i = 0; i < commandBufferCount; i++) {
++@@ -716,6 +729,11 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
++    enum nvk_barrier barriers = 0;
++    struct nvk_pixel_dep pixel_dep = { .dst_pixel_reads = true };
++ 
+++   /* The method path below may wait for idle: no join QMD may be left
+++    * waiting for a host release.
+++    */
+++   nvk_cmd_cs_join_close(cmd);
+++
++    /* For asymmetric, we don't know what the access flags will be yet.
++     * Handle this by setting access to everything.
++     */
++@@ -784,6 +802,10 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
++             .flush_data = FLUSH_DATA_TRUE,
++          });
++       }
+++      /* Compute work before a 3D-subchannel drain was already idled by the
+++       * switch to 3D (see below).
+++       */
+++      cmd->cs_join_covered = true;
++    } else if ((barriers & NVK_BARRIER_WFI) && wait) {
++       /* If this comes from a vkCmdSetEvent, we don't need to wait
++        *
++@@ -814,11 +836,13 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
++          }
++          struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++          P_IMMD(p, NV9097, WAIT_FOR_IDLE, 0);
+++         cmd->cs_join_covered = true;
++          break;
++       }
++       case SUBC_NV90C0: {
++          struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++          P_IMMD(p, NVA0C0, WAIT_FOR_IDLE, 0);
+++         cmd->cs_join_covered = true;
++          break;
++       }
++       default:
++@@ -1037,6 +1061,9 @@ nvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
++ {
++    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++ 
+++   if (nvk_cmd_cs_join_barrier(cmd, pDependencyInfo))
+++      return;
+++
++    nvk_cmd_flush_wait_dep(cmd, pDependencyInfo, true);
++    nvk_cmd_image_layout_transition(cmd, pDependencyInfo);
++    nvk_cmd_invalidate_deps(cmd, 1, pDependencyInfo);
++diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
++index e844b0ff4df6..ea751804a427 100644
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
++@@ -224,6 +224,41 @@ struct nvk_compute_state {
++    bool active_compute_invocations_query;
++ };
++ 
+++/* One QMD of the compute dependency chain: an empty QMD loaded inline from
+++ * the push buffer, patched in place until the command buffer ends.
+++ */
+++struct nvk_cs_join_qmd {
+++   uint64_t addr;
+++   uint32_t *map;
+++   uint32_t counter;
+++   bool valid;
+++};
+++
+++/* Compute -> compute ordering through QMD dependencies instead of
+++ * WAIT_FOR_IDLE, as NVIDIA's driver does it (libnvidia-eglcore.so
+++ * 615.78.08: per-dispatch hook E 0xd35a90, join QMD E 0xd345d0, consumer
+++ * link E 0xd33fb0, launch kick E 0xd36060).  Every dispatch decrements the
+++ * open join QMD when it completes; a barrier makes the next dispatch wait
+++ * for that join QMD.  The state never crosses a command buffer boundary.
+++ */
+++struct nvk_cs_join {
+++   /* The open join QMD every dispatch since the last barrier decrements */
+++   struct nvk_cs_join_qmd join;
+++   /* The join QMD of the last barrier and the newest empty link QMD hung
+++    * below it: the next dispatch waits on the newest of the two.
+++    */
+++   struct nvk_cs_join_qmd prev;
+++   struct nvk_cs_join_qmd link;
+++   /* Dispatches linked to the open join QMD */
+++   uint32_t linked;
+++   /* Dispatches and QMDs since the chain was last drained with methods */
+++   uint32_t chain;
+++   /* A barrier is pending: the next dispatch releases the join QMD */
+++   bool barrier;
+++   /* Invalidates the pending barrier's destination needs */
+++   bool inval_tex, inval_data, inval_const;
+++};
+++
++ struct nvk_cmd_push {
++    void *map;
++    uint64_t addr;
++@@ -235,6 +270,19 @@ struct nvk_cmd_push {
++ struct nvk_cmd_buffer {
++    struct vk_command_buffer vk;
++ 
+++   struct nvk_cs_join cs_join;
+++   /* Conditional rendering may skip dispatches: their dependency decrements
+++    * would never arrive, so no dispatch joins the chain while it can be on.
+++    */
+++   bool cs_join_cond_render;
+++   /* All compute work recorded so far is either complete when the open join
+++    * QMD chain starts or part of the chain: only then can a barrier wait on
+++    * the chain alone.  Set by a compute-subchannel drain, cleared by compute
+++    * work that is not linked and at the start of the command buffer (an
+++    * earlier command buffer's dispatches may still be running).
+++    */
+++   bool cs_join_covered;
+++
++    struct nvk_cmd_state {
++       uint64_t descriptor_buffers[NVK_MAX_SETS];
++       struct nvk_graphics_state gfx;
++@@ -444,6 +492,11 @@ void nvk_cmd_flush_gfx_dynamic_state(struct nvk_cmd_buffer *cmd);
++ void nvk_cmd_flush_gfx_shaders(struct nvk_cmd_buffer *cmd);
++ void nvk_cmd_flush_gfx_cbufs(struct nvk_cmd_buffer *cmd);
++ 
+++bool nvk_cmd_cs_join_supported(struct nvk_cmd_buffer *cmd);
+++bool nvk_cmd_cs_join_barrier(struct nvk_cmd_buffer *cmd,
+++                             const VkDependencyInfo *dep);
+++void nvk_cmd_cs_join_close(struct nvk_cmd_buffer *cmd);
+++
++ void nvk_cmd_dispatch_shader(struct nvk_cmd_buffer *cmd,
++                              struct nvk_shader *shader,
++                              const void *push_data, size_t push_size,
++diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++index 4c596b785414..75d6e7a54f8a 100644
++--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++@@ -10,6 +10,8 @@
++ #include "nvk_physical_device.h"
++ #include "nvk_shader.h"
++ 
+++#include "vk_synchronization.h"
+++
++ #include "cl906f.h"
++ #include "cla0b5.h"
++ #include "cla1c0.h"
++@@ -17,6 +19,7 @@
++ #include "clc5c0.h"
++ #include "clcbc0.h"
++ #include "clcdc0.h"
+++#include "clcec0.h"
++ #include "nv_push_cl90c0.h"
++ #include "nv_push_cl9097.h"
++ #include "nv_push_cla0c0.h"
++@@ -27,6 +30,7 @@
++ #include "nv_push_clc6c0.h"
++ #include "nv_push_clc7c0.h"
++ #include "nv_push_clc86f.h"
+++#include "nv_push_clcec0.h"
++ 
++ VkResult
++ nvk_push_dispatch_state_init(struct nvk_queue *queue, struct nv_push *p)
++@@ -155,6 +159,358 @@ nvk_flush_compute_state(struct nvk_cmd_buffer *cmd,
++       nvk_cmd_buffer_flush_printf_buffer(cmd, desc);
++ }
++ 
+++
+++/* Compute -> compute ordering with QMD dependencies (struct nvk_cs_join).
+++ *
+++ * NVIDIA's driver (libnvidia-eglcore.so 615.78.08) never drains the compute
+++ * pipe for a compute -> compute barrier.  Every dispatch QMD gets
+++ * DEPENDENT_QMD0 {DECREMENT_DEPENDENCE, PREFETCH} pointing at an empty
+++ * "join" QMD J (CTA 1x1x1, grid 0) whose DEPENDENCE_COUNTER is the number of
+++ * dispatches linked to it plus one.  At the first dispatch after a barrier,
+++ * the host releases J (SEND_PCAS_A + SEND_SIGNALING_PCAS2_B
+++ * DECREMENT_DEPENDENCE), J's DEPENDENT_QMD0 points at that dispatch, which
+++ * has DEPENDENCE_COUNTER 1, and J carries the destination's cache
+++ * invalidates.  Later dispatches hang off J through empty link QMDs on
+++ * DEPENDENT_QMD1.  After each dispatch is launched, the QMD it waits on gets
+++ * one more count and one host decrement, so it cannot complete before the
+++ * dependent QMD has been loaded.  Join and link QMDs are loaded inline from
+++ * the push buffer (SET_INLINE_QMD_ADDRESS + LOAD_INLINE_QMD_DATA) and their
+++ * counters and links are patched in place until the command buffer ends,
+++ * so every execution of the command buffer starts from the recorded state.
+++ *
+++ * Only the Blackwell B layout has been measured on hardware; every other
+++ * class keeps WAIT_FOR_IDLE for compute barriers.
+++ */
+++#define NVK_CS_JOIN_MAX_CHAIN 0x24
+++
+++bool
+++nvk_cmd_cs_join_supported(struct nvk_cmd_buffer *cmd)
+++{
+++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+++   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+++
+++   return pdev->info.cls_compute == BLACKWELL_COMPUTE_B &&
+++          !cmd->cs_join_cond_render;
+++}
+++
+++static void
+++nvk_cs_join_pcas_decrement(struct nvk_cmd_buffer *cmd,
+++                           const struct nvk_cs_join_qmd *q)
+++{
+++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
+++   P_MTHD(p, NVA0C0, SEND_PCAS_A);
+++   P_NVA0C0_SEND_PCAS_A(p, q->addr >> 8);
+++   P_IMMD(p, NVC6C0, SEND_SIGNALING_PCAS2_B,
+++          PCAS_ACTION_DECREMENT_DEPENDENCE);
+++}
+++
+++static void
+++nvk_cs_join_set_counter(struct nvk_cmd_buffer *cmd,
+++                        struct nvk_cs_join_qmd *q, uint32_t counter)
+++{
+++   const struct nvk_physical_device *pdev =
+++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+++   nak_qmd_set_dependence_counter(&pdev->info, q->map,
+++                                  nak_qmd_size_B(&pdev->info), counter);
+++   q->counter = counter;
+++}
+++
+++/* An empty QMD built from the dispatch's own QMD, loaded inline. */
+++static VkResult
+++nvk_cs_join_emit_empty(struct nvk_cmd_buffer *cmd, const uint32_t *tmpl,
+++                       struct nvk_cs_join_qmd *q)
+++{
+++   const struct nvk_physical_device *pdev =
+++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+++   const uint32_t qmd_size_B = nak_qmd_size_B(&pdev->info);
+++   const uint32_t qmd_dw = qmd_size_B / 4;
+++   assert(qmd_size_B == 384);
+++
+++   void *qmd_mem;
+++   VkResult result = nvk_cmd_buffer_alloc_qmd(cmd, qmd_size_B, 0x100,
+++                                              &q->addr, &qmd_mem);
+++   if (unlikely(result != VK_SUCCESS))
+++      return result;
+++
+++   uint32_t qmd[NAK_MAX_QMD_DWORDS];
+++   memcpy(qmd, tmpl, qmd_size_B);
+++   nak_qmd_set_empty_grid(&pdev->info, qmd, qmd_size_B);
+++
+++   /* NAK's V05 QMD is 384 bytes: load all of it, so nothing of the QMD
+++    * comes from the memory behind q->addr.
+++    */
+++   uint32_t addr_a;
+++   V_NVCEC0_SET_INLINE_QMD_ADDRESS_A(addr_a, {
+++      .qmd_address_shifted8_upper = q->addr >> 40,
+++      .inline_size = INLINE_SIZE_INLINE_384,
+++   });
+++
+++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 4 + qmd_dw);
+++   P_MTHD(p, NVC6C0, SET_INLINE_QMD_ADDRESS_A);
+++   P_INLINE_DATA(p, addr_a);
+++   P_NVC6C0_SET_INLINE_QMD_ADDRESS_B(p, q->addr >> 8);
+++   P_MTHD(p, NVC6C0, LOAD_INLINE_QMD_DATA(0));
+++   q->map = p->end;
+++   P_INLINE_ARRAY(p, qmd, qmd_dw);
+++
+++   q->counter = 0;
+++   q->valid = true;
+++   cmd->cs_join.chain++;
+++
+++   return VK_SUCCESS;
+++}
+++
+++static void
+++nvk_cs_join_put_invalidates(struct nvk_cmd_buffer *cmd, uint32_t *qmd)
+++{
+++   const struct nvk_physical_device *pdev =
+++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+++   struct nvk_cs_join *j = &cmd->cs_join;
+++
+++   nak_qmd_set_invalidates(&pdev->info, qmd, nak_qmd_size_B(&pdev->info),
+++                           j->inval_tex, j->inval_data, j->inval_const);
+++   j->inval_tex = j->inval_data = j->inval_const = false;
+++}
+++
+++/* Before a dispatch QMD is written: make sure a join QMD is open (releasing
+++ * the previous one if a barrier happened), link the dispatch to the work
+++ * before the barrier and to the open join QMD.  `qmd` is the dispatch's QMD
+++ * (not yet in memory), `qmd_addr` where it will be launched from.
+++ */
+++static VkResult
+++nvk_cs_join_dispatch(struct nvk_cmd_buffer *cmd, uint32_t *qmd,
+++                     uint64_t qmd_addr)
+++{
+++   const struct nvk_physical_device *pdev =
+++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+++   const uint32_t qmd_size_B = nak_qmd_size_B(&pdev->info);
+++   struct nvk_cs_join *j = &cmd->cs_join;
+++   VkResult result;
+++
+++   /* The chain length counts dispatches and the QMDs created for them */
+++   j->chain++;
+++
+++   /* Join QMD (E 0xd345d0) */
+++   if (j->join.valid && j->barrier) {
+++      nvk_cs_join_pcas_decrement(cmd, &j->join);
+++      j->prev = j->join;
+++      j->link.valid = false;
+++      j->join.valid = false;
+++      j->linked = 0;
+++      j->barrier = false;
+++   }
+++   if (j->join.valid) {
+++      nvk_cs_join_set_counter(cmd, &j->join, j->linked + 2);
+++   } else {
+++      result = nvk_cs_join_emit_empty(cmd, qmd, &j->join);
+++      if (unlikely(result != VK_SUCCESS))
+++         return result;
+++      nvk_cs_join_set_counter(cmd, &j->join, j->linked + 2);
+++   }
+++
+++   /* Link to the work before the last barrier (E 0xd33fb0) */
+++   struct nvk_cs_join_qmd *holder = j->link.valid ? &j->link :
+++                                    j->prev.valid ? &j->prev : NULL;
+++   if (holder == &j->prev &&
+++       !nak_qmd_dependent_qmd_enabled(&pdev->info, j->prev.map,
+++                                      qmd_size_B, 0)) {
+++      nak_qmd_set_dependent_qmd(&pdev->info, j->prev.map, qmd_size_B,
+++                                0, qmd_addr);
+++      nvk_cs_join_put_invalidates(cmd, j->prev.map);
+++   } else if (holder != NULL) {
+++      struct nvk_cs_join_qmd link;
+++      result = nvk_cs_join_emit_empty(cmd, qmd, &link);
+++      if (unlikely(result != VK_SUCCESS))
+++         return result;
+++      nak_qmd_set_dependent_qmd(&pdev->info, link.map, qmd_size_B,
+++                                0, qmd_addr);
+++      nvk_cs_join_set_counter(cmd, &link, 1);
+++      nak_qmd_set_dependent_qmd(&pdev->info, holder->map, qmd_size_B,
+++                                1, link.addr);
+++      nvk_cs_join_set_counter(cmd, holder, holder->counter + 1);
+++      nvk_cs_join_pcas_decrement(cmd, holder);
+++      nvk_cs_join_put_invalidates(cmd, holder->map);
+++      j->link = link;
+++   }
+++
+++   /* The dispatch itself (E 0xd35a90): wait for one decrement if anything
+++    * precedes it, decrement the open join QMD when done.
+++    */
+++   const bool waits = j->link.valid || j->prev.valid;
+++   nak_qmd_set_dependence_counter(&pdev->info, qmd, qmd_size_B, waits);
+++   if (!waits)
+++      nvk_cs_join_put_invalidates(cmd, qmd);
+++   nak_qmd_set_dependent_qmd(&pdev->info, qmd, qmd_size_B, 0,
+++                             j->join.addr);
+++
+++   return VK_SUCCESS;
+++}
+++
+++/* After the dispatch QMD was launched (E 0xd36060) */
+++static void
+++nvk_cs_join_launched(struct nvk_cmd_buffer *cmd)
+++{
+++   struct nvk_cs_join *j = &cmd->cs_join;
+++   struct nvk_cs_join_qmd *holder = j->link.valid ? &j->link :
+++                                    j->prev.valid ? &j->prev : NULL;
+++   if (holder != NULL) {
+++      nvk_cs_join_set_counter(cmd, holder, holder->counter + 1);
+++      nvk_cs_join_pcas_decrement(cmd, holder);
+++   }
+++   j->linked++;
+++}
+++
+++/* Release the open join QMD and forget the chain.  A barrier still waiting
+++ * for its dispatch is drained with methods.  Called before anything that
+++ * waits for idle, before secondaries and at the end of the command buffer.
+++ */
+++void
+++nvk_cmd_cs_join_close(struct nvk_cmd_buffer *cmd)
+++{
+++   struct nvk_cs_join *j = &cmd->cs_join;
+++
+++   /* Dispatches of this chain no later chain links to */
+++   if (j->join.valid || j->prev.valid)
+++      cmd->cs_join_covered = false;
+++
+++   if (j->join.valid)
+++      nvk_cs_join_pcas_decrement(cmd, &j->join);
+++
+++   if (j->barrier) {
+++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+++      P_IMMD(p, NVA0C0, WAIT_FOR_IDLE, 0);
+++      if (j->inval_tex) {
+++         P_IMMD(p, NVA0C0, INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI, {
+++            .lines = LINES_ALL,
+++         });
+++      }
+++      if (j->inval_data || j->inval_const) {
+++         P_IMMD(p, NVA0C0, INVALIDATE_SHADER_CACHES_NO_WFI, {
+++            .global_data = j->inval_data,
+++            .constant = j->inval_const,
+++         });
+++      }
+++      cmd->cs_join_covered = true;
+++   }
+++
+++   memset(j, 0, sizeof(*j));
+++}
+++
+++static bool
+++nvk_cs_join_stages_ok(VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst)
+++{
+++   src = vk_expand_src_stage_flags2(src);
+++   dst = vk_expand_dst_stage_flags2(dst);
+++   const VkPipelineStageFlags2 none = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT |
+++                                      VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+++   return (src & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) &&
+++          !(src & ~(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | none)) &&
+++          !(dst & ~(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | none));
+++}
+++
+++static bool
+++nvk_cs_join_add(struct nvk_cs_join *j,
+++                VkPipelineStageFlags2 src_stages, VkAccessFlags2 src_access,
+++                VkPipelineStageFlags2 dst_stages, VkAccessFlags2 dst_access)
+++{
+++   if (!nvk_cs_join_stages_ok(src_stages, dst_stages))
+++      return false;
+++
+++   src_access = vk_filter_src_access_flags2(
+++      vk_expand_src_stage_flags2(src_stages), src_access);
+++   if (src_access & ~(VK_ACCESS_2_SHADER_WRITE_BIT |
+++                      VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+++                      VK_ACCESS_2_MEMORY_WRITE_BIT |
+++                      VK_ACCESS_2_SHADER_READ_BIT |
+++                      VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+++                      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+++                      VK_ACCESS_2_UNIFORM_READ_BIT |
+++                      VK_ACCESS_2_MEMORY_READ_BIT))
+++      return false;
+++
+++   dst_access = vk_filter_dst_access_flags2(
+++      vk_expand_dst_stage_flags2(dst_stages), dst_access);
+++   if (dst_access & ~(VK_ACCESS_2_SHADER_READ_BIT |
+++                      VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+++                      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+++                      VK_ACCESS_2_UNIFORM_READ_BIT |
+++                      VK_ACCESS_2_SHADER_WRITE_BIT |
+++                      VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT))
+++      return false;
+++
+++   /* The proprietary driver's mapping: shader / storage / sampled reads
+++    * invalidate texture and shader data, uniform reads the constant cache.
+++    * NAK may also read uniform buffers through global loads, so they also
+++    * invalidate shader data, as NVK's own barrier does.
+++    */
+++   if (dst_access & (VK_ACCESS_2_SHADER_READ_BIT |
+++                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+++                     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT)) {
+++      j->inval_tex = true;
+++      j->inval_data = true;
+++   }
+++   if (dst_access & VK_ACCESS_2_UNIFORM_READ_BIT) {
+++      j->inval_data = true;
+++      j->inval_const = true;
+++   }
+++
+++   return true;
+++}
+++
+++/* A vkCmdPipelineBarrier2 that only orders compute shaders against compute
+++ * shaders: recorded for the next dispatch instead of draining.  Returns
+++ * false when the barrier needs the method path.
+++ */
+++bool
+++nvk_cmd_cs_join_barrier(struct nvk_cmd_buffer *cmd,
+++                        const VkDependencyInfo *dep)
+++{
+++   struct nvk_cs_join *j = &cmd->cs_join;
+++
+++   if (!nvk_cmd_cs_join_supported(cmd) || !j->join.valid ||
+++       !cmd->cs_join_covered ||
+++       j->chain > NVK_CS_JOIN_MAX_CHAIN ||
+++       (dep->dependencyFlags & VK_DEPENDENCY_ASYMMETRIC_EVENT_BIT_KHR))
+++      return false;
+++
+++   struct nvk_cs_join t = *j;
+++   bool any = false;
+++
+++   for (uint32_t i = 0; i < dep->memoryBarrierCount; i++) {
+++      const VkMemoryBarrier2 *bar = &dep->pMemoryBarriers[i];
+++      if (!nvk_cs_join_add(&t, bar->srcStageMask, bar->srcAccessMask,
+++                           bar->dstStageMask, bar->dstAccessMask))
+++         return false;
+++      any = true;
+++   }
+++
+++   for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount; i++) {
+++      const VkBufferMemoryBarrier2 *bar = &dep->pBufferMemoryBarriers[i];
+++      if (bar->srcQueueFamilyIndex != bar->dstQueueFamilyIndex ||
+++          !nvk_cs_join_add(&t, bar->srcStageMask, bar->srcAccessMask,
+++                           bar->dstStageMask, bar->dstAccessMask))
+++         return false;
+++      any = true;
+++   }
+++
+++   for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; i++) {
+++      const VkImageMemoryBarrier2 *bar = &dep->pImageMemoryBarriers[i];
+++      if (bar->srcQueueFamilyIndex != bar->dstQueueFamilyIndex ||
+++          bar->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED ||
+++          !nvk_cs_join_add(&t, bar->srcStageMask, bar->srcAccessMask,
+++                           bar->dstStageMask, bar->dstAccessMask))
+++         return false;
+++      any = true;
+++   }
+++
+++   if (!any)
+++      return false;
+++
+++   t.barrier = true;
+++   *j = t;
+++   return true;
+++}
+++
++ static VkResult
++ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
++                    const struct nvk_shader *shader,
++@@ -162,6 +518,7 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
++                    const void *root,
++                    size_t root_size,
++                    uint32_t global_size[3],
+++                   bool join,
++                    uint64_t *qmd_addr_out,
++                    uint64_t *root_desc_addr_out)
++ {
++@@ -237,6 +594,12 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
++       if (unlikely(result != VK_SUCCESS))
++          return result;
++ 
+++      if (join) {
+++         result = nvk_cs_join_dispatch(cmd, qmd, qmd_addr);
+++         if (unlikely(result != VK_SUCCESS))
+++            return result;
+++      }
+++
++       memcpy(qmd_map, qmd, qmd_size_B);
++    }
++ 
++@@ -259,7 +622,7 @@ nvk_cmd_flush_cs_qmd(struct nvk_cmd_buffer *cmd,
++ 
++    return nvk_cmd_upload_qmd(cmd, state->cs.shader, desc,
++                              desc->root, sizeof(desc->root),
++-                             global_size,
+++                             global_size, false,
++                              qmd_addr_out, root_desc_addr_out);
++ }
++ 
++@@ -306,9 +669,14 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
++    uint32_t global_size[3] = { groupCountX, groupCountY, groupCountZ };
++    nvk_flush_compute_state(cmd, base_workgroup, global_size);
++ 
+++   const bool join = nvk_cmd_cs_join_supported(cmd);
+++   if (!join)
+++      cmd->cs_join_covered = false;
++    uint64_t qmd_addr = 0;
++-   VkResult result = nvk_cmd_flush_cs_qmd(cmd, &cmd->state, global_size,
++-                                          &qmd_addr, NULL);
+++   const struct nvk_descriptor_state *desc = &cmd->state.cs.descriptors;
+++   VkResult result = nvk_cmd_upload_qmd(cmd, cmd->state.cs.shader, desc,
+++                                        desc->root, sizeof(desc->root),
+++                                        global_size, join, &qmd_addr, NULL);
++    if (result != VK_SUCCESS) {
++       vk_command_buffer_set_error(&cmd->vk, result);
++       return;
++@@ -345,6 +713,9 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
++       P_IMMD(p, NVC6C0, SEND_SIGNALING_PCAS2_B,
++              PCAS_ACTION_INVALIDATE_COPY_SCHEDULE);
++    }
+++
+++   if (join)
+++      nvk_cs_join_launched(cmd);
++ }
++ 
++ void
++@@ -360,10 +731,14 @@ nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
++ 
++    uint32_t group_count[3] = { groupCountX, groupCountY, groupCountZ };
++ 
+++   /* Internal dispatches are not part of the dependency chain */
+++   nvk_cmd_cs_join_close(cmd);
+++   cmd->cs_join_covered = false;
+++
++    uint64_t qmd_addr;
++    VkResult result = nvk_cmd_upload_qmd(cmd, shader, NULL,
++                                         root, root_size,
++-                                        group_count,
+++                                        group_count, false,
++                                         &qmd_addr, NULL);
++    if (result != VK_SUCCESS) {
++       vk_command_buffer_set_error(&cmd->vk, result);
++@@ -579,6 +954,10 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
++ 
++    uint64_t dispatch_addr = pInfo->addressRange.address;
++ 
+++   /* The indirect path waits for idle below; its dispatch is not linked */
+++   nvk_cmd_cs_join_close(cmd);
+++   cmd->cs_join_covered = false;
+++
++    /* We set these through the MME */
++    uint32_t base_workgroup[3] = { 0, 0, 0 };
++    uint32_t global_size[3] = { 0, 0, 0 };
++diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
++index 362d8c50e43a..87e64e7935ca 100644
++--- a/src/nouveau/vulkan/nvk_cmd_draw.c
+++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
++@@ -6072,6 +6072,12 @@ nvk_CmdBeginConditionalRendering2EXT(VkCommandBuffer commandBuffer,
++    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++ 
+++   /* Every dependency decrement must be sent before launches can be
+++    * skipped.
+++    */
+++   nvk_cmd_cs_join_close(cmd);
+++   cmd->cs_join_cond_render = true;
+++
++    if (pdev->info.cls_eng3d >= TURING_A) {
++       nvk_cmd_begin_cond_render_mme(cmd, pConditionalRenderingBegin);
++    } else {
++@@ -6084,6 +6090,8 @@ nvk_CmdEndConditionalRenderingEXT(VkCommandBuffer commandBuffer)
++ {
++    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++ 
+++   cmd->cs_join_cond_render = false;
+++
++    struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
++    if (nvk_cmd_buffer_last_subchannel(cmd) == SUBC_NV9097) {
++       /* The GLOBAL variant sets render enable across both 3d and compute */
++diff --git a/src/nouveau/vulkan/nvk_cmd_indirect.c b/src/nouveau/vulkan/nvk_cmd_indirect.c
++index 7aca0c2bf846..0ed79a1fde85 100644
++--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
+++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
++@@ -1126,6 +1126,12 @@ nvk_CmdPreprocessGeneratedCommandsEXT(VkCommandBuffer commandBuffer,
++    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++    VK_FROM_HANDLE(nvk_cmd_buffer, state_cmd, stateCommandBuffer);
++ 
+++   /* Waits for idle below: release the open join QMD first; the
+++    * dispatches here are not linked.
+++    */
+++   nvk_cmd_cs_join_close(cmd);
+++   cmd->cs_join_covered = false;
+++
++    nvk_cmd_flush_process_state(state_cmd, info);
++    nvk_cmd_process_cmds(cmd, info, &state_cmd->state);
++ }
++@@ -1141,6 +1147,12 @@ nvk_CmdExecuteGeneratedCommandsEXT(VkCommandBuffer commandBuffer,
++    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++ 
+++   /* Waits for idle below: release the open join QMD first; the
+++    * dispatches here are not linked.
+++    */
+++   nvk_cmd_cs_join_close(cmd);
+++   cmd->cs_join_covered = false;
+++
++    if (!isPreprocessed) {
++       nvk_cmd_flush_process_state(cmd, info);
++       nvk_cmd_process_cmds(cmd, info, &cmd->state);
++@@ -1318,6 +1330,12 @@ nvk_CmdCopyMemoryIndirectKHR(VkCommandBuffer commandBuffer,
++                              const VkCopyMemoryIndirectInfoKHR* info)
++ {
++    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+++
+++   /* Waits for idle below: release the open join QMD first; the
+++    * dispatches here are not linked.
+++    */
+++   nvk_cmd_cs_join_close(cmd);
+++   cmd->cs_join_covered = false;
++    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++    VkResult result;
++diff --git a/src/nouveau/vulkan/nvk_query_pool.c b/src/nouveau/vulkan/nvk_query_pool.c
++index af6f89fd8722..62fcfd7d1c39 100644
++--- a/src/nouveau/vulkan/nvk_query_pool.c
+++++ b/src/nouveau/vulkan/nvk_query_pool.c
++@@ -342,6 +342,9 @@ nvk_CmdResetQueryPool(VkCommandBuffer commandBuffer,
++    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++    VK_FROM_HANDLE(nvk_query_pool, pool, queryPool);
++ 
+++   /* Waits for idle below: release the open join QMD first */
+++   nvk_cmd_cs_join_close(cmd);
+++
++    if (unlikely(!queryCount))
++       return;
++ 
++@@ -405,6 +408,9 @@ nvk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
++    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++    VK_FROM_HANDLE(nvk_query_pool, pool, queryPool);
++ 
+++   /* Waits for idle below: release the open join QMD first */
+++   nvk_cmd_cs_join_close(cmd);
+++
++    assert(pool->layout == NVK_QUERY_POOL_LAYOUT_TIMESTAMP_PACKED);
++ 
++    uint64_t report_addr = nvk_query_report_addr(pool, query);
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/README.md b/nvidia-prolapse/driver-source/native/mesa/tests/README.md
+index 220d220..0852abd 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/tests/README.md
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/README.md
+@@ -631,6 +631,36 @@ WAIT_FOR_IDLE, as NVIDIA's driver emits it (libnvidia-eglcore.so 615.78.08 E 0xc
+ 10-24 (RTX 5090): 480 rounds per case at spin 0 / 300 / 2000 / 20000, all PASS; stock PASS; unordered FAIL on
+ both (colour 60/60 and compute 57-60/60 bad rounds). 0 Xid.
+ 
++## vk-cs-join-reuse.c (compute -> compute barriers on re-executed and split command buffers)
++
++    T=build/cs-join-reuse; mkdir -p $T; S=nvidia-prolapse/driver-source/native/mesa/tests
++    glslangValidator -V -S comp $S/vk-cs-join-reuse.glsl --vn vk_cs_join_reuse_inc -o $T/vk-cs-join-reuse.inc.h
++    cc -std=c11 -Wall -Wextra -Werror -I$T $S/vk-cs-join-reuse.c -lvulkan -o $T/vk-cs-join-reuse
++    E="VK_DRIVER_FILES=$PWD/build/nvk-host/native-rm-icd.json VK_LOADER_LAYERS_DISABLE=~implicit~"
++    for spin in 0 2000 20000; do for m in reuse double clear split; do env $E $T/vk-cs-join-reuse 20 $spin $m; done; done
++    env $E $T/vk-cs-join-reuse 5 2000 unordered                     # negative control: must FAIL
++    NVK_DEBUG=push_dump env $E $T/vk-cs-join-reuse 1 2000 2>&1 | grep -c SET_INLINE_QMD_ADDRESS_A   # 40 on Blackwell B
++
++16 epochs x 3 dispatches, each dispatch a read-spin-write increment of its slice of a host-visible
++buffer, a COMPUTE storage write/read -> COMPUTE storage read/write memory barrier after every epoch;
++every element must equal the epoch count after each execution. `reuse` records once without
++ONE_TIME_SUBMIT and submits 20 times; `double` submits the SIMULTANEOUS_USE command buffer twice per
++vkQueueSubmit; `clear` adds a vkCmdClearColorImage (3D work) inside every epoch; `split` puts epoch 0
++in a first command buffer and starts the second with a one-workgroup dispatch and the barrier, so
++the barrier has to order the first command buffer's work too. On Blackwell B these barriers become
++join / link QMDs loaded inline (SET_INLINE_QMD_ADDRESS_A with INLINE_SIZE_INLINE_384, then
++LOAD_INLINE_QMD_DATA) and SEND_SIGNALING_PCAS2_B DECREMENT_DEPENDENCE, as NVIDIA's driver orders
++compute work (libnvidia-eglcore.so 615.78.08 E 0xd35a90 / E 0xd345d0 / E 0xd33fb0 / E 0xd36060);
++the first barrier of a command buffer and every barrier after 0x24 chained dispatches + QMDs keep
++the method path.
++10-24 (RTX 5090, Blackwell B): reuse / double / clear / split at spin 0, 2000, 20000, 20 executions each, all
++PASS; unordered FAIL (5/5 executions). Push dump of one execution: 40 inline QMDs, 76 dependency decrements,
++3 INVALIDATE_SHADER_CACHES{FLUSH_DATA} + 1 WAIT_FOR_IDLE (first barrier, two chain-limit fallbacks, the
++pending last barrier at vkEndCommandBuffer) where NVK without the join QMDs emits 16 flush-form invalidates.
++vk-barrier-order on the same build: 40 rounds at spin 0 / 300 / 2000 / 20000 PASS, unordered FAIL; its push
++dump goes from 90 to 78 WAIT_FOR_IDLE and 37 to 25 flush-form invalidates (the compute -> compute barrier of
++each round). 0 Xid.
++
+ ## nak-qmd-membar.c (CWD_MEMBAR_TYPE in the QMDs of the built NVK)
+ 
+     M=build/mesa-rm-source; B=build/nvk-host; S=nvidia-prolapse/driver-source/native/mesa/tests
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/vk-cs-join-reuse.c b/nvidia-prolapse/driver-source/native/mesa/tests/vk-cs-join-reuse.c
+new file mode 100644
+index 0000000..6facab1
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/vk-cs-join-reuse.c
+@@ -0,0 +1,276 @@
++/*
++ * Compute -> compute barriers on a command buffer that is executed more than once.
++ *
++ * The command buffer runs EPOCHS epochs; each epoch dispatches SLICES dispatches, dispatch j
++ * incrementing every element of slice j of buffer A once (read, spin, write x + 1), then a
++ * COMPUTE / SHADER_STORAGE_WRITE|READ -> COMPUTE / SHADER_STORAGE_READ|WRITE memory barrier.
++ * Each slice is therefore incremented once per epoch and every increment must be ordered behind
++ * the previous epoch's: after one execution every element is EPOCHS. Several dispatches per
++ * epoch exercise more than one dispatch waiting on the same barrier; enough epochs reach the
++ * driver's dependency-chain limit.
++ *
++ * Modes (argv[3]):
++ *   reuse   (default) record once (no ONE_TIME_SUBMIT), submit ITERATIONS times, one at a time,
++ *           A reset to 0 by the host before each; every execution must give EPOCHS.
++ *   double  SIMULTANEOUS_USE, the same command buffer twice in one vkQueueSubmit, ITERATIONS
++ *           times: 2 * EPOCHS (the trailing barrier orders the second execution behind the first).
++ *   clear   as reuse, plus a vkCmdClearColorImage of an unrelated image between the first and
++ *           second dispatch of every epoch (3D work while the barrier's dependency is open).
++ *   split   epoch 0 in a first command buffer, then a second command buffer (same submit) that
++ *           starts with a one-workgroup dispatch on an extra slice and a barrier, then epochs
++ *           1..: the barrier must also order the first command buffer's dispatches.
++ *   unordered  as reuse without the barriers: must FAIL (negative control).
++ *
++ * usage: vk-cs-join-reuse [ITERATIONS [SPIN [MODE [EPOCHS [SLICES]]]]]
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <vulkan/vulkan.h>
++
++#include "vk-cs-join-reuse.inc.h"
++
++#define VKCHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { \
++   fprintf(stderr, "%s:%d: %s = %d\n", __FILE__, __LINE__, #x, r_); exit(2); } } while (0)
++
++#define N 65536
++
++static VkDevice dev;
++static VkPhysicalDevice pd;
++
++static uint32_t
++mem_type(uint32_t bits, VkMemoryPropertyFlags want)
++{
++   VkPhysicalDeviceMemoryProperties mp;
++   vkGetPhysicalDeviceMemoryProperties(pd, &mp);
++   for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
++      if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want)
++         return i;
++   fprintf(stderr, "no memory type 0x%x for bits 0x%x\n", want, bits);
++   exit(2);
++}
++
++static void
++cs_barrier(VkCommandBuffer cb)
++{
++   VkMemoryBarrier2 mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
++      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
++      .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
++      .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
++      .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT };
++   VkDependencyInfo di = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
++      .pMemoryBarriers = &mb };
++   vkCmdPipelineBarrier2(cb, &di);
++}
++
++int
++main(int argc, char **argv)
++{
++   int iterations = argc > 1 ? atoi(argv[1]) : 20;
++   uint32_t spin = argc > 2 ? (uint32_t)atoi(argv[2]) : 2000;
++   const char *mode = argc > 3 ? argv[3] : "reuse";
++   int epochs = argc > 4 ? atoi(argv[4]) : 16;
++   int slices = argc > 5 ? atoi(argv[5]) : 3;
++   int dbl = !strcmp(mode, "double"), clear = !strcmp(mode, "clear"), unordered = !strcmp(mode, "unordered");
++   int split = !strcmp(mode, "split");
++   if (iterations <= 0 || epochs <= 0 || slices <= 0 || slices > 16 ||
++       (!dbl && !clear && !unordered && !split && strcmp(mode, "reuse"))) {
++      fprintf(stderr, "usage: %s [ITERATIONS [SPIN [reuse|double|clear|unordered [EPOCHS [SLICES]]]]]\n", argv[0]);
++      return 2;
++   }
++
++   VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++      .pApplicationName = "vk-cs-join-reuse", .apiVersion = VK_API_VERSION_1_3 };
++   VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
++   VkInstance inst;
++   VKCHECK(vkCreateInstance(&ici, NULL, &inst));
++   uint32_t n = 0;
++   VKCHECK(vkEnumeratePhysicalDevices(inst, &n, NULL));
++   VkPhysicalDevice pds[16];
++   if (n > 16) n = 16;
++   VKCHECK(vkEnumeratePhysicalDevices(inst, &n, pds));
++   VkPhysicalDeviceDriverProperties drv = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
++   for (uint32_t i = 0; i < n && !pd; i++) {
++      VkPhysicalDeviceProperties2 p = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv };
++      vkGetPhysicalDeviceProperties2(pds[i], &p);
++      if (p.properties.vendorID == 0x10de)
++         pd = pds[i];
++   }
++   if (!pd) { fprintf(stderr, "no NVIDIA (0x10de) Vulkan device\n"); return 2; }
++   printf("driver: %s (%s), mode %s, %d epochs x %d slices, spin %u\n", drv.driverName, drv.driverInfo,
++          mode, epochs, slices, spin);
++
++   uint32_t qn = 0;
++   vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, NULL);
++   VkQueueFamilyProperties qp[16];
++   if (qn > 16) qn = 16;
++   vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, qp);
++   uint32_t qf = UINT32_MAX;
++   for (uint32_t i = 0; i < qn && qf == UINT32_MAX; i++)
++      if ((qp[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
++          (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
++         qf = i;
++   if (qf == UINT32_MAX) { fprintf(stderr, "no graphics+compute queue\n"); return 2; }
++   float prio = 1.0f;
++   VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++      .queueFamilyIndex = qf, .queueCount = 1, .pQueuePriorities = &prio };
++   VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
++      .synchronization2 = VK_TRUE };
++   VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f13,
++      .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci };
++   VKCHECK(vkCreateDevice(pd, &dci, NULL, &dev));
++   VkQueue queue;
++   vkGetDeviceQueue(dev, qf, 0, &queue);
++
++   /* A: host-visible so the host resets and checks it directly */
++   const VkDeviceSize asize = (VkDeviceSize)N * 4 * (VkDeviceSize)(slices + 1);
++   VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = asize,
++      .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT };
++   VkBuffer a;
++   VKCHECK(vkCreateBuffer(dev, &bci, NULL, &a));
++   VkMemoryRequirements mr;
++   vkGetBufferMemoryRequirements(dev, a, &mr);
++   VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
++      .memoryTypeIndex = mem_type(mr.memoryTypeBits,
++                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
++   VkDeviceMemory amem;
++   VKCHECK(vkAllocateMemory(dev, &mai, NULL, &amem));
++   VKCHECK(vkBindBufferMemory(dev, a, amem, 0));
++   uint32_t *amap;
++   VKCHECK(vkMapMemory(dev, amem, 0, asize, 0, (void **)&amap));
++
++   /* unrelated image for the clear mode */
++   VkImageCreateInfo imci = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { 64, 64, 1 }, .mipLevels = 1, .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
++   VkImage img;
++   VKCHECK(vkCreateImage(dev, &imci, NULL, &img));
++   vkGetImageMemoryRequirements(dev, img, &mr);
++   VkMemoryAllocateInfo imai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
++      .memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
++   VkDeviceMemory imem;
++   VKCHECK(vkAllocateMemory(dev, &imai, NULL, &imem));
++   VKCHECK(vkBindImageMemory(dev, img, imem, 0));
++
++   VkDescriptorSetLayoutBinding b = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL };
++   VkDescriptorSetLayoutCreateInfo dlci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++      .bindingCount = 1, .pBindings = &b };
++   VkDescriptorSetLayout dsl;
++   VKCHECK(vkCreateDescriptorSetLayout(dev, &dlci, NULL, &dsl));
++   VkPushConstantRange pcr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 12 };
++   VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++      .setLayoutCount = 1, .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
++   VkPipelineLayout pl;
++   VKCHECK(vkCreatePipelineLayout(dev, &plci, NULL, &pl));
++   VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++      .codeSize = sizeof(vk_cs_join_reuse_inc), .pCode = vk_cs_join_reuse_inc };
++   VkShaderModule sm;
++   VKCHECK(vkCreateShaderModule(dev, &smci, NULL, &sm));
++   VkComputePipelineCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++      .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sm, .pName = "main" },
++      .layout = pl };
++   VkPipeline pipe;
++   VKCHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpci, NULL, &pipe));
++
++   VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
++   VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
++      .poolSizeCount = 1, .pPoolSizes = &ps };
++   VkDescriptorPool dp;
++   VKCHECK(vkCreateDescriptorPool(dev, &dpci, NULL, &dp));
++   VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
++      .descriptorPool = dp, .descriptorSetCount = 1, .pSetLayouts = &dsl };
++   VkDescriptorSet set;
++   VKCHECK(vkAllocateDescriptorSets(dev, &dsai, &set));
++   VkDescriptorBufferInfo dbi = { a, 0, VK_WHOLE_SIZE };
++   VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
++      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &dbi };
++   vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
++
++   VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = qf };
++   VkCommandPool pool;
++   VKCHECK(vkCreateCommandPool(dev, &cpi, NULL, &pool));
++   VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 2 };
++   VkCommandBuffer cbv[2];
++   VKCHECK(vkAllocateCommandBuffers(dev, &cai, cbv));
++   VkCommandBuffer cb = cbv[0];
++   VkCommandBufferBeginInfo cbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++      .flags = dbl ? VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT : 0 };
++   VKCHECK(vkBeginCommandBuffer(cb, &cbi));
++   if (clear) {
++      VkImageMemoryBarrier2 ib = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
++         .srcStageMask = VK_PIPELINE_STAGE_2_NONE, .dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT,
++         .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++         .newLayout = VK_IMAGE_LAYOUT_GENERAL, .image = img,
++         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++      VkDependencyInfo di = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
++         .pImageMemoryBarriers = &ib };
++      vkCmdPipelineBarrier2(cb, &di);
++   }
++   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
++   vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, NULL);
++   for (int e = 0; e < epochs; e++) {
++      if (split && e == 1) {
++         /* second command buffer: a dispatch on the extra slice, then the barrier */
++         VKCHECK(vkEndCommandBuffer(cb));
++         cb = cbv[1];
++         VKCHECK(vkBeginCommandBuffer(cb, &cbi));
++         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
++         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, NULL);
++         uint32_t pc[3] = { (uint32_t)slices, spin, N };
++         vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
++         vkCmdDispatch(cb, 1, 1, 1); /* short: done long before epoch 0 */
++         cs_barrier(cb);
++      }
++      for (int j = 0; j < slices; j++) {
++         uint32_t pc[3] = { (uint32_t)j, spin, N };
++         vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
++         vkCmdDispatch(cb, N / 64, 1, 1);
++         if (clear && j == 0) {
++            VkClearColorValue cv = { .float32 = { (float)e / epochs, 0, 0, 1 } };
++            VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
++            vkCmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &r);
++         }
++      }
++      if (!unordered && !(split && e == 0))
++         cs_barrier(cb);
++   }
++   VKCHECK(vkEndCommandBuffer(cb));
++
++   VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++   VkFence fence;
++   VKCHECK(vkCreateFence(dev, &fci, NULL, &fence));
++   VkCommandBuffer cbs[2] = { cb, cb };
++   if (split)
++      cbs[0] = cbv[0], cbs[1] = cbv[1];
++   const uint32_t want = (uint32_t)epochs * (dbl ? 2u : 1u);
++   long bad_execs = 0, bad_values = 0;
++   for (int it = 0; it < iterations; it++) {
++      memset(amap, 0, asize);
++      VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = dbl || split ? 2 : 1,
++         .pCommandBuffers = cbs };
++      VKCHECK(vkQueueSubmit(queue, 1, &si, fence));
++      VKCHECK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 20ull * 1000 * 1000 * 1000));
++      VKCHECK(vkResetFences(dev, 1, &fence));
++      long wrong = 0;
++      int first_i = -1;
++      uint32_t first = 0;
++      for (size_t i = 0; i < (size_t)N * (size_t)(slices + 1); i++)
++         if (amap[i] != (i < (size_t)N * (size_t)slices ? want :
++                         split && i < (size_t)N * (size_t)slices + 64 ? 1u : 0u)) {
++            if (first_i < 0) { first_i = (int)i; first = amap[i]; }
++            wrong++;
++         }
++      if (wrong) {
++         if (bad_execs < 5)
++            printf("MISMATCH execution %d: %ld wrong, first [%d] = %u (want %u)\n", it, wrong, first_i, first, want);
++         bad_execs++;
++         bad_values += wrong;
++      }
++   }
++   printf("%d executions, %ld bad executions, %ld wrong values\n", iterations, bad_execs, bad_values);
++   printf("%s\n", bad_values ? "FAIL" : "PASS");
++   return bad_values ? 1 : 0;
++}
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/vk-cs-join-reuse.glsl b/nvidia-prolapse/driver-source/native/mesa/tests/vk-cs-join-reuse.glsl
+new file mode 100644
+index 0000000..13f907e
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/vk-cs-join-reuse.glsl
+@@ -0,0 +1,17 @@
++#version 450
++/* Shader of vk-cs-join-reuse.c: one read-modify-write per invocation on slice `slice` of A, after
++ * spinning `spin` iterations, so a dispatch that is not ordered behind the previous one on the same
++ * slice loses increments.
++ */
++layout(local_size_x = 64) in;
++layout(push_constant) uniform PC { uint slice; uint spin; uint n; } pc;
++layout(std430, set = 0, binding = 0) buffer A { uint v[]; } a;
++void main() {
++   uint i = pc.slice * pc.n + gl_GlobalInvocationID.x;
++   uint x = a.v[i];
++   uint acc = x ^ gl_GlobalInvocationID.x;
++   for (uint k = 0u; k < pc.spin; k++)
++      acc = acc * 1664525u + 1013904223u;
++   /* acc | 1 is never 0: the write is x + 1, but only after the loop. */
++   a.v[i] = x + 1u + ((acc | 1u) == 0u ? 1u : 0u);
++}
+-- 
+2.56.0
+

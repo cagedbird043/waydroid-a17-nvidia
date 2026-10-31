@@ -1,0 +1,1467 @@
+From 1df977db95ceee7a2958293b9997278e229cd641 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 17:24:05 +0800
+Subject: [PATCH 69/72] =?utf-8?q?NVK=EF=BC=9A=E4=B8=BA=20Ampere=20B=20?=
+ =?utf-8?q?=E5=8F=8A=E6=9B=B4=E6=96=B0=E8=AE=A1=E7=AE=97=E7=B1=BB=E5=90=AF?=
+ =?utf-8?q?=E7=94=A8=20join-QMD=20=E5=B1=8F=E9=9A=9C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 364585ebcb1480f661fbe0063a46956b0df85148)
+---
+ .../native/mesa/nak-qmd-cwd-membar.patch      | 115 +++++-
+ .../native/mesa/nak-qmd-dependency.patch      | 359 +++++++++++++-----
+ .../native/mesa/nak-qmd-launch-fields.patch   |  76 ++--
+ .../native/mesa/nvk-compute-scg-init.patch    |  14 +-
+ .../native/mesa/nvk-cs-join-qmd.patch         |  81 ++--
+ .../mesa/nvk-turing-sked-qmd-invalidate.patch |  56 +--
+ .../driver-source/native/mesa/tests/README.md |  30 +-
+ .../native/mesa/tests/nak-qmd-dependency.c    |  65 ++++
+ .../native/mesa/tests/nak-qmd-membar.c        |  23 +-
+ 9 files changed, 586 insertions(+), 233 deletions(-)
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/tests/nak-qmd-dependency.c
+
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nak-qmd-cwd-membar.patch b/nvidia-prolapse/driver-source/native/mesa/nak-qmd-cwd-membar.patch
+index 04e5d92..295f3fa 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nak-qmd-cwd-membar.patch
++++ b/nvidia-prolapse/driver-source/native/mesa/nak-qmd-cwd-membar.patch
+@@ -1,10 +1,14 @@
+-nak: CWD_MEMBAR_TYPE = L1_MEMBAR in Blackwell B QMDs
++nak: CWD_MEMBAR_TYPE = L1_MEMBAR in every QMD from Turing on
+ 
+-NVIDIA's driver (libnvidia-eglcore.so 615.78.08) launches every Blackwell B (cec0) QMD with
+-CWD_MEMBAR_TYPE = L1_MEMBAR (QMDV05_00 MW(625:624) = 3, in its QMD template); NAK left it L1_NONE.
++NVIDIA's driver (libnvidia-eglcore.so 615.78.08) builds every compute QMD from a per-class template
++(ELF 0xaa12a0) that sets CWD_MEMBAR_TYPE = L1_MEMBAR in all its compute-class arms, Turing to
++Blackwell B: word 11 = 0x44030000 for its V02/V03 layouts (ELF 0xaa1338), word 35 = 0x30000 for
++its V04 layouts, Hopper and Blackwell A (ELF 0xaa14c7), word 19 = 0x30000 for V05, Blackwell B
++(ELF 0xaa13d3).  NAK left it L1_NONE.  Set it in NAK's V02_02 (Turing only), V03_00, V04_00 and
++V05_00 QMDs.  That library has no Volta class; Volta keeps L1_NONE.
+ 
+ diff --git a/src/nouveau/compiler/nak/qmd.rs b/src/nouveau/compiler/nak/qmd.rs
+-index d91d6a32841f..6b54e7153b94 100644
++index d91d6a32841f..827510d5caf9 100644
+ --- a/src/nouveau/compiler/nak/qmd.rs
+ +++ b/src/nouveau/compiler/nak/qmd.rs
+ @@ -7,7 +7,9 @@ use std::cmp::min;
+@@ -13,21 +17,64 @@ index d91d6a32841f..6b54e7153b94 100644
+  use nak_bindings::*;
+ -use nvidia_headers::classes::{cla0c0, clc0c0, clc3c0, clc6c0, clcbc0, clcdc0};
+ +use nvidia_headers::classes::{
+-+    cla0c0, clc0c0, clc3c0, clc6c0, clcbc0, clcdc0, clcec0,
+++    cla0c0, clc0c0, clc3c0, clc5c0, clc6c0, clcbc0, clcdc0,
+ +};
+  
+  use bitview::*;
+  use paste::paste;
+-@@ -621,6 +623,17 @@ mod qmd_5_0 {
++@@ -504,6 +506,15 @@ mod qmd_2_2 {
++         qmd_impl_set_smem_size_bounded!(clc3c0, QMDV02_02);
++         qmd_impl_set_slm_size!(clc3c0, QMDV02_02, NONE);
++     }
+++
+++    impl Qmd2_2 {
+++        /// CWD_MEMBAR_TYPE = L1_MEMBAR (MW(369:368), clc3c0qmd.h); see
+++        /// nak_fill_qmd for the classes that get it.
+++        pub fn set_cwd_membar_l1(&mut self) {
+++            let mut bv = QMDBitView::new(&mut self.qmd);
+++            set_enum!(bv, clc3c0, QMDV02_02, CWD_MEMBAR_TYPE, L1_MEMBAR);
+++        }
+++    }
++ }
++ use qmd_2_2::Qmd2_2;
++ 
++@@ -537,6 +548,14 @@ mod qmd_3_0 {
++         qmd_impl_set_smem_size_bounded!(clc6c0, QMDV03_00);
++         qmd_impl_set_slm_size!(clc6c0, QMDV03_00, NONE);
++     }
+++
+++    impl Qmd3_0 {
+++        /// CWD_MEMBAR_TYPE = L1_MEMBAR (MW(369:368), clc6c0qmd.h).
+++        pub fn set_cwd_membar_l1(&mut self) {
+++            let mut bv = QMDBitView::new(&mut self.qmd);
+++            set_enum!(bv, clc6c0, QMDV03_00, CWD_MEMBAR_TYPE, L1_MEMBAR);
+++        }
+++    }
++ }
++ use qmd_3_0::Qmd3_0;
++ 
++@@ -577,6 +596,14 @@ mod qmd_4_0 {
++         qmd_impl_set_smem_size_bounded!(clcbc0, QMDV04_00);
++         qmd_impl_set_slm_size!(clcbc0, QMDV04_00, NONE);
++     }
+++
+++    impl Qmd4_0 {
+++        /// CWD_MEMBAR_TYPE = L1_MEMBAR (MW(1137:1136), clcbc0qmd.h).
+++        pub fn set_cwd_membar_l1(&mut self) {
+++            let mut bv = QMDBitView::new(&mut self.qmd);
+++            set_enum!(bv, clcbc0, QMDV04_00, CWD_MEMBAR_TYPE, L1_MEMBAR);
+++        }
+++    }
++ }
++ use qmd_4_0::Qmd4_0;
++ 
++@@ -621,6 +648,14 @@ mod qmd_5_0 {
+          qmd_impl_set_smem_size_bounded_gb!(clcdc0, QMDV05_00);
+          qmd_impl_set_slm_size!(clcdc0, QMDV05_00, SHIFTED4);
+      }
+ +
+ +    impl Qmd5_0 {
+-+        /// L1 membar when each CTA completes, so the grid's stores are
+-+        /// visible in L2 once the CWD retires it.  NVIDIA's own driver
+-+        /// (libnvidia-eglcore.so 615.78.08) has CWD_MEMBAR_TYPE = L1_MEMBAR
+-+        /// in every Blackwell B (cec0) QMD it launches, Vulkan and GL.
+++        /// CWD_MEMBAR_TYPE = L1_MEMBAR (MW(625:624), clcdc0qmd.h).
+ +        pub fn set_cwd_membar_l1(&mut self) {
+ +            let mut bv = QMDBitView::new(&mut self.qmd);
+ +            set_enum!(bv, clcdc0, QMDV05_00, CWD_MEMBAR_TYPE, L1_MEMBAR);
+@@ -36,17 +83,55 @@ index d91d6a32841f..6b54e7153b94 100644
+  }
+  use qmd_5_0::Qmd5_0;
+  
+-@@ -707,7 +720,12 @@ pub extern "C" fn nak_fill_qmd(
++@@ -686,6 +721,16 @@ pub extern "C" fn nak_qmd_size_B(dev: &nv_device_info) -> u32 {
++     size_B
++ }
++ 
+++/// Every QMD from Turing on gets CWD_MEMBAR_TYPE = L1_MEMBAR (an L1 membar
+++/// when each CTA completes, so the grid's stores are visible in L2 once the
+++/// CWD retires it), as NVIDIA's driver builds them: the QMD template of
+++/// libnvidia-eglcore.so 615.78.08 (ELF 0xaa12a0) stores it in every
+++/// compute-class arm, Turing to Blackwell B, through its three layout tails
+++/// (ELF 0xaa1338: word 11 = 0x44030000 for its V02/V03 layouts; ELF
+++/// 0xaa14c7: word 35 = 0x30000 for its V04 layouts, Hopper and Blackwell A;
+++/// ELF 0xaa13d3: word 19 = 0x30000 for V05, Blackwell B).  That library
+++/// has no Volta class, and the Volta template of the 580 driver series has
+++/// not been read, so Volta keeps L1_NONE.
++ #[no_mangle]
++ pub extern "C" fn nak_fill_qmd(
++     dev: *const nv_device_info,
++@@ -707,19 +752,30 @@ pub extern "C" fn nak_fill_qmd(
+          if dev.cls_compute >= clcdc0::BLACKWELL_COMPUTE_A {
+              let qmd_out = qmd_out as *mut Qmd5_0;
+              assert!(qmd_size == size_of_val(&*qmd_out));
+ -            qmd_out.write(fill_qmd(dev, info, qmd_info));
+ +            let mut qmd: Qmd5_0 = fill_qmd(dev, info, qmd_info);
+-+            // Known for Blackwell B only; Blackwell A keeps L1_NONE.
+-+            if dev.cls_compute >= clcec0::BLACKWELL_COMPUTE_B {
+-+                qmd.set_cwd_membar_l1();
+-+            }
+++            qmd.set_cwd_membar_l1();
+ +            qmd_out.write(qmd);
+          } else if dev.cls_compute >= clcbc0::HOPPER_COMPUTE_A {
+              let qmd_out = qmd_out as *mut Qmd4_0;
+              assert!(qmd_size == size_of_val(&*qmd_out));
++-            qmd_out.write(fill_qmd(dev, info, qmd_info));
+++            let mut qmd: Qmd4_0 = fill_qmd(dev, info, qmd_info);
+++            qmd.set_cwd_membar_l1();
+++            qmd_out.write(qmd);
++         } else if dev.cls_compute >= clc6c0::AMPERE_COMPUTE_A {
++             let qmd_out = qmd_out as *mut Qmd3_0;
++             assert!(qmd_size == size_of_val(&*qmd_out));
++-            qmd_out.write(fill_qmd(dev, info, qmd_info));
+++            let mut qmd: Qmd3_0 = fill_qmd(dev, info, qmd_info);
+++            qmd.set_cwd_membar_l1();
+++            qmd_out.write(qmd);
++         } else if dev.cls_compute >= clc3c0::VOLTA_COMPUTE_A {
++             let qmd_out = qmd_out as *mut Qmd2_2;
++             assert!(qmd_size == size_of_val(&*qmd_out));
++-            qmd_out.write(fill_qmd(dev, info, qmd_info));
+++            let mut qmd: Qmd2_2 = fill_qmd(dev, info, qmd_info);
+++            // Turing on, not Volta (see above).
+++            if dev.cls_compute >= clc5c0::TURING_COMPUTE_A {
+++                qmd.set_cwd_membar_l1();
+++            }
+++            qmd_out.write(qmd);
++         } else if dev.cls_compute >= clc0c0::PASCAL_COMPUTE_A {
++             let qmd_out = qmd_out as *mut Qmd2_1;
++             assert!(qmd_size == size_of_val(&*qmd_out));
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nak-qmd-dependency.patch b/nvidia-prolapse/driver-source/native/mesa/nak-qmd-dependency.patch
+index 198a839..343ab49 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nak-qmd-dependency.patch
++++ b/nvidia-prolapse/driver-source/native/mesa/nak-qmd-dependency.patch
+@@ -1,21 +1,25 @@
+-nak: QMD dependency field setters for Blackwell B
++nak: QMD dependency field setters, Ampere B to Blackwell B
+ 
+ NVIDIA's driver (libnvidia-eglcore.so 615.78.08) orders compute work with QMD dependencies:
+ DEPENDENCE_COUNTER, DEPENDENT_QMD{0,1} {ENABLE, ACTION = DECREMENT_DEPENDENCE, PREFETCH,
+ POINTER} and the per-QMD INVALIDATE_{TEXTURE_DATA,SHADER_DATA,SHADER_CONSTANT}_CACHE bits
+ (writers E 0xd32f60, E 0xd33340, E 0xd334a0, E 0xd33fb0), plus empty QMDs with CTA 1x1x1 and
+-grid 0 (E 0xd34709).  Expose setters for those fields (clcec0qmd.h layout) to NVK.  Only the
+-Blackwell B layout is supported; any other class aborts with a named reason.
++grid 0 (E 0xd34709).  Its writers have one arm per QMD layout; it uses them for compute classes
++above 0xc6bf outside GA100.  Expose setters for those fields to NVK for NAK's QMD layouts on
++those classes: V03_00 (AMPERE_COMPUTE_B, ADA_COMPUTE_A; the second dependent QMD's pointer in
++word 9, where the driver stores it, E 0xd335d5), V04_00 (HOPPER_COMPUTE_A) and V05_00
++(BLACKWELL_COMPUTE_A/B).  Any other class aborts with a named reason.
+ 
+ diff --git a/src/nouveau/compiler/nak.h b/src/nouveau/compiler/nak.h
+-index 54a31230f642..fc5c1ad65f86 100644
++index 54a31230f642..616fa618a20e 100644
+ --- a/src/nouveau/compiler/nak.h
+ +++ b/src/nouveau/compiler/nak.h
+-@@ -334,6 +334,23 @@ struct nak_qmd_cbuf_desc_layout {
++@@ -334,6 +334,24 @@ struct nak_qmd_cbuf_desc_layout {
+  struct nak_qmd_cbuf_desc_layout
+  nak_get_qmd_cbuf_desc_layout(const struct nv_device_info *dev, uint8_t idx);
+  
+-+/* QMD dependency fields (Blackwell B compute only; other classes abort). */
+++/* QMD dependency fields (AMPERE_COMPUTE_B..BLACKWELL_COMPUTE_B; other
+++ * classes abort). */
+ +void nak_qmd_set_empty_grid(const struct nv_device_info *dev,
+ +                            void *qmd, size_t qmd_size);
+ +void nak_qmd_set_dependence_counter(const struct nv_device_info *dev,
+@@ -36,112 +40,237 @@ index 54a31230f642..fc5c1ad65f86 100644
+  }
+  #endif
+ diff --git a/src/nouveau/compiler/nak/qmd.rs b/src/nouveau/compiler/nak/qmd.rs
+-index 6b54e7153b94..35f9c2e29103 100644
++index 827510d5caf9..5659955c0a70 100644
+ --- a/src/nouveau/compiler/nak/qmd.rs
+ +++ b/src/nouveau/compiler/nak/qmd.rs
+-@@ -625,6 +625,16 @@ mod qmd_5_0 {
++@@ -8,7 +8,8 @@ use std::cmp::min;
++ use compiler::bindings::*;
++ use nak_bindings::*;
++ use nvidia_headers::classes::{
++-    cla0c0, clc0c0, clc3c0, clc5c0, clc6c0, clcbc0, clcdc0,
+++    cla0c0, clc0c0, clc3c0, clc5c0, clc6c0, clc7c0, clc9c0, clcbc0, clcdc0,
+++    clcec0,
++ };
++ 
++ use bitview::*;
++@@ -550,6 +551,16 @@ mod qmd_3_0 {
+      }
+  
+-     impl Qmd5_0 {
++     impl Qmd3_0 {
+ +        pub fn from_words(words: &[u32]) -> Self {
+-+            let mut qmd = [0; 96];
+++            let mut qmd = [0; 64];
+ +            qmd.copy_from_slice(words);
+ +            Self { qmd }
+ +        }
+ +
+-+        pub fn qmd_words(&self) -> [u32; 96] {
+++        pub fn qmd_words(&self) -> [u32; 64] {
+ +            self.qmd
+ +        }
+ +
+-         /// L1 membar when each CTA completes, so the grid's stores are
+-         /// visible in L2 once the CWD retires it.  NVIDIA's own driver
+-         /// (libnvidia-eglcore.so 615.78.08) has CWD_MEMBAR_TYPE = L1_MEMBAR
+-@@ -634,6 +644,65 @@ mod qmd_5_0 {
+-             set_enum!(bv, clcdc0, QMDV05_00, CWD_MEMBAR_TYPE, L1_MEMBAR);
+-         }
++         /// CWD_MEMBAR_TYPE = L1_MEMBAR (MW(369:368), clc6c0qmd.h).
++         pub fn set_cwd_membar_l1(&mut self) {
++             let mut bv = QMDBitView::new(&mut self.qmd);
++@@ -598,6 +609,16 @@ mod qmd_4_0 {
+      }
+-+
+-+    /// Dependency fields of a Blackwell B (cec0) QMD, as laid out in
+-+    /// clcec0qmd.h.  NVIDIA's driver (libnvidia-eglcore.so 615.78.08,
+-+    /// E 0xd32f60 / E 0xd33340 / E 0xd334a0 / E 0xd33fb0) writes exactly
+-+    /// these bits: DEPENDENCE_COUNTER, DEPENDENT_QMD{0,1} enable / action /
+-+    /// prefetch / pointer and the per-QMD cache invalidates.
+-+    pub mod cec0 {
+-+        use crate::qmd::*;
+-+        use nvidia_headers::classes::clcec0::qmd::*;
+-+
+-+        pub fn set_dependence_counter(qmd: &mut [u32], counter: u16) {
+-+            let mut bv = QMDBitView::new(qmd);
+-+            bv.set_field(QMDV05_00_DEPENDENCE_COUNTER, counter);
++ 
++     impl Qmd4_0 {
+++        pub fn from_words(words: &[u32]) -> Self {
+++            let mut qmd = [0; 96];
+++            qmd.copy_from_slice(words);
+++            Self { qmd }
+ +        }
+ +
+-+        pub fn set_dependent_qmd(qmd: &mut [u32], slot: usize, addr: u64) {
+-+            assert!(addr % 256 == 0);
+-+            let mut bv = QMDBitView::new(qmd);
+-+            bv.set_field(
+-+                QMDV05_00_DEPENDENT_QMD_ENABLE(slot),
+-+                QMDV05_00_DEPENDENT_QMD_ENABLE_TRUE,
+-+            );
+-+            bv.set_field(
+-+                QMDV05_00_DEPENDENT_QMD_ACTION(slot),
+-+                QMDV05_00_DEPENDENT_QMD_ACTION_QMD_DECREMENT_DEPENDENCE,
+-+            );
+-+            bv.set_field(
+-+                QMDV05_00_DEPENDENT_QMD_PREFETCH(slot),
+-+                QMDV05_00_DEPENDENT_QMD_PREFETCH_TRUE,
+-+            );
+-+            bv.set_field(
+-+                QMDV05_00_DEPENDENT_QMD_POINTER(slot),
+-+                u32::try_from(addr >> 8).unwrap(),
+-+            );
+++        pub fn qmd_words(&self) -> [u32; 96] {
+++            self.qmd
+ +        }
+ +
+-+        pub fn dependent_qmd_enabled(qmd: &mut [u32], slot: usize) -> bool {
+-+            let bv = QMDBitView::new(qmd);
+-+            bv.get_bit_range_u64(QMDV05_00_DEPENDENT_QMD_ENABLE(slot)) != 0
++         /// CWD_MEMBAR_TYPE = L1_MEMBAR (MW(1137:1136), clcbc0qmd.h).
++         pub fn set_cwd_membar_l1(&mut self) {
++             let mut bv = QMDBitView::new(&mut self.qmd);
++@@ -650,6 +671,16 @@ mod qmd_5_0 {
++     }
++ 
++     impl Qmd5_0 {
+++        pub fn from_words(words: &[u32]) -> Self {
+++            let mut qmd = [0; 96];
+++            qmd.copy_from_slice(words);
+++            Self { qmd }
+ +        }
+ +
+-+        pub fn set_invalidates(
+-+            qmd: &mut [u32],
+-+            texture_data: bool,
+-+            shader_data: bool,
+-+            shader_constant: bool,
+-+        ) {
+-+            let mut bv = QMDBitView::new(qmd);
+-+            if texture_data {
+-+                bv.set_field(QMDV05_00_INVALIDATE_TEXTURE_DATA_CACHE, 1_u32);
+-+            }
+-+            if shader_data {
+-+                bv.set_field(QMDV05_00_INVALIDATE_SHADER_DATA_CACHE, 1_u32);
+-+            }
+-+            if shader_constant {
+-+                bv.set_field(QMDV05_00_INVALIDATE_SHADER_CONSTANT_CACHE, 1_u32);
+-+            }
+++        pub fn qmd_words(&self) -> [u32; 96] {
+++            self.qmd
+ +        }
+-+    }
+++
++         /// CWD_MEMBAR_TYPE = L1_MEMBAR (MW(625:624), clcdc0qmd.h).
++         pub fn set_cwd_membar_l1(&mut self) {
++             let mut bv = QMDBitView::new(&mut self.qmd);
++@@ -659,6 +690,128 @@ mod qmd_5_0 {
+  }
+  use qmd_5_0::Qmd5_0;
+  
+-@@ -794,3 +863,97 @@ pub extern "C" fn nak_get_qmd_cbuf_desc_layout(
+++/// Where a QMD layout keeps the fields NVIDIA's driver
+++/// (libnvidia-eglcore.so 615.78.08) writes to order compute work through QMD
+++/// dependencies: DEPENDENCE_COUNTER (ELF 0xd32f60), DEPENDENT_QMD{0,1}
+++/// enable / action / prefetch / pointer (ELF 0xd33340, ELF 0xd334a0) and the
+++/// per-QMD cache invalidates (ELF 0xd341b0).  Those writers pick the layout
+++/// from the compute class: AMPERE_COMPUTE_B and ADA_COMPUTE_A share one,
+++/// HOPPER_COMPUTE_A and BLACKWELL_COMPUTE_A another, BLACKWELL_COMPUTE_B a
+++/// third.  NAK fills a V05_00 QMD on Blackwell A, so its fields follow
+++/// clcdc0qmd.h's V05_00 here, which equal clcec0qmd.h's.
+++mod qmd_dep {
+++    use std::ops::Range;
+++
+++    pub struct Layout {
+++        pub counter: Range<usize>,
+++        pub enable: [Range<usize>; 2],
+++        pub action: [Range<usize>; 2],
+++        pub prefetch: [Range<usize>; 2],
+++        pub pointer: [Range<usize>; 2],
+++        pub action_decrement: u32,
+++        pub inval_texture_data: Range<usize>,
+++        pub inval_shader_data: Range<usize>,
+++        pub inval_shader_constant: Range<usize>,
+++    }
+++
+++    /// QMD V03_00 (clc7c0qmd.h, the same bits in clc9c0qmd.h).  The second
+++    /// dependent QMD's pointer has no name of its own in the header: the
+++    /// proprietary driver stores it in QMD word 9 (ELF 0xd335d5,
+++    /// `mov %esi,0x24(%rax)` in the V03 arm of ELF 0xd334a0), the bits the
+++    /// header calls CIRCULAR_QUEUE_ADDR_LOWER, a field grid QMDs do not use.
+++    pub mod v3 {
+++        use super::Layout;
+++        use nvidia_headers::classes::clc7c0::qmd::*;
+++
+++        pub const LAYOUT: Layout = Layout {
+++            counter: QMDV03_00_DEPENDENCE_COUNTER,
+++            enable: [
+++                QMDV03_00_DEPENDENT_QMD0_ENABLE,
+++                QMDV03_00_DEPENDENT_QMD1_ENABLE,
+++            ],
+++            action: [
+++                QMDV03_00_DEPENDENT_QMD0_ACTION,
+++                QMDV03_00_DEPENDENT_QMD1_ACTION,
+++            ],
+++            prefetch: [
+++                QMDV03_00_DEPENDENT_QMD0_PREFETCH,
+++                QMDV03_00_DEPENDENT_QMD1_PREFETCH,
+++            ],
+++            pointer: [
+++                QMDV03_00_DEPENDENT_QMD0_POINTER,
+++                QMDV03_00_CIRCULAR_QUEUE_ADDR_LOWER,
+++            ],
+++            action_decrement:
+++                QMDV03_00_DEPENDENT_QMD0_ACTION_QMD_DECREMENT_DEPENDENCE,
+++            inval_texture_data: QMDV03_00_INVALIDATE_TEXTURE_DATA_CACHE,
+++            inval_shader_data: QMDV03_00_INVALIDATE_SHADER_DATA_CACHE,
+++            inval_shader_constant: QMDV03_00_INVALIDATE_SHADER_CONSTANT_CACHE,
+++        };
+++    }
+++
+++    /// QMD V04_00 (clcbc0qmd.h).
+++    pub mod v4 {
+++        use super::Layout;
+++        use nvidia_headers::classes::clcbc0::qmd::*;
+++
+++        pub const LAYOUT: Layout = Layout {
+++            counter: QMDV04_00_DEPENDENCE_COUNTER,
+++            enable: [
+++                QMDV04_00_DEPENDENT_QMD_ENABLE(0),
+++                QMDV04_00_DEPENDENT_QMD_ENABLE(1),
+++            ],
+++            action: [
+++                QMDV04_00_DEPENDENT_QMD_ACTION(0),
+++                QMDV04_00_DEPENDENT_QMD_ACTION(1),
+++            ],
+++            prefetch: [
+++                QMDV04_00_DEPENDENT_QMD_PREFETCH(0),
+++                QMDV04_00_DEPENDENT_QMD_PREFETCH(1),
+++            ],
+++            pointer: [
+++                QMDV04_00_DEPENDENT_QMD0_POINTER,
+++                QMDV04_00_DEPENDENT_QMD1_POINTER,
+++            ],
+++            action_decrement:
+++                QMDV04_00_DEPENDENT_QMD_ACTION_QMD_DECREMENT_DEPENDENCE,
+++            inval_texture_data: QMDV04_00_INVALIDATE_TEXTURE_DATA_CACHE,
+++            inval_shader_data: QMDV04_00_INVALIDATE_SHADER_DATA_CACHE,
+++            inval_shader_constant: QMDV04_00_INVALIDATE_SHADER_CONSTANT_CACHE,
+++        };
+++    }
+++
+++    /// QMD V05_00 (clcdc0qmd.h; clcec0qmd.h has the same bits).
+++    pub mod v5 {
+++        use super::Layout;
+++        use nvidia_headers::classes::clcdc0::qmd::*;
+++
+++        pub const LAYOUT: Layout = Layout {
+++            counter: QMDV05_00_DEPENDENCE_COUNTER,
+++            enable: [
+++                QMDV05_00_DEPENDENT_QMD_ENABLE(0),
+++                QMDV05_00_DEPENDENT_QMD_ENABLE(1),
+++            ],
+++            action: [
+++                QMDV05_00_DEPENDENT_QMD_ACTION(0),
+++                QMDV05_00_DEPENDENT_QMD_ACTION(1),
+++            ],
+++            prefetch: [
+++                QMDV05_00_DEPENDENT_QMD_PREFETCH(0),
+++                QMDV05_00_DEPENDENT_QMD_PREFETCH(1),
+++            ],
+++            pointer: [
+++                QMDV05_00_DEPENDENT_QMD_POINTER(0),
+++                QMDV05_00_DEPENDENT_QMD_POINTER(1),
+++            ],
+++            action_decrement:
+++                QMDV05_00_DEPENDENT_QMD_ACTION_QMD_DECREMENT_DEPENDENCE,
+++            inval_texture_data: QMDV05_00_INVALIDATE_TEXTURE_DATA_CACHE,
+++            inval_shader_data: QMDV05_00_INVALIDATE_SHADER_DATA_CACHE,
+++            inval_shader_constant: QMDV05_00_INVALIDATE_SHADER_CONSTANT_CACHE,
+++        };
+++    }
+++}
+++
++ fn fill_qmd<Q: QMD>(
++     dev: &nv_device_info,
++     info: &nak_shader_info,
++@@ -832,3 +985,137 @@ pub extern "C" fn nak_get_qmd_cbuf_desc_layout(
+          panic!("Unsupported shader model");
+      }
+  }
+ +
+-+/// The QMD words of `qmd` for a class with QMD dependency support (only
+-+/// Blackwell B for now: the only class whose dependency layout has been
+-+/// measured on hardware).
+++/// The dependency layout of the device's QMDs and the QMD's words.  The
+++/// proprietary driver orders compute work through QMD dependencies when the
+++/// compute class is above 0xc6bf, outside GA100 (libnvidia-eglcore.so
+++/// 615.78.08, ELF 0xd32f42 / ELF 0xd33302 / ELF 0xd33328): AMPERE_COMPUTE_B,
+++/// ADA_COMPUTE_A, HOPPER_COMPUTE_A, BLACKWELL_COMPUTE_A, BLACKWELL_COMPUTE_B.
+++/// Any other class aborts.
+ +fn dep_qmd<'a>(
+ +    dev: &nv_device_info,
+ +    qmd: *mut ::std::os::raw::c_void,
+ +    qmd_size: usize,
+-+) -> &'a mut [u32] {
+-+    assert!(
+-+        dev.cls_compute == clcec0::BLACKWELL_COMPUTE_B,
+-+        "QMD dependencies are only supported on Blackwell B compute"
+-+    );
+++) -> (&'static qmd_dep::Layout, &'a mut [u32]) {
+++    let layout = match dev.cls_compute {
+++        clc7c0::AMPERE_COMPUTE_B | clc9c0::ADA_COMPUTE_A => {
+++            assert!(qmd_size == size_of::<Qmd3_0>());
+++            &qmd_dep::v3::LAYOUT
+++        }
+++        clcbc0::HOPPER_COMPUTE_A => {
+++            assert!(qmd_size == size_of::<Qmd4_0>());
+++            &qmd_dep::v4::LAYOUT
+++        }
+++        clcdc0::BLACKWELL_COMPUTE_A | clcec0::BLACKWELL_COMPUTE_B => {
+++            assert!(qmd_size == size_of::<Qmd5_0>());
+++            &qmd_dep::v5::LAYOUT
+++        }
+++        _ => panic!(
+++            "QMD dependencies need AMPERE_COMPUTE_B..BLACKWELL_COMPUTE_B"
+++        ),
+++    };
+ +    assert!(!qmd.is_null());
+-+    assert!(qmd_size == size_of::<Qmd5_0>());
+-+    unsafe { std::slice::from_raw_parts_mut(qmd as *mut u32, qmd_size / 4) }
+++    let words = unsafe {
+++        std::slice::from_raw_parts_mut(qmd as *mut u32, qmd_size / 4)
+++    };
+++    (layout, words)
+ +}
+ +
+ +#[no_mangle]
+@@ -151,12 +280,25 @@ index 6b54e7153b94..35f9c2e29103 100644
+ +    qmd_size: usize,
+ +) {
+ +    // Keep everything of the template and only set CTA 1x1x1 / grid 0,
+-+    // as the proprietary driver builds its empty QMDs (E 0xd34709).
+-+    let words = dep_qmd(dev, qmd, qmd_size);
+-+    let mut q = Qmd5_0::from_words(words);
+-+    q.set_global_size(0, 0, 0);
+-+    q.set_local_size(1, 1, 1);
+-+    words.copy_from_slice(&q.qmd_words());
+++    // as the proprietary driver builds its empty QMDs (ELF 0xd34709, one
+++    // arm per layout).
+++    let (_, words) = dep_qmd(dev, qmd, qmd_size);
+++    if dev.cls_compute >= clcdc0::BLACKWELL_COMPUTE_A {
+++        let mut q = Qmd5_0::from_words(words);
+++        q.set_global_size(0, 0, 0);
+++        q.set_local_size(1, 1, 1);
+++        words.copy_from_slice(&q.qmd_words());
+++    } else if dev.cls_compute >= clcbc0::HOPPER_COMPUTE_A {
+++        let mut q = Qmd4_0::from_words(words);
+++        q.set_global_size(0, 0, 0);
+++        q.set_local_size(1, 1, 1);
+++        words.copy_from_slice(&q.qmd_words());
+++    } else {
+++        let mut q = Qmd3_0::from_words(words);
+++        q.set_global_size(0, 0, 0);
+++        q.set_local_size(1, 1, 1);
+++        words.copy_from_slice(&q.qmd_words());
+++    }
+ +}
+ +
+ +#[no_mangle]
+@@ -166,12 +308,11 @@ index 6b54e7153b94..35f9c2e29103 100644
+ +    qmd_size: usize,
+ +    counter: u32,
+ +) {
+++    let (l, words) = dep_qmd(dev, qmd, qmd_size);
+ +    let counter = u16::try_from(counter)
+ +        .expect("QMD dependence counter exceeds the 16-bit field");
+-+    qmd_5_0::cec0::set_dependence_counter(
+-+        dep_qmd(dev, qmd, qmd_size),
+-+        counter,
+-+    );
+++    let mut bv = QMDBitView::new(words);
+++    bv.set_field(l.counter.clone(), counter);
+ +}
+ +
+ +#[no_mangle]
+@@ -183,10 +324,16 @@ index 6b54e7153b94..35f9c2e29103 100644
+ +    dep_addr: u64,
+ +) {
+ +    assert!(slot < 2);
+-+    qmd_5_0::cec0::set_dependent_qmd(
+-+        dep_qmd(dev, qmd, qmd_size),
+-+        slot as usize,
+-+        dep_addr,
+++    assert!(dep_addr % 256 == 0);
+++    let (l, words) = dep_qmd(dev, qmd, qmd_size);
+++    let i = slot as usize;
+++    let mut bv = QMDBitView::new(words);
+++    bv.set_field(l.enable[i].clone(), 1_u32);
+++    bv.set_field(l.action[i].clone(), l.action_decrement);
+++    bv.set_field(l.prefetch[i].clone(), 1_u32);
+++    bv.set_field(
+++        l.pointer[i].clone(),
+++        u32::try_from(dep_addr >> 8).unwrap(),
+ +    );
+ +}
+ +
+@@ -198,10 +345,9 @@ index 6b54e7153b94..35f9c2e29103 100644
+ +    slot: u32,
+ +) -> bool {
+ +    assert!(slot < 2);
+-+    qmd_5_0::cec0::dependent_qmd_enabled(
+-+        dep_qmd(dev, qmd, qmd_size),
+-+        slot as usize,
+-+    )
+++    let (l, words) = dep_qmd(dev, qmd, qmd_size);
+++    let bv = QMDBitView::new(words);
+++    bv.get_bit_range_u64(l.enable[slot as usize].clone()) != 0
+ +}
+ +
+ +#[no_mangle]
+@@ -213,10 +359,15 @@ index 6b54e7153b94..35f9c2e29103 100644
+ +    shader_data: bool,
+ +    shader_constant: bool,
+ +) {
+-+    qmd_5_0::cec0::set_invalidates(
+-+        dep_qmd(dev, qmd, qmd_size),
+-+        texture_data,
+-+        shader_data,
+-+        shader_constant,
+-+    );
+++    let (l, words) = dep_qmd(dev, qmd, qmd_size);
+++    let mut bv = QMDBitView::new(words);
+++    if texture_data {
+++        bv.set_field(l.inval_texture_data.clone(), 1_u32);
+++    }
+++    if shader_data {
+++        bv.set_field(l.inval_shader_data.clone(), 1_u32);
+++    }
+++    if shader_constant {
+++        bv.set_field(l.inval_shader_constant.clone(), 1_u32);
+++    }
+ +}
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nak-qmd-launch-fields.patch b/nvidia-prolapse/driver-source/native/mesa/nak-qmd-launch-fields.patch
+index 1c03ffc..ecabbbc 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nak-qmd-launch-fields.patch
++++ b/nvidia-prolapse/driver-source/native/mesa/nak-qmd-launch-fields.patch
+@@ -9,9 +9,11 @@ QMD_GROUP_ID (0x1f graphics / 0x20 compute, from Turing on) at ELF 0xc5aed0.
+ A compute-only channel has no 3D class: the indirect dispatch sizes the MME
+ data FIFO through the compute class there (clc7c0.h..clcbc0.h 0x0574).
+ 
++diff --git a/src/nouveau/compiler/nak.h b/src/nouveau/compiler/nak.h
++index 616fa618a20e..f85d76d290e3 100644
+ --- a/src/nouveau/compiler/nak.h
+ +++ b/src/nouveau/compiler/nak.h
+-@@ -334,6 +334,11 @@
++@@ -334,6 +334,11 @@ struct nak_qmd_cbuf_desc_layout {
+  struct nak_qmd_cbuf_desc_layout
+  nak_get_qmd_cbuf_desc_layout(const struct nv_device_info *dev, uint8_t idx);
+  
+@@ -20,21 +22,14 @@ data FIFO through the compute class there (clc7c0.h..clcbc0.h 0x0574).
+ +                              void *qmd, size_t qmd_size,
+ +                              bool compute_family);
+ +
+- /* QMD dependency fields (Blackwell B compute only; other classes abort). */
++ /* QMD dependency fields (AMPERE_COMPUTE_B..BLACKWELL_COMPUTE_B; other
++  * classes abort). */
+  void nak_qmd_set_empty_grid(const struct nv_device_info *dev,
+-                             void *qmd, size_t qmd_size);
++diff --git a/src/nouveau/compiler/nak/qmd.rs b/src/nouveau/compiler/nak/qmd.rs
++index cabcf46e10f4..2179509509f5 100644
+ --- a/src/nouveau/compiler/nak/qmd.rs
+ +++ b/src/nouveau/compiler/nak/qmd.rs
+-@@ -8,7 +8,7 @@
+- use compiler::bindings::*;
+- use nak_bindings::*;
+- use nvidia_headers::classes::{
+--    cla0c0, clc0c0, clc3c0, clc6c0, clcbc0, clcdc0, clcec0,
+-+    cla0c0, clc0c0, clc3c0, clc5c0, clc6c0, clc7c0, clcbc0, clcdc0, clcec0,
+- };
+- 
+- use bitview::*;
+-@@ -512,6 +512,7 @@
++@@ -522,6 +522,7 @@ use qmd_2_2::Qmd2_2;
+  mod qmd_3_0 {
+      use crate::qmd::*;
+      use nvidia_headers::classes::clc6c0::qmd as clc6c0;
+@@ -42,12 +37,11 @@ data FIFO through the compute class there (clc7c0.h..clcbc0.h 0x0574).
+  
+      #[repr(transparent)]
+      pub struct Qmd3_0 {
+-@@ -539,6 +540,26 @@
+-         qmd_impl_set_smem_size_bounded!(clc6c0, QMDV03_00);
+-         qmd_impl_set_slm_size!(clc6c0, QMDV03_00, NONE);
+-     }
++@@ -566,6 +567,24 @@ mod qmd_3_0 {
++             let mut bv = QMDBitView::new(&mut self.qmd);
++             set_enum!(bv, clc6c0, QMDV03_00, CWD_MEMBAR_TYPE, L1_MEMBAR);
++         }
+ +
+-+    impl Qmd3_0 {
+ +        /// Occupancy limits of the grid in the AMPERE_COMPUTE_B+ QMD V03_00
+ +        /// layout (clc7c0qmd.h / clc9c0qmd.h; the AMPERE_COMPUTE_A layout in
+ +        /// clc6c0qmd.h has no such fields).  NVIDIA's driver
+@@ -65,16 +59,14 @@ data FIFO through the compute class there (clc7c0.h..clcbc0.h 0x0574).
+ +            set_field!(bv, clc7c0, QMDV03_00, OCCUPANCY_THRESHOLD_REGISTER, 0x40_u32);
+ +            set_field!(bv, clc7c0, QMDV03_00, OCCUPANCY_MAX_REGISTER, 0xff_u32);
+ +        }
+-+    }
++     }
+  }
+  use qmd_3_0::Qmd3_0;
+- 
+-@@ -579,6 +600,21 @@
+-         qmd_impl_set_smem_size_bounded!(clcbc0, QMDV04_00);
+-         qmd_impl_set_slm_size!(clcbc0, QMDV04_00, NONE);
+-     }
++@@ -624,6 +643,19 @@ mod qmd_4_0 {
++             let mut bv = QMDBitView::new(&mut self.qmd);
++             set_enum!(bv, clcbc0, QMDV04_00, CWD_MEMBAR_TYPE, L1_MEMBAR);
++         }
+ +
+-+    impl Qmd4_0 {
+ +        /// Occupancy limits of the grid (clcbc0qmd.h QMDV04_00), the values
+ +        /// NVIDIA's driver writes on every dispatch (setters at ELF 0xaa1700 /
+ +        /// 0xaa17e0 of libnvidia-eglcore.so.615.78.08, their 0xcbc0 arm).
+@@ -87,31 +79,27 @@ data FIFO through the compute class there (clc7c0.h..clcbc0.h 0x0574).
+ +            set_field!(bv, clcbc0, QMDV04_00, OCCUPANCY_THRESHOLD_REGISTER, 0x40_u32);
+ +            set_field!(bv, clcbc0, QMDV04_00, OCCUPANCY_MAX_REGISTER, 0xff_u32);
+ +        }
+-+    }
++     }
+  }
+  use qmd_4_0::Qmd4_0;
+- 
+-@@ -810,11 +846,17 @@
+-         } else if dev.cls_compute >= clcbc0::HOPPER_COMPUTE_A {
+-             let qmd_out = qmd_out as *mut Qmd4_0;
++@@ -925,12 +957,16 @@ pub extern "C" fn nak_fill_qmd(
+              assert!(qmd_size == size_of_val(&*qmd_out));
+--            qmd_out.write(fill_qmd(dev, info, qmd_info));
+-+            let mut qmd: Qmd4_0 = fill_qmd(dev, info, qmd_info);
++             let mut qmd: Qmd4_0 = fill_qmd(dev, info, qmd_info);
++             qmd.set_cwd_membar_l1();
+ +            qmd.set_occupancy();
+-+            qmd_out.write(qmd);
++             qmd_out.write(qmd);
+          } else if dev.cls_compute >= clc6c0::AMPERE_COMPUTE_A {
+              let qmd_out = qmd_out as *mut Qmd3_0;
+              assert!(qmd_size == size_of_val(&*qmd_out));
+--            qmd_out.write(fill_qmd(dev, info, qmd_info));
+-+            let mut qmd: Qmd3_0 = fill_qmd(dev, info, qmd_info);
++             let mut qmd: Qmd3_0 = fill_qmd(dev, info, qmd_info);
++             qmd.set_cwd_membar_l1();
+ +            if dev.cls_compute >= clc7c0::AMPERE_COMPUTE_B {
+ +                qmd.set_occupancy();
+ +            }
+-+            qmd_out.write(qmd);
++             qmd_out.write(qmd);
+          } else if dev.cls_compute >= clc3c0::VOLTA_COMPUTE_A {
+              let qmd_out = qmd_out as *mut Qmd2_2;
+-             assert!(qmd_size == size_of_val(&*qmd_out));
+-@@ -876,6 +918,52 @@
++@@ -998,6 +1034,52 @@ pub extern "C" fn nak_get_qmd_cbuf_desc_layout(
+      }
+  }
+  
+@@ -161,9 +149,11 @@ data FIFO through the compute class there (clc7c0.h..clcbc0.h 0x0574).
+ +    }
+ +}
+ +
+- /// The QMD words of `qmd` for a class with QMD dependency support (only
+- /// Blackwell B for now: the only class whose dependency layout has been
+- /// measured on hardware).
++ /// The dependency layout of the device's QMDs and the QMD's words.  The
++ /// proprietary driver orders compute work through QMD dependencies when the
++ /// compute class is above 0xc6bf, outside GA100 (libnvidia-eglcore.so
++diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++index b32826a217c3..ef0054bcd50a 100644
+ --- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+ +++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+ @@ -8,6 +8,7 @@
+@@ -174,7 +164,7 @@ data FIFO through the compute class there (clc7c0.h..clcbc0.h 0x0574).
+  #include "nvk_shader.h"
+  
+  #include "vk_synchronization.h"
+-@@ -728,6 +729,14 @@
++@@ -750,6 +751,14 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+        assert(qmd_size_B <= sizeof(qmd));
+        nak_fill_qmd(&pdev->info, &shader->info, &qmd_info, qmd, qmd_size_B);
+  
+@@ -189,7 +179,7 @@ data FIFO through the compute class there (clc7c0.h..clcbc0.h 0x0574).
+        void *qmd_map;
+        result = nvk_cmd_buffer_alloc_qmd(cmd, qmd_size_B, 0x100,
+                                          &qmd_addr, &qmd_map);
+-@@ -1114,8 +1123,24 @@
++@@ -1136,8 +1145,24 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+     struct nv_push *p;
+     if (nvk_cmd_buffer_compute_cls(cmd) >= TURING_COMPUTE_A) {
+        p = nvk_cmd_buffer_push(cmd, 14);
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-compute-scg-init.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-scg-init.patch
+index 4a7458e..bf8c7ac 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nvk-compute-scg-init.patch
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-scg-init.patch
+@@ -1,3 +1,5 @@
++diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++index ef0054bcd50a..fef3312392b9 100644
+ --- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+ +++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+ @@ -17,7 +17,14 @@
+@@ -14,8 +16,8 @@
+ +#include "clce97.h"
+  #include "clcbc0.h"
+  #include "clcdc0.h"
+- #include "clcec0.h"
+-@@ -73,6 +80,88 @@
++ #include "clc697.h"
++@@ -77,6 +84,88 @@ nvk_compute_sked_cache_shared(const struct nvk_physical_device *pdev)
+            pdev->nvkmd->kmd_info.sm_isa_version != 0;
+  }
+  
+@@ -104,7 +106,7 @@
+  VkResult
+  nvk_push_dispatch_state_init(struct nvk_queue *queue, struct nv_push *p)
+  {
+-@@ -92,11 +181,10 @@
++@@ -96,11 +185,10 @@ nvk_push_dispatch_state_init(struct nvk_queue *queue, struct nv_push *p)
+      * E 0x56f1c0; on GB202 the stream of every compute channel it creates,
+      * graphics queue and compute queue alike) is followed where its methods
+      * are public and Volta+ (clc3c0.h onwards): SPA/QMD version here, the
+@@ -120,7 +122,7 @@
+      */
+     const uint32_t sm_isa = dev->nvkmd->pdev->kmd_info.sm_isa_version;
+     const bool stock_init = nvk_compute_sked_cache_shared(pdev);
+-@@ -151,6 +239,44 @@
++@@ -159,6 +247,44 @@ nvk_push_dispatch_state_init(struct nvk_queue *queue, struct nv_push *p)
+        P_NVA0C0_SET_SHADER_SHARED_MEMORY_WINDOW(p, 0xfe << 24);
+     }
+  
+@@ -165,9 +167,11 @@
+     if (stock_init) {
+        /* E 0x56f868..0x56f8bb, unconditional in stock: an FE atomic
+         * sequence holding a host WFI of every SCG type, a SKED cache
++diff --git a/src/nouveau/vulkan/nvkmd/nvkmd.h b/src/nouveau/vulkan/nvkmd/nvkmd.h
++index 284bbdb07388..27e1da6af91d 100644
+ --- a/src/nouveau/vulkan/nvkmd/nvkmd.h
+ +++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
+-@@ -133,6 +133,11 @@
++@@ -133,6 +133,11 @@ struct nvkmd_info {
+     /* The KMD's SM ISA code (RM NV2080_CTRL_GR_INFO_INDEX_SM_VERSION, e.g.
+      * 0xa04 on GB20x); 0 when the KMD does not report one. */
+     uint32_t sm_isa_version;
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-cs-join-qmd.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-cs-join-qmd.patch
+index 3d5c608..c34ba1a 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nvk-cs-join-qmd.patch
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-cs-join-qmd.patch
+@@ -1,4 +1,4 @@
+-nvk: compute -> compute barriers through QMD dependencies on Blackwell B
++nvk: compute -> compute barriers through QMD dependencies, Ampere B to Blackwell B
+ 
+ NVIDIA's driver (libnvidia-eglcore.so 615.78.08: dispatch hook E 0xd35a90, join QMD
+ E 0xd345d0, consumer link E 0xd33fb0, launch kick E 0xd36060) never waits for idle for a
+@@ -11,13 +11,17 @@ the QMD it waits on.  Join and link QMDs are loaded inline from the push buffer
+ place until the command buffer ends, so every execution starts from the recorded counters.
+ 
+ Do the same for barriers whose source and destination are only compute shaders (shader reads and
+-writes) on Blackwell B compute.  The chain never crosses a command buffer, a secondary, an
+-internal dispatch, an indirect dispatch or conditional rendering; it is released before anything
+-that waits for idle, and is limited to 0x24 QMDs before the method path is used again, as the
+-proprietary driver limits it.  Every other barrier and every other class keep WAIT_FOR_IDLE.
++writes) on the classes the driver does it for: compute class above 0xc6bf, not GA100 (E 0xd32f42,
++E 0xd33302, E 0xd33328), i.e. AMPERE_COMPUTE_B, ADA_COMPUTE_A, HOPPER_COMPUTE_A,
++BLACKWELL_COMPUTE_A and BLACKWELL_COMPUTE_B.  Empty QMDs are loaded inline in full, INLINE_SIZE
++set when the QMD is not 256 bytes, as the driver sets it (E 0xd33e7f).
++
++The chain never crosses a command buffer, a secondary, an internal dispatch, an indirect dispatch
++or conditional rendering; it is released before anything that waits for idle, and is limited to
++0x24 QMDs before the method path is used again, as the proprietary driver limits it.  Every other barrier and every other class keep WAIT_FOR_IDLE.
+ 
+ diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+-index 07738ae55e00..0903caeffb4f 100644
++index c2b7f5bdcecb..38e904cbf1af 100644
+ --- a/src/nouveau/vulkan/nvk_cmd_buffer.c
+ +++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+ @@ -130,6 +130,9 @@ nvk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+@@ -66,7 +70,7 @@ index 07738ae55e00..0903caeffb4f 100644
+     nvk_cmd_buffer_flush_push(cmd, false);
+  
+     for (uint32_t i = 0; i < commandBufferCount; i++) {
+-@@ -716,6 +729,11 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
++@@ -710,6 +723,11 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+     enum nvk_barrier barriers = 0;
+     struct nvk_pixel_dep pixel_dep = { .dst_pixel_reads = true };
+  
+@@ -78,7 +82,7 @@ index 07738ae55e00..0903caeffb4f 100644
+     /* For asymmetric, we don't know what the access flags will be yet.
+      * Handle this by setting access to everything.
+      */
+-@@ -784,6 +802,10 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
++@@ -778,6 +796,10 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+              .flush_data = FLUSH_DATA_TRUE,
+           });
+        }
+@@ -89,7 +93,7 @@ index 07738ae55e00..0903caeffb4f 100644
+     } else if ((barriers & NVK_BARRIER_WFI) && wait) {
+        /* If this comes from a vkCmdSetEvent, we don't need to wait
+         *
+-@@ -814,11 +836,13 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
++@@ -807,11 +829,13 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+           }
+           struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+           P_IMMD(p, NV9097, WAIT_FOR_IDLE, 0);
+@@ -103,7 +107,7 @@ index 07738ae55e00..0903caeffb4f 100644
+           break;
+        }
+        default:
+-@@ -1037,6 +1061,9 @@ nvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
++@@ -1030,6 +1054,9 @@ nvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
+  {
+     VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+  
+@@ -114,7 +118,7 @@ index 07738ae55e00..0903caeffb4f 100644
+     nvk_cmd_image_layout_transition(cmd, pDependencyInfo);
+     nvk_cmd_invalidate_deps(cmd, 1, pDependencyInfo);
+ diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+-index e844b0ff4df6..ea751804a427 100644
++index e844b0ff4df6..f26795cd1b2c 100644
+ --- a/src/nouveau/vulkan/nvk_cmd_buffer.h
+ +++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+ @@ -224,6 +224,41 @@ struct nvk_compute_state {
+@@ -192,7 +196,7 @@ index e844b0ff4df6..ea751804a427 100644
+                               struct nvk_shader *shader,
+                               const void *push_data, size_t push_size,
+ diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+-index 4c596b785414..75d6e7a54f8a 100644
++index 4c596b785414..11b00c1ae588 100644
+ --- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+ +++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+ @@ -10,6 +10,8 @@
+@@ -204,15 +208,16 @@ index 4c596b785414..75d6e7a54f8a 100644
+  #include "cl906f.h"
+  #include "cla0b5.h"
+  #include "cla1c0.h"
+-@@ -17,6 +19,7 @@
++@@ -17,6 +19,8 @@
+  #include "clc5c0.h"
+  #include "clcbc0.h"
+  #include "clcdc0.h"
+++#include "clc697.h"
+ +#include "clcec0.h"
+  #include "nv_push_cl90c0.h"
+  #include "nv_push_cl9097.h"
+  #include "nv_push_cla0c0.h"
+-@@ -27,6 +30,7 @@
++@@ -27,6 +31,7 @@
+  #include "nv_push_clc6c0.h"
+  #include "nv_push_clc7c0.h"
+  #include "nv_push_clc86f.h"
+@@ -220,7 +225,7 @@ index 4c596b785414..75d6e7a54f8a 100644
+  
+  VkResult
+  nvk_push_dispatch_state_init(struct nvk_queue *queue, struct nv_push *p)
+-@@ -155,6 +159,358 @@ nvk_flush_compute_state(struct nvk_cmd_buffer *cmd,
++@@ -155,6 +160,370 @@ nvk_flush_compute_state(struct nvk_cmd_buffer *cmd,
+        nvk_cmd_buffer_flush_printf_buffer(cmd, desc);
+  }
+  
+@@ -243,8 +248,12 @@ index 4c596b785414..75d6e7a54f8a 100644
+ + * counters and links are patched in place until the command buffer ends,
+ + * so every execution of the command buffer starts from the recorded state.
+ + *
+-+ * Only the Blackwell B layout has been measured on hardware; every other
+-+ * class keeps WAIT_FOR_IDLE for compute barriers.
+++ * The driver builds this chain only when the compute class is above 0xc6bf
+++ * and the GPU is not a GA100 (3D class AMPERE_A): compute class test at
+++ * ELF 0xd32f42 / ELF 0xd33302, GA100 row of its architecture table at
+++ * ELF 0xd33328.  That is AMPERE_COMPUTE_B, ADA_COMPUTE_A, HOPPER_COMPUTE_A,
+++ * BLACKWELL_COMPUTE_A and BLACKWELL_COMPUTE_B; every other class keeps
+++ * WAIT_FOR_IDLE for compute barriers.
+ + */
+ +#define NVK_CS_JOIN_MAX_CHAIN 0x24
+ +
+@@ -254,7 +263,8 @@ index 4c596b785414..75d6e7a54f8a 100644
+ +   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+ +   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+ +
+-+   return pdev->info.cls_compute == BLACKWELL_COMPUTE_B &&
+++   return pdev->info.cls_compute > 0xc6bf &&
+++          pdev->info.cls_eng3d != AMPERE_A &&
+ +          !cmd->cs_join_cond_render;
+ +}
+ +
+@@ -289,7 +299,7 @@ index 4c596b785414..75d6e7a54f8a 100644
+ +      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+ +   const uint32_t qmd_size_B = nak_qmd_size_B(&pdev->info);
+ +   const uint32_t qmd_dw = qmd_size_B / 4;
+-+   assert(qmd_size_B == 384);
+++   assert(qmd_size_B == 256 || qmd_size_B == 384);
+ +
+ +   void *qmd_mem;
+ +   VkResult result = nvk_cmd_buffer_alloc_qmd(cmd, qmd_size_B, 0x100,
+@@ -301,14 +311,21 @@ index 4c596b785414..75d6e7a54f8a 100644
+ +   memcpy(qmd, tmpl, qmd_size_B);
+ +   nak_qmd_set_empty_grid(&pdev->info, qmd, qmd_size_B);
+ +
+-+   /* NAK's V05 QMD is 384 bytes: load all of it, so nothing of the QMD
+-+    * comes from the memory behind q->addr.
+++   /* Load the whole QMD inline, so nothing of it comes from the memory
+++    * behind q->addr.  INLINE_SIZE (bit 30 from HOPPER_COMPUTE_A on) is set
+++    * when the QMD is not 256 bytes, as the proprietary driver sets it
+++    * (libnvidia-eglcore.so 615.78.08, ELF 0xd33e7f); NAK's V04 and V05 QMDs
+++    * are 384 bytes, its V03 QMD 256.
+ +    */
+ +   uint32_t addr_a;
+-+   V_NVCEC0_SET_INLINE_QMD_ADDRESS_A(addr_a, {
+-+      .qmd_address_shifted8_upper = q->addr >> 40,
+-+      .inline_size = INLINE_SIZE_INLINE_384,
+-+   });
+++   if (qmd_size_B == 384) {
+++      V_NVCEC0_SET_INLINE_QMD_ADDRESS_A(addr_a, {
+++         .qmd_address_shifted8_upper = q->addr >> 40,
+++         .inline_size = INLINE_SIZE_INLINE_384,
+++      });
+++   } else {
+++      V_NVC6C0_SET_INLINE_QMD_ADDRESS_A(addr_a, q->addr >> 40);
+++   }
+ +
+ +   struct nv_push *p = nvk_cmd_buffer_push(cmd, 4 + qmd_dw);
+ +   P_MTHD(p, NVC6C0, SET_INLINE_QMD_ADDRESS_A);
+@@ -579,7 +596,7 @@ index 4c596b785414..75d6e7a54f8a 100644
+  static VkResult
+  nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+                     const struct nvk_shader *shader,
+-@@ -162,6 +518,7 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
++@@ -162,6 +531,7 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+                     const void *root,
+                     size_t root_size,
+                     uint32_t global_size[3],
+@@ -587,7 +604,7 @@ index 4c596b785414..75d6e7a54f8a 100644
+                     uint64_t *qmd_addr_out,
+                     uint64_t *root_desc_addr_out)
+  {
+-@@ -237,6 +594,12 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
++@@ -237,6 +607,12 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+        if (unlikely(result != VK_SUCCESS))
+           return result;
+  
+@@ -600,7 +617,7 @@ index 4c596b785414..75d6e7a54f8a 100644
+        memcpy(qmd_map, qmd, qmd_size_B);
+     }
+  
+-@@ -259,7 +622,7 @@ nvk_cmd_flush_cs_qmd(struct nvk_cmd_buffer *cmd,
++@@ -259,7 +635,7 @@ nvk_cmd_flush_cs_qmd(struct nvk_cmd_buffer *cmd,
+  
+     return nvk_cmd_upload_qmd(cmd, state->cs.shader, desc,
+                               desc->root, sizeof(desc->root),
+@@ -609,7 +626,7 @@ index 4c596b785414..75d6e7a54f8a 100644
+                               qmd_addr_out, root_desc_addr_out);
+  }
+  
+-@@ -306,9 +669,14 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
++@@ -306,9 +682,14 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
+     uint32_t global_size[3] = { groupCountX, groupCountY, groupCountZ };
+     nvk_flush_compute_state(cmd, base_workgroup, global_size);
+  
+@@ -626,7 +643,7 @@ index 4c596b785414..75d6e7a54f8a 100644
+     if (result != VK_SUCCESS) {
+        vk_command_buffer_set_error(&cmd->vk, result);
+        return;
+-@@ -345,6 +713,9 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
++@@ -345,6 +726,9 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
+        P_IMMD(p, NVC6C0, SEND_SIGNALING_PCAS2_B,
+               PCAS_ACTION_INVALIDATE_COPY_SCHEDULE);
+     }
+@@ -636,7 +653,7 @@ index 4c596b785414..75d6e7a54f8a 100644
+  }
+  
+  void
+-@@ -360,10 +731,14 @@ nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
++@@ -360,10 +744,14 @@ nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
+  
+     uint32_t group_count[3] = { groupCountX, groupCountY, groupCountZ };
+  
+@@ -652,7 +669,7 @@ index 4c596b785414..75d6e7a54f8a 100644
+                                          &qmd_addr, NULL);
+     if (result != VK_SUCCESS) {
+        vk_command_buffer_set_error(&cmd->vk, result);
+-@@ -579,6 +954,10 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
++@@ -579,6 +967,10 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+  
+     uint64_t dispatch_addr = pInfo->addressRange.address;
+  
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-turing-sked-qmd-invalidate.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-turing-sked-qmd-invalidate.patch
+index e9a609b..7474a17 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nvk-turing-sked-qmd-invalidate.patch
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-turing-sked-qmd-invalidate.patch
+@@ -1,6 +1,8 @@
++diff --git a/src/nouveau/compiler/nak.h b/src/nouveau/compiler/nak.h
++index f85d76d290e3..d429570f3190 100644
+ --- a/src/nouveau/compiler/nak.h
+ +++ b/src/nouveau/compiler/nak.h
+-@@ -356,6 +356,11 @@
++@@ -357,6 +357,11 @@ void nak_qmd_set_invalidates(const struct nv_device_info *dev,
+                               bool texture_data, bool shader_data,
+                               bool shader_constant);
+  
+@@ -12,11 +14,13 @@
+  #ifdef __cplusplus
+  }
+  #endif
++diff --git a/src/nouveau/compiler/nak/qmd.rs b/src/nouveau/compiler/nak/qmd.rs
++index 2179509509f5..56606bca06ea 100644
+ --- a/src/nouveau/compiler/nak/qmd.rs
+ +++ b/src/nouveau/compiler/nak/qmd.rs
+-@@ -1057,3 +1057,40 @@
+-         shader_constant,
+-     );
++@@ -1213,3 +1213,40 @@ pub extern "C" fn nak_qmd_set_invalidates(
++         bv.set_field(l.inval_shader_constant.clone(), 1_u32);
++     }
+  }
+ +
+ +/// RELEASE0 of a Volta/Turing (QMD V02_02) dispatch: a one-word semaphore
+@@ -55,9 +59,11 @@
+ +    set_enum!(bv, q, QMDV02_02, RELEASE0_STRUCTURE_SIZE, ONE_WORD);
+ +    set_field!(bv, q, QMDV02_02, RELEASE0_PAYLOAD, payload);
+ +}
++diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
++index bbb08a784bcc..80a76c6ec77e 100644
+ --- a/src/nouveau/vulkan/nvk_cmd_buffer.c
+ +++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+-@@ -67,6 +67,7 @@
++@@ -67,6 +67,7 @@ nvk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+     nvk_cmd_pool_free_qmd_list(pool, &cmd->owned_qmd);
+     util_dynarray_fini(&cmd->pushes);
+     util_dynarray_fini(&cmd->copy_memory_indirect_temps);
+@@ -65,7 +71,7 @@
+     vk_command_buffer_finish(&cmd->vk);
+     vk_free(&pool->vk.alloc, cmd);
+  }
+-@@ -102,6 +103,7 @@
++@@ -102,6 +103,7 @@ nvk_create_cmd_buffer(struct vk_command_pool *vk_pool,
+     list_inithead(&cmd->owned_qmd);
+     cmd->pushes = UTIL_DYNARRAY_INIT;
+     cmd->copy_memory_indirect_temps = UTIL_DYNARRAY_INIT;
+@@ -73,7 +79,7 @@
+  
+     cmd->prev_subc = ffs(nvk_cmd_buffer_subchannel_mask(cmd)) - 1;
+  
+-@@ -134,6 +136,11 @@
++@@ -134,6 +136,11 @@ nvk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+     memset(&cmd->cs_join, 0, sizeof(cmd->cs_join));
+     cmd->cs_join_cond_render = false;
+     cmd->cs_join_covered = false;
+@@ -85,7 +91,7 @@
+  
+     util_dynarray_clear(&cmd->pushes);
+     util_dynarray_clear(&cmd->copy_memory_indirect_temps);
+-@@ -329,8 +336,19 @@
++@@ -329,8 +336,19 @@ nvk_cmd_buffer_alloc_qmd(struct nvk_cmd_buffer *cmd,
+     /* On Maxwell B and later, we have INVALIDATE_SKED_CACHES so we can just
+      * allocate from wherever we want (the upload stream in this case).
+      */
+@@ -107,7 +113,7 @@
+  
+     /* The GPU compute scheduler (SKED) has a cache.  Maxwell B added the
+      * INVALIDATE_SKED_CACHES instruction to manage the SKED cache.  We call
+-@@ -382,6 +400,10 @@
++@@ -382,6 +400,10 @@ nvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+                                COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT);
+        cmd->cs_join_cond_render = cond != NULL &&
+                                   cond->conditionalRenderingEnable;
+@@ -118,7 +124,7 @@
+     }
+  
+     /* Start with a nop so we have at least something to submit.  The
+-@@ -419,6 +441,7 @@
++@@ -419,6 +441,7 @@ nvk_EndCommandBuffer(VkCommandBuffer commandBuffer)
+     VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+  
+     nvk_cmd_cs_join_close(cmd);
+@@ -126,9 +132,11 @@
+     nvk_cmd_buffer_flush_push(cmd, false);
+  
+     /* We only need to flush the memory objects we own because, if there are
++diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
++index a89d29e9636d..2f939d6429d0 100644
+ --- a/src/nouveau/vulkan/nvk_cmd_buffer.h
+ +++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+-@@ -283,6 +283,22 @@
++@@ -283,6 +283,22 @@ struct nvk_cmd_buffer {
+      */
+     bool cs_join_covered;
+  
+@@ -151,7 +159,7 @@
+     struct nvk_cmd_state {
+        uint64_t descriptor_buffers[NVK_MAX_SETS];
+        struct nvk_graphics_state gfx;
+-@@ -367,6 +383,9 @@
++@@ -367,6 +383,9 @@ nvk_cmd_buffer_push_indirect(struct nvk_cmd_buffer *cmd,
+  void nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
+                                     const VkCommandBufferBeginInfo *pBeginInfo);
+  bool nvk_compute_sked_cache_shared(const struct nvk_physical_device *pdev);
+@@ -161,7 +169,7 @@
+  void nvk_cmd_invalidate_sked_caches(struct nvk_cmd_buffer *cmd);
+  
+  void nvk_cmd_buffer_begin_compute(struct nvk_cmd_buffer *cmd,
+-@@ -490,9 +509,27 @@
++@@ -490,9 +509,27 @@ nvk_cmd_buffer_get_cbuf_descriptor_addr(struct nvk_cmd_buffer *cmd,
+                                          const struct nvk_descriptor_state *desc,
+                                          const struct nvk_cbuf *cbuf);
+  
+@@ -189,9 +197,11 @@
+                                uint64_t *qmd_addr_out,
+                                uint64_t *root_desc_addr_out);
+  
++diff --git a/src/nouveau/vulkan/nvk_cmd_dispatch.c b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++index fef3312392b9..c01e59d5c9ae 100644
+ --- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+ +++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+-@@ -385,6 +385,126 @@
++@@ -395,6 +395,126 @@ nvk_cmd_invalidate_sked_caches(struct nvk_cmd_buffer *cmd)
+     }
+  }
+  
+@@ -318,7 +328,7 @@
+  void
+  nvk_cmd_invalidate_compute_state(struct nvk_cmd_buffer *cmd)
+  {
+-@@ -786,6 +906,7 @@
++@@ -808,6 +928,7 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+                     size_t root_size,
+                     uint32_t global_size[3],
+                     bool join,
+@@ -326,7 +336,7 @@
+                     uint64_t *qmd_addr_out,
+                     uint64_t *root_desc_addr_out)
+  {
+-@@ -863,6 +984,25 @@
++@@ -885,6 +1006,25 @@ nvk_cmd_upload_qmd(struct nvk_cmd_buffer *cmd,
+                                 !(nvk_cmd_buffer_queue_flags(cmd) &
+                                   VK_QUEUE_GRAPHICS_BIT));
+  
+@@ -352,7 +362,7 @@
+        void *qmd_map;
+        result = nvk_cmd_buffer_alloc_qmd(cmd, qmd_size_B, 0x100,
+                                          &qmd_addr, &qmd_map);
+-@@ -889,6 +1029,7 @@
++@@ -911,6 +1051,7 @@ VkResult
+  nvk_cmd_flush_cs_qmd(struct nvk_cmd_buffer *cmd,
+                       const struct nvk_cmd_state *state,
+                       uint32_t global_size[3],
+@@ -360,7 +370,7 @@
+                       uint64_t *qmd_addr_out,
+                       uint64_t *root_desc_addr_out)
+  {
+-@@ -897,7 +1038,7 @@
++@@ -919,7 +1060,7 @@ nvk_cmd_flush_cs_qmd(struct nvk_cmd_buffer *cmd,
+  
+     return nvk_cmd_upload_qmd(cmd, state->cs.shader, desc,
+                               desc->root, sizeof(desc->root),
+@@ -369,7 +379,7 @@
+                               qmd_addr_out, root_desc_addr_out);
+  }
+  
+-@@ -951,7 +1092,9 @@
++@@ -973,7 +1114,9 @@ nvk_CmdDispatchBase(VkCommandBuffer commandBuffer,
+     const struct nvk_descriptor_state *desc = &cmd->state.cs.descriptors;
+     VkResult result = nvk_cmd_upload_qmd(cmd, cmd->state.cs.shader, desc,
+                                          desc->root, sizeof(desc->root),
+@@ -380,7 +390,7 @@
+     if (result != VK_SUCCESS) {
+        vk_command_buffer_set_error(&cmd->vk, result);
+        return;
+-@@ -1014,6 +1157,7 @@
++@@ -1036,6 +1179,7 @@ nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
+     VkResult result = nvk_cmd_upload_qmd(cmd, shader, NULL,
+                                          root, root_size,
+                                          group_count, false,
+@@ -388,7 +398,7 @@
+                                          &qmd_addr, NULL);
+     if (result != VK_SUCCESS) {
+        vk_command_buffer_set_error(&cmd->vk, result);
+-@@ -1240,6 +1384,7 @@
++@@ -1262,6 +1406,7 @@ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
+  
+     uint64_t qmd_addr = 0, root_desc_addr = 0;
+     VkResult result = nvk_cmd_flush_cs_qmd(cmd, &cmd->state, global_size,
+@@ -396,9 +406,11 @@
+                                            &qmd_addr, &root_desc_addr);
+     if (result != VK_SUCCESS) {
+        vk_command_buffer_set_error(&cmd->vk, result);
++diff --git a/src/nouveau/vulkan/nvk_cmd_indirect.c b/src/nouveau/vulkan/nvk_cmd_indirect.c
++index 0a337b295a41..7b7fb8742085 100644
+ --- a/src/nouveau/vulkan/nvk_cmd_indirect.c
+ +++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
+-@@ -1075,6 +1075,7 @@
++@@ -1075,6 +1075,7 @@ nvk_cmd_process_cmds(struct nvk_cmd_buffer *cmd,
+     if (layout->stages & VK_SHADER_STAGE_COMPUTE_BIT) {
+        uint32_t global_size[3] = { 0, 0, 0 };
+        VkResult result = nvk_cmd_flush_cs_qmd(cmd, state, global_size,
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/README.md b/nvidia-prolapse/driver-source/native/mesa/tests/README.md
+index 8cde457..986295d 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/tests/README.md
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/README.md
+@@ -647,9 +647,9 @@ every element must equal the epoch count after each execution. `reuse` records o
+ ONE_TIME_SUBMIT and submits 20 times; `double` submits the SIMULTANEOUS_USE command buffer twice per
+ vkQueueSubmit; `clear` adds a vkCmdClearColorImage (3D work) inside every epoch; `split` puts epoch 0
+ in a first command buffer and starts the second with a one-workgroup dispatch and the barrier, so
+-the barrier has to order the first command buffer's work too. On Blackwell B these barriers become
+-join / link QMDs loaded inline (SET_INLINE_QMD_ADDRESS_A with INLINE_SIZE_INLINE_384, then
+-LOAD_INLINE_QMD_DATA) and SEND_SIGNALING_PCAS2_B DECREMENT_DEPENDENCE, as NVIDIA's driver orders
++the barrier has to order the first command buffer's work too. From AMPERE_COMPUTE_B to Blackwell B
++(not GA100) these barriers become join / link QMDs loaded inline (SET_INLINE_QMD_ADDRESS_A, with
++INLINE_SIZE_INLINE_384 for the 384-byte V04 / V05 QMDs, then LOAD_INLINE_QMD_DATA) and SEND_SIGNALING_PCAS2_B DECREMENT_DEPENDENCE, as NVIDIA's driver orders
+ compute work (libnvidia-eglcore.so 615.78.08 E 0xd35a90 / E 0xd345d0 / E 0xd33fb0 / E 0xd36060);
+ the first barrier of a command buffer and every barrier after 0x24 chained dispatches + QMDs keep
+ the method path.
+@@ -660,6 +660,14 @@ pending last barrier at vkEndCommandBuffer) where NVK without the join QMDs emit
+ vk-barrier-order on the same build: 40 rounds at spin 0 / 300 / 2000 / 20000 PASS, unordered FAIL; its push
+ dump goes from 90 to 78 WAIT_FOR_IDLE and 37 to 25 flush-form invalidates (the compute -> compute barrier of
+ each round). 0 Xid.
++10-25 (RTX 5090, under load, the class gate widened to c7c0..cec0): reuse / double / clear / split at spin 0,
++2000, 20000 PASS, unordered FAIL, 40 inline QMDs; vk-barrier-order 4 spins PASS, unordered FAIL. 0 Xid.
++10-25, driver 580.178.04: RTX 3060 (GA106, AMPERE_COMPUTE_B) and RTX 4060 (AD107, ADA_COMPUTE_A): every
++mode and spin PASS, 40 inline QMDs (256-byte V03, no INLINE_384), 76 dependency decrements, 1 WAIT_FOR_IDLE
++per execution; the unordered control passes on both GPUs with NVK (it fails with NVIDIA's driver there),
++so on these GPUs it does not show that the barriers do the ordering. RTX 2060 (TU106): join path off as
++intended (0 inline QMDs), every mode PASS. vk-barrier-order: 4 spins PASS on all three, unordered FAIL.
++0 Xid.
+ 
+ ## nak-qmd-membar.c (CWD_MEMBAR_TYPE in the QMDs of the built NVK)
+ 
+@@ -669,7 +677,21 @@ each round). 0 Xid.
+        -I$M/include -I$M/src -I$B/src/compiler -I$B/src $S/nak-qmd-membar.c -ldl -o build/nak-qmd-membar
+     build/nak-qmd-membar $B/src/nouveau/vulkan/libvulkan_nouveau.so
+ 
+-PASS = CWD_MEMBAR_TYPE 3 (dword 19 = 0x00030000) for cec0 and 0 for cdc0. 10-24: PASS.
++PASS = CWD_MEMBAR_TYPE 3 (L1_MEMBAR) from Turing to Blackwell B (word 11 for c5c0..c9c0, word 35 for cbc0,
++word 19 for cdc0 / cec0) and 0 on Volta (c3c0), as NVIDIA's driver builds its QMDs (libnvidia-eglcore.so
++615.78.08 QMD template ELF 0xaa12a0, tails ELF 0xaa1338 / 0xaa14c7 / 0xaa13d3). 10-25: PASS.
++
++## nak-qmd-dependency.c (QMD dependency field setters of the built NVK, every layout they serve)
++
++    M=build/mesa-rm-source; B=build/nvk-host; S=nvidia-prolapse/driver-source/native/mesa/tests
++    cc -std=gnu11 -DHAVE_FUNC_ATTRIBUTE_PACKED -DHAVE_ENDIAN_H -DUTIL_ARCH_LITTLE_ENDIAN=1 -DUTIL_ARCH_BIG_ENDIAN=0 \
++       -I$M/src/nouveau/compiler -I$M/src/nouveau/headers -I$M/src/compiler -I$M/src/compiler/nir -I$B/src/compiler/nir \
++       -I$M/include -I$M/src -I$B/src/compiler -I$B/src $S/nak-qmd-dependency.c -ldl -o build/nak-qmd-dependency
++    build/nak-qmd-dependency $B/src/nouveau/vulkan/libvulkan_nouveau.so
++
++Counter, DEPENDENT_QMD0/1 and invalidates set on a zeroed QMD of c7c0, c9c0 (V03_00), cbc0 (V04_00), cdc0 and
++cec0 (V05_00); every word must equal the bits NVIDIA's driver writes for that layout (list in the file header;
++the V03 second dependent pointer goes to word 9). PASS = all five classes "ok". 10-25: PASS.
+ 
+ ## vk-zcull-depth.c (depth-tested rendering with ZCULL active on the RM backend)
+ 
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/nak-qmd-dependency.c b/nvidia-prolapse/driver-source/native/mesa/tests/nak-qmd-dependency.c
+new file mode 100644
+index 0000000..2895f25
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/nak-qmd-dependency.c
+@@ -0,0 +1,65 @@
++/* QMD dependency fields of the built NVK: calls its exported nak_qmd_set_dependence_counter,
++ * nak_qmd_set_dependent_qmd (slots 0 and 1), nak_qmd_dependent_qmd_enabled and nak_qmd_set_invalidates
++ * on a zeroed QMD for every class they serve and compares every word with the bits NVIDIA's driver writes
++ * for that layout (libnvidia-eglcore.so 615.78.08: DEPENDENCE_COUNTER ELF 0xd32f60, DEPENDENT_QMD0
++ * ELF 0xd33340, DEPENDENT_QMD1 ELF 0xd334a0, invalidates ELF 0xd341b0; ACTION 4 = DECREMENT_DEPENDENCE,
++ * PREFETCH 1):
++ *   V03_00 (c7c0, c9c0): counter word 4 bits 29:14; QMD0 word 16 bits 0 / 3:1 / 4, pointer word 15;
++ *     QMD1 word 16 bits 5 / 8:6 / 9, pointer word 9; invalidates word 5 bits 28 / 29 / 31.
++ *   V04_00 (cbc0): counter word 0 bits 15:0; QMD0 word 11 bits 16 / 19:17 / 20, pointer word 14;
++ *     QMD1 word 11 bits 21 / 24:22 / 25, pointer word 15; invalidates word 18 bits 28 / 29 / 31.
++ *   V05_00 (cdc0 in NAK, cec0): counter word 4 bits 15:0; QMD0 word 10 bits 16 / 19:17 / 20, pointer
++ *     word 12; QMD1 word 10 bits 24 / 27:25 / 28, pointer word 13; invalidates word 14 bits 26 / 27 / 29.
++ * Usage: nak-qmd-dependency LIBVULKAN_NOUVEAU.so. Build/run: tests/README.md "nak-qmd-dependency".
++ */
++#include <dlfcn.h>
++#include <stdio.h>
++#include <string.h>
++#include "nv_device_info.h"
++#include "nak.h"
++struct want { unsigned w; uint32_t v; };
++int main(int argc, char **argv) {
++   if (argc < 2) return 2;
++   void *h = dlopen(argv[1], RTLD_NOW);
++   if (!h) { printf("%s\n", dlerror()); return 2; }
++   uint32_t (*size)(const struct nv_device_info *) = dlsym(h, "nak_qmd_size_B");
++   void (*counter)(const struct nv_device_info *, void *, size_t, uint32_t) = dlsym(h, "nak_qmd_set_dependence_counter");
++   void (*dep)(const struct nv_device_info *, void *, size_t, uint32_t, uint64_t) = dlsym(h, "nak_qmd_set_dependent_qmd");
++   bool (*enabled)(const struct nv_device_info *, void *, size_t, uint32_t) = dlsym(h, "nak_qmd_dependent_qmd_enabled");
++   void (*inval)(const struct nv_device_info *, void *, size_t, bool, bool, bool) = dlsym(h, "nak_qmd_set_invalidates");
++   if (!size || !counter || !dep || !enabled || !inval) { printf("missing export\n"); return 2; }
++   const uint64_t a0 = 0x12345600, a1 = 0xabcdef00;
++   const uint32_t cnt = 0x1234;
++   const struct want v3[] = { { 4, cnt << 14 }, { 5, 0xb0000000 }, { 9, a1 >> 8 }, { 15, a0 >> 8 },
++                              { 16, 0x1 | 4 << 1 | 1 << 4 | 1 << 5 | 4 << 6 | 1 << 9 } };
++   const struct want v4[] = { { 0, cnt }, { 11, 1 << 16 | 4 << 17 | 1 << 20 | 1 << 21 | 4 << 22 | 1 << 25 },
++                              { 14, a0 >> 8 }, { 15, a1 >> 8 }, { 18, 0xb0000000 } };
++   const struct want v5[] = { { 4, cnt }, { 10, 1 << 16 | 4 << 17 | 1 << 20 | 1 << 24 | 4 << 25 | 1u << 28 },
++                              { 12, a0 >> 8 }, { 13, a1 >> 8 }, { 14, 0x2c000000 } };
++   const struct { uint16_t cc, c3d; const struct want *w; unsigned n; } cls[] = {
++      { 0xc7c0, 0xc797, v3, 5 }, { 0xc9c0, 0xc997, v3, 5 }, { 0xcbc0, 0xcb97, v4, 5 },
++      { 0xcdc0, 0xcd97, v5, 5 }, { 0xcec0, 0xce97, v5, 5 },
++   };
++   int bad = 0;
++   for (unsigned k = 0; k < sizeof(cls) / sizeof(cls[0]); k++) {
++      struct nv_device_info dev; memset(&dev, 0, sizeof(dev));
++      dev.cls_compute = cls[k].cc; dev.cls_eng3d = cls[k].c3d;
++      uint32_t sz = size(&dev), q[96] = {0}, want[96] = {0};
++      int e0 = enabled(&dev, q, sz, 0), e1 = enabled(&dev, q, sz, 1);
++      counter(&dev, q, sz, cnt);
++      dep(&dev, q, sz, 0, a0);
++      int e0b = enabled(&dev, q, sz, 0), e1b = enabled(&dev, q, sz, 1);
++      dep(&dev, q, sz, 1, a1);
++      int e1c = enabled(&dev, q, sz, 1);
++      inval(&dev, q, sz, true, true, true);
++      for (unsigned i = 0; i < cls[k].n; i++) want[cls[k].w[i].w] = cls[k].w[i].v;
++      int ok = !e0 && !e1 && e0b && !e1b && e1c;
++      for (unsigned i = 0; i < sz / 4; i++) {
++         if (q[i] != want[i]) { ok = 0; printf("  0x%x word %u = 0x%08x, want 0x%08x\n", cls[k].cc, i, q[i], want[i]); }
++      }
++      printf("cls_compute 0x%x qmd %u B: %s\n", cls[k].cc, sz, ok ? "ok" : "MISMATCH");
++      if (!ok) bad = 1;
++   }
++   printf("%s\n", bad ? "FAIL" : "PASS");
++   return bad;
++}
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/nak-qmd-membar.c b/nvidia-prolapse/driver-source/native/mesa/tests/nak-qmd-membar.c
+index f273825..96a0a5c 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/tests/nak-qmd-membar.c
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/nak-qmd-membar.c
+@@ -1,6 +1,8 @@
+ /* QMD CWD_MEMBAR_TYPE of the built NVK: calls its exported nak_fill_qmd for a minimal compute shader on
+- * Blackwell A (cdc0) and Blackwell B (cec0) and checks QMDV05_00 CWD_MEMBAR_TYPE (MW(625:624),
+- * clcdc0qmd.h): L1_MEMBAR (3) on cec0, as NVIDIA's driver launches every cec0 QMD, L1_NONE (0) on cdc0.
++ * every compute class from Volta to Blackwell B and checks CWD_MEMBAR_TYPE: L1_MEMBAR (3) from Turing on,
++ * as NVIDIA's driver builds every QMD (libnvidia-eglcore.so 615.78.08 QMD template ELF 0xaa12a0, tails
++ * ELF 0xaa1338 / 0xaa14c7 / 0xaa13d3), L1_NONE (0) on Volta. Field: MW(369:368) in V02_02 / V03_00
++ * (clc3c0qmd.h, clc6c0qmd.h), MW(1137:1136) in V04_00 (clcbc0qmd.h), MW(625:624) in V05_00 (clcdc0qmd.h).
+  * Usage: nak-qmd-membar LIBVULKAN_NOUVEAU.so. Build/run: tests/README.md "nak-qmd-membar".
+  */
+ #include <dlfcn.h>
+@@ -13,11 +15,16 @@ int main(int argc, char **argv) {
+    if (!h) { printf("%s\n", dlerror()); return 2; }
+    void (*fill)(const struct nv_device_info *, const struct nak_shader_info *, const struct nak_qmd_info *, void *, size_t) = dlsym(h, "nak_fill_qmd");
+    uint32_t (*size)(const struct nv_device_info *) = dlsym(h, "nak_qmd_size_B");
++   static const struct { uint16_t cc, c3d; uint8_t sm; unsigned dw, want; } cls[] = {
++      { 0xc3c0, 0xc397, 70, 11, 0 }, { 0xc5c0, 0xc597, 75, 11, 3 }, { 0xc6c0, 0xc697, 80, 11, 3 },
++      { 0xc7c0, 0xc797, 86, 11, 3 }, { 0xc9c0, 0xc997, 89, 11, 3 }, { 0xcbc0, 0xcb97, 90, 35, 3 },
++      { 0xcdc0, 0xcd97, 100, 19, 3 }, { 0xcec0, 0xce97, 120, 19, 3 },
++   };
+    int bad = 0;
+-   for (int k = 0; k < 2; k++) {
++   for (unsigned k = 0; k < sizeof(cls) / sizeof(cls[0]); k++) {
+       struct nv_device_info dev; memset(&dev, 0, sizeof(dev));
+-      dev.cls_compute = k ? 0xcec0 : 0xcdc0; dev.cls_eng3d = k ? 0xce97 : 0xcd97;
+-      dev.sm = k ? 120 : 100; dev.max_smem_per_wg_kB = 48; dev.sm_smem_size_count = 2; dev.sm_smem_sizes_kB[0] = 32; dev.sm_smem_sizes_kB[1] = 100;
++      dev.cls_compute = cls[k].cc; dev.cls_eng3d = cls[k].c3d;
++      dev.sm = cls[k].sm; dev.max_smem_per_wg_kB = 48; dev.sm_smem_size_count = 2; dev.sm_smem_sizes_kB[0] = 32; dev.sm_smem_sizes_kB[1] = 100;
+       struct nak_shader_info info; memset(&info, 0, sizeof(info));
+       info.stage = MESA_SHADER_COMPUTE; info.max_warps_per_sm = 48; info.num_gprs = 16;
+       info.cs.local_size[0] = 64; info.cs.local_size[1] = 1; info.cs.local_size[2] = 1;
+@@ -26,9 +33,9 @@ int main(int argc, char **argv) {
+       uint32_t q[96] = {0};
+       uint32_t sz = size(&dev);
+       fill(&dev, &info, &qi, q, sz);
+-      unsigned m = (q[19] >> 16) & 3;
+-      printf("cls_compute 0x%x qmd %u B: CWD_MEMBAR_TYPE = %u (dword19 = 0x%08x)\n", dev.cls_compute, sz, m, q[19]);
+-      if (m != (k ? 3u : 0u)) bad = 1;
++      unsigned m = (q[cls[k].dw] >> 16) & 3;
++      printf("cls_compute 0x%x qmd %u B: CWD_MEMBAR_TYPE = %u (dword%u = 0x%08x)\n", dev.cls_compute, sz, m, cls[k].dw, q[cls[k].dw]);
++      if (m != cls[k].want) bad = 1;
+    }
+    printf("%s\n", bad ? "FAIL" : "PASS");
+    return bad;
+-- 
+2.56.0
+

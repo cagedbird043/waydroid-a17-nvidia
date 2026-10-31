@@ -1,0 +1,51 @@
+From 1683f26939d3e7fb9c29d64d7ec86014c88e0f57 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 17:24:05 +0800
+Subject: [PATCH 67/72] =?utf-8?q?=E6=9E=84=E5=BB=BA=EF=BC=9ANVK=20?=
+ =?utf-8?q?=E4=B8=8E=20nvrm=20=E5=85=B1=E7=94=A8=E5=AE=8C=E6=95=B4=20Mesa?=
+ =?utf-8?q?=20=E8=A1=A5=E4=B8=81=E6=B8=85=E5=8D=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+按本地已选补丁生成同一清单，保留双 graphics 队列与 3D-view 补丁。
+
+(cherry picked from commit 0029e7e7590b81fd78334d7154817e390dd11cc5)
+---
+ nvidia-prolapse/driver-source/native/mesa/build.py | 13 ++-----------
+ 1 file changed, 2 insertions(+), 11 deletions(-)
+
+diff --git a/nvidia-prolapse/driver-source/native/mesa/build.py b/nvidia-prolapse/driver-source/native/mesa/build.py
+index 6a55de5..b105048 100755
+--- a/nvidia-prolapse/driver-source/native/mesa/build.py
++++ b/nvidia-prolapse/driver-source/native/mesa/build.py
+@@ -138,17 +138,6 @@ endian = 'little'
+ _GL_SUFFIX = os.environ.get("NVRM_GL_DIR_SUFFIX", "")
+ GL_SOURCE = ROOT / f"build/mesa-gl-source{_GL_SUFFIX}"
+ GL_RUST = ROOT / f"build/nvrm-rust{_GL_SUFFIX}"
+-NVK_PATCHES = ("build-compat.patch", "rm-integration.patch", "pascal-a-clear.patch",
+-               "nvk-upstream-ecfea8d9-ycbcr-modifier.patch",
+-               "nvk-upstream-bfb90f05-memory-plane-aspects.patch",
+-               "nvk-explicit-plane-layouts.patch", "nvk-angle-nan-preserve-min-max.patch",
+-               "mesa-disk-cache-create-with-path.patch", "mesa-disk-cache-keep-file-backend.patch",
+-               "mesa-disk-cache-evict-invalid-item.patch", "nvk-android-app-disk-cache.patch",
+-               "nvk-shader-upload-publish.patch", "nvk-shader-prefetch-in-range.patch",
+-               "nvk-prevolta-modifier-memory-types.patch", "nvk-3d-view-of-2d-image.patch",
+-               "nvk-pixel-shader-barrier.patch", "nak-qmd-cwd-membar.patch",
+-               "nak-qmd-dependency.patch", "nvk-cs-join-qmd.patch",
+-               "nvk-compute-queue-family.patch", "nvk-stock-compute-init.patch")
+ 
+ GL_TRIPLES = {"android": "x86_64-linux-android", "android32": "i686-linux-android"}
+ # Android: distinct library names so the image's own Mesa (libEGL_mesa.so,
+@@ -234,6 +223,8 @@ NVK_PATCH_LIST = [
+     HERE / "nvk-turing-sked-qmd-invalidate.patch",
+     HERE / "nvk-compute-queue-no-mme.patch",
+ ]
++# NVK and GL consume exactly the same ordered stack.
++NVK_PATCHES = tuple(patch.name for patch in NVK_PATCH_LIST)
+ 
+ def prepared_stamp(source, inputs):
+     """Content hash of what a source preparation applies (patches, copied files): written into the worktree
+-- 
+2.56.0
+

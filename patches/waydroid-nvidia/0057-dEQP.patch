@@ -1,0 +1,55 @@
+From 971aeabada0c79746363d772d0bc42862ef3ac13 Mon Sep 17 00:00:00 2001
+From: Shiro836 <noreply>
+Date: Sat, 24 Oct 2026 16:04:39 +0300
+Subject: [PATCH 57/72] =?utf-8?q?dEQP=EF=BC=9A=E5=B4=A9=E6=BA=83=E5=90=8E?=
+ =?utf-8?q?=E9=87=8D=E6=96=B0=E6=8E=92=E5=85=A5=E5=85=A8=E9=83=A8=E6=9C=AA?=
+ =?utf-8?q?=E8=BF=94=E5=9B=9E=E7=BB=93=E6=9E=9C=E7=9A=84=E7=94=A8=E4=BE=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit bd8c56fd8c9dfc37de2e0736b22dfc85f02c23b5)
+---
+ .../native/mesa/tests/deqp-gles2-run.py         | 17 +++++++----------
+ 1 file changed, 7 insertions(+), 10 deletions(-)
+
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/deqp-gles2-run.py b/nvidia-prolapse/driver-source/native/mesa/tests/deqp-gles2-run.py
+index 7dbea61..e8d58c3 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/tests/deqp-gles2-run.py
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/deqp-gles2-run.py
+@@ -28,10 +28,11 @@ args = ["--deqp-surface-type=pbuffer", "--deqp-gl-config-name=" + os.environ.get
+         "--deqp-watchdog=enable"]
+ results = {}
+ first_err = {}
+-i = 0
+ batch = 0
+-while i < len(cases):
+-    rest = cases[i:]
++# Re-queue every case without a result. dEQP runs a list in its own order, not
++# the list's, so a crash can leave unrun cases before the one that died.
++while any(c not in results for c in cases):
++    rest = [c for c in cases if c not in results]
+     lf = os.path.join(outdir, f"batch{batch}.txt")
+     with open(lf, "w") as f:
+         f.write("\n".join(rest) + "\n")
+@@ -61,14 +62,10 @@ while i < len(cases):
+         results[cur] = "Crash" if rc != "timeout" else "Timeout"
+         msg = [l for l in err.splitlines() if "nvrm:" in l or "abort" in l.lower() or "Assert" in l]
+         first_err[cur] = (msg[-1] if msg else f"rc={rc}")[:300]
+-    # advance past everything that has a result
+-    while i < len(cases) and cases[i] in results:
+-        i += 1
+-    if cur is None and i < len(cases) and done == 0:
++    if cur is None and done == 0:
+         # nothing ran: mark the first one and move on
+-        results[cases[i]] = "Crash"
+-        first_err[cases[i]] = ("no output: " + err[-300:]).replace("\n", " | ")
+-        i += 1
++        results[rest[0]] = "Crash"
++        first_err[rest[0]] = ("no output: " + err[-300:]).replace("\n", " | ")
+     batch += 1
+ cnt = collections.Counter(results.values())
+ json.dump({"counts": cnt, "results": results, "errors": first_err},
+-- 
+2.56.0
+

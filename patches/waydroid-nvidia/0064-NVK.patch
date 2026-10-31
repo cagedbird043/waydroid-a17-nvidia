@@ -1,0 +1,3091 @@
+From 681f610533303812461bec72610b1e6c6f18cc6c Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 17:22:03 +0800
+Subject: [PATCH 64/72] =?utf-8?q?NVK=EF=BC=9A=E5=8A=A0=E5=85=A5=E7=8B=AC?=
+ =?utf-8?q?=E7=AB=8B=E8=AE=A1=E7=AE=97=E9=98=9F=E5=88=97=E6=97=8F=E5=92=8C?=
+ =?utf-8?q?=E9=80=9A=E7=94=A8=E8=AE=A1=E7=AE=97=E5=88=9D=E5=A7=8B=E5=8C=96?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 67920f1e8bf8a89ae9060ee5adf30c07f0d36e19)
+---
+ .../driver-source/native/mesa/abi-check.c     |    2 +
+ .../driver-source/native/mesa/build.py        |   14 +-
+ .../driver-source/native/mesa/nv_rm.h         |    5 +-
+ .../mesa/nvk-compute-queue-family.patch       | 1893 +++++++++++++++++
+ .../native/mesa/nvk-stock-compute-init.patch  |  218 ++
+ .../driver-source/native/mesa/nvkmd_rm.c      |    8 +-
+ .../driver-source/native/mesa/tests/README.md |   17 +
+ .../native/mesa/tests/vk-async-compute.c      |  555 +++++
+ .../native/mesa/tests/vk-async-compute.glsl   |   43 +
+ .../mesa/tests/vk-compute-queue-compressed.c  |  128 ++
+ .../driver-source/native/src/gpu.rs           |   17 +
+ .../driver-source/native/src/mesa.rs          |    7 +-
+ 12 files changed, 2902 insertions(+), 5 deletions(-)
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-family.patch
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nvk-stock-compute-init.patch
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/tests/vk-async-compute.c
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/tests/vk-async-compute.glsl
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/tests/vk-compute-queue-compressed.c
+
+diff --git a/nvidia-prolapse/driver-source/native/mesa/abi-check.c b/nvidia-prolapse/driver-source/native/mesa/abi-check.c
+index 1ecdd71..afdcc34 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/abi-check.c
++++ b/nvidia-prolapse/driver-source/native/mesa/abi-check.c
+@@ -5,6 +5,7 @@ _Static_assert(sizeof(struct NvRmInfo) == 208, "Rust Info size");
+ _Static_assert(offsetof(struct NvRmInfo, zcull) == 152, "Rust Info ZCULL offset");
+ _Static_assert(offsetof(struct NvRmInfo, zcull_ctxsw_size) == 192, "Rust Info ZCULL ctxsw offset");
+ _Static_assert(offsetof(struct NvRmInfo, has_zcull_info) == 200, "Rust Info ZCULL flag offset");
++_Static_assert(offsetof(struct NvRmInfo, sm_isa) == 204, "Rust Info SM ISA offset");
+ _Static_assert(offsetof(struct NvRmInfo, generic_kind) == 68, "Rust Info kind offset");
+ _Static_assert(offsetof(struct NvRmInfo, vram_size) == 72, "Rust Info VRAM offset");
+ _Static_assert(offsetof(struct NvRmInfo, bar_size) == 80, "Rust Info BAR offset");
+@@ -21,6 +22,7 @@ int main(void) {
+    OFFSET(NvRmInfo, zcull);
+    OFFSET(NvRmInfo, zcull_ctxsw_size);
+    OFFSET(NvRmInfo, has_zcull_info);
++   OFFSET(NvRmInfo, sm_isa);
+    SIZE(NvRmAllocation);
+    OFFSET(NvRmAllocation, id);
+    OFFSET(NvRmAllocation, size);
+diff --git a/nvidia-prolapse/driver-source/native/mesa/build.py b/nvidia-prolapse/driver-source/native/mesa/build.py
+index 6a6e15f..b8c170e 100755
+--- a/nvidia-prolapse/driver-source/native/mesa/build.py
++++ b/nvidia-prolapse/driver-source/native/mesa/build.py
+@@ -147,7 +147,8 @@ NVK_PATCHES = ("build-compat.patch", "rm-integration.patch", "pascal-a-clear.pat
+                "nvk-shader-upload-publish.patch", "nvk-shader-prefetch-in-range.patch",
+                "nvk-prevolta-modifier-memory-types.patch", "nvk-3d-view-of-2d-image.patch",
+                "nvk-pixel-shader-barrier.patch", "nak-qmd-cwd-membar.patch",
+-               "nak-qmd-dependency.patch", "nvk-cs-join-qmd.patch")
++               "nak-qmd-dependency.patch", "nvk-cs-join-qmd.patch",
++               "nvk-compute-queue-family.patch", "nvk-stock-compute-init.patch")
+ 
+ GL_TRIPLES = {"android": "x86_64-linux-android", "android32": "i686-linux-android"}
+ # Android: distinct library names so the image's own Mesa (libEGL_mesa.so,
+@@ -211,6 +212,17 @@ NVK_PATCH_LIST = [
+     # decrements) instead of WAIT_FOR_IDLE, as NVIDIA's driver does.
+     HERE / "nak-qmd-dependency.patch",
+     HERE / "nvk-cs-join-qmd.patch",
++    # A compute-only queue family whose queues run on their own
++    # subcontext in graphics queue 0's channel group (BLACKWELL_COMPUTE_B,
++    # backends with shared contexts), as the proprietary driver exposes
++    # and places its compute queues; its transfers and clears run as
++    # compute work there.
++    HERE / "nvk-compute-queue-family.patch",
++    # Every compute context starts with the proprietary driver's compute
++    # initialiser words where they are public (SPA/QMD version, SKED
++    # cache sequence with IGNORE_VEID, CWD slot count on GB20x); SKED
++    # cache invalidates then happen only in that WFI-ALL form.
++    HERE / "nvk-stock-compute-init.patch",
+ ]
+ 
+ def prepared_stamp(source, inputs):
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nv_rm.h b/nvidia-prolapse/driver-source/native/mesa/nv_rm.h
+index ff2cadd..6378ee6 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nv_rm.h
++++ b/nvidia-prolapse/driver-source/native/mesa/nv_rm.h
+@@ -39,7 +39,10 @@ struct NvRmInfo {
+     * is logged at open. */
+    struct NvRmZcullInfo zcull;
+    uint32_t zcull_ctxsw_size, zcull_ctxsw_align;
+-   uint32_t has_zcull_info, reserved;
++   uint32_t has_zcull_info;
++   /* RM's SM ISA code (NV2080_CTRL_GR_INFO_INDEX_SM_VERSION, e.g. 0xa04 on
++    * GB20x); `sm` is the shader model decimal derived from it. */
++   uint32_t sm_isa;
+ };
+ struct NvRmAllocation {
+    uint64_t id, size;
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-family.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-family.patch
+new file mode 100644
+index 0000000..7ddfebe
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-family.patch
+@@ -0,0 +1,1893 @@
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
++@@ -34,6 +34,7 @@
++ #include "nv_push_clb1c0.h"
++ #include "nv_push_clc597.h"
++ #include "nv_push_clc797.h"
+++#include "nv_push_clc7c0.h"
++ #include "nv_push_clc86f.h"
++ 
++ static uint8_t
++@@ -163,6 +164,12 @@
++    return nvk_queue_subchannels_from_engines(engines);
++ }
++ 
+++uint8_t
+++nvk_cmd_buffer_host_subc(struct nvk_cmd_buffer *cmd)
+++{
+++   return ffs(nvk_cmd_buffer_subchannel_mask(cmd)) - 1;
+++}
+++
++ const struct vk_command_buffer_ops nvk_cmd_buffer_ops = {
++    .create = nvk_create_cmd_buffer,
++    .reset = nvk_reset_cmd_buffer,
++@@ -377,10 +384,18 @@
++                                  cond->conditionalRenderingEnable;
++    }
++ 
++-   /* Start with a nop so we have at least something to submit */
+++   /* Start with a nop so we have at least something to submit.  The
+++    * compute-only family has no copy engine: its nop goes to the compute
+++    * class.
+++    */
++    struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++-   P_MTHD(p, NV90B5, NOP);
++-   P_NV90B5_NOP(p, 0);
+++   if (nvk_queue_engines_from_queue_flags(queue_flags) & NVKMD_ENGINE_COPY) {
+++      P_MTHD(p, NV90B5, NOP);
+++      P_NV90B5_NOP(p, 0);
+++   } else {
+++      P_MTHD(p, NVA0C0, NO_OPERATION);
+++      P_NVA0C0_NO_OPERATION(p, 0);
+++   }
++ 
++    if (queue_flags & VK_QUEUE_COMPUTE_BIT)
++       nvk_cmd_buffer_begin_compute(cmd, pBeginInfo);
++@@ -981,6 +996,7 @@
++    }
++ 
++    if (barriers & NVK_BARRIER_INVALIDATE_RASTER_CACHE &&
+++       (engines & NVKMD_ENGINE_3D) &&
++        dev->vk.enabled_features.pipelineFragmentShadingRate)
++       P_IMMD(p, NVC597, INVALIDATE_RASTER_CACHE_NO_WFI, 0);
++ 
++@@ -1016,18 +1032,22 @@
++    if (barriers & (NVK_BARRIER_INVALIDATE_MME_DATA)) {
++       if (pdev->info.cls_eng3d >= HOPPER_A) {
++          /* take from the open kernel watchdog handling, might be overkill */
++-         P_IMMD(p, NVC86F, WFI, 0);
++-         P_MTHD(p, NVC86F, MEM_OP_A);
+++         __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NVC86F_WFI, 0);
+++         __push_mthd(p, nvk_cmd_buffer_host_subc(cmd), NVC86F_MEM_OP_A);
++          P_NVC86F_MEM_OP_A(p, {});
++          P_NVC86F_MEM_OP_B(p, 0);
++          P_NVC86F_MEM_OP_C(p, { .membar_type = 0 });
++          P_NVC86F_MEM_OP_D(p, { .operation = OPERATION_MEMBAR });
++ 
++       } else {
++-         __push_immd(p, SUBC_NV9097, NV906F_SET_REFERENCE, 0);
+++         __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NV906F_SET_REFERENCE, 0);
++ 
++-         if (pdev->info.cls_eng3d >= TURING_A)
++-            P_IMMD(p, NVC597, MME_DMA_SYSMEMBAR, 0);
+++         if (pdev->info.cls_eng3d >= TURING_A) {
+++            if (engines & NVKMD_ENGINE_3D)
+++               P_IMMD(p, NVC597, MME_DMA_SYSMEMBAR, 0);
+++            else
+++               P_IMMD(p, NVC7C0, MME_DMA_SYSMEMBAR, 0);
+++         }
++       }
++    }
++ 
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
++@@ -439,6 +439,11 @@
++ 
++ VkQueueFlags nvk_cmd_buffer_queue_flags(struct nvk_cmd_buffer *cmd);
++ 
+++/* Subchannel for host (channel-class) methods: one the channel has bound,
+++ * which on the compute-only family is the compute class's.
+++ */
+++uint8_t nvk_cmd_buffer_host_subc(struct nvk_cmd_buffer *cmd);
+++
++ VkResult nvk_cmd_buffer_alloc_mem(struct nvk_cmd_buffer *cmd,
++                                   bool force_gart,
++                                   struct nvk_cmd_mem **mem_out);
++@@ -525,6 +530,17 @@
++ void nvk_cmd_copy_image_ce(struct nvk_cmd_buffer *cmd,
++                            const VkCopyImageInfo2 *pCopyImageInfo);
++ 
+++struct nvk_image;
+++void nvk_cmd_clear_color_image_meta(struct nvk_cmd_buffer *cmd,
+++                                    struct nvk_image *image,
+++                                    const VkClearColorValue *color,
+++                                    uint32_t range_count,
+++                                    const VkImageSubresourceRange *ranges);
+++
+++void nvk_cmd_update_buffer_meta(struct nvk_cmd_buffer *cmd, VkBuffer dstBuffer,
+++                                VkDeviceSize dstOffset, VkDeviceSize dataSize,
+++                                const void *pData);
+++
++ void nvk_meta_resolve_rendering(struct nvk_cmd_buffer *cmd,
++                                 const VkRenderingInfo *pRenderingInfo);
++ 
++--- a/src/nouveau/vulkan/nvk_cmd_clear.c
+++++ b/src/nouveau/vulkan/nvk_cmd_clear.c
++@@ -3,6 +3,7 @@
++  * SPDX-License-Identifier: MIT
++  */
++ #include "nvk_cmd_buffer.h"
+++#include "nvk_queue.h"
++ 
++ #include "nvk_device.h"
++ #include "nvk_entrypoints.h"
++@@ -372,6 +373,13 @@
++    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++    VK_FROM_HANDLE(nvk_image, image, _image);
++ 
+++   /* Without the 3D class (compute-only family) the clear is compute work */
+++   if (!(nvk_queue_engines_from_queue_flags(nvk_cmd_buffer_queue_flags(cmd)) &
+++         NVKMD_ENGINE_3D)) {
+++      nvk_cmd_clear_color_image_meta(cmd, image, pColor, rangeCount, pRanges);
+++      return;
+++   }
+++
++    VkClearValue clear_value = {
++       .color = *pColor,
++    };
++--- a/src/nouveau/vulkan/nvk_cmd_copy.c
+++++ b/src/nouveau/vulkan/nvk_cmd_copy.c
++@@ -3,6 +3,7 @@
++  * SPDX-License-Identifier: MIT
++  */
++ #include "nvk_cmd_buffer.h"
+++#include "nvk_queue.h"
++ 
++ #include "nvk_buffer.h"
++ #include "nvk_device.h"
++@@ -975,8 +976,15 @@
++ 
++    /* Do not use I2M if the copy is too big (2012 bytes is our limit) */
++    const uint32_t i2m_push_dw_count = dw_count + 9;
++-   if (i2m_push_dw_count > NVK_CMD_BUFFER_MAX_PUSH)
+++   if (i2m_push_dw_count > NVK_CMD_BUFFER_MAX_PUSH) {
+++      /* The compute-only family has no copy engine: compute meta. */
+++      if (!(nvk_queue_engines_from_queue_flags(nvk_cmd_buffer_queue_flags(cmd)) &
+++            NVKMD_ENGINE_COPY)) {
+++         nvk_cmd_update_buffer_meta(cmd, dstBuffer, dstOffset, dataSize, pData);
+++         return;
+++      }
++       subc = SUBC_NV90B5;
+++   }
++ 
++    /* I2M transfers are affected by conditional rendering but CmdUpdateBuffer shouldn't */
++    if (subc == SUBC_NV9097 || subc == SUBC_NV90C0) {
++--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++@@ -105,7 +105,7 @@
++                              const VkCommandBufferBeginInfo *pBeginInfo)
++ {
++    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
++-      struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
++       if (nvk_cmd_buffer_compute_cls(cmd) >= MAXWELL_COMPUTE_B) {
++          P_IMMD(p, NVB1C0, INVALIDATE_SKED_CACHES, 0);
++       }
++@@ -115,6 +115,25 @@
++       P_IMMD(p, NVA0C0, INVALIDATE_TEXTURE_HEADER_CACHE_NO_WFI, {
++          .lines = LINES_ALL,
++       });
+++
+++      /* Host writes and the other queues' work (semaphore waits make all
+++       * of it visible) reach this command buffer's shaders only if their
+++       * caches drop stale lines: queues in one channel group get no context
+++       * switch between submissions, and on a queue without the 3D class the
+++       * constant-cache invalidate of nvk_cmd_buffer_begin_graphics()
+++       * (nvk_cmd_draw.c) never runs.  Every submission of the proprietary
+++       * driver starts with these invalidates on its graphics and compute
+++       * channels alike (libnvidia-eglcore.so 615.78.08, prologue words at
+++       * E 0xb2c888, compute form: shader caches {GLOBAL_DATA, CONSTANT},
+++       * texture header, sampler, texture data).
+++       */
+++      P_IMMD(p, NVA0C0, INVALIDATE_SHADER_CACHES_NO_WFI, {
+++         .global_data = GLOBAL_DATA_TRUE,
+++         .constant = CONSTANT_TRUE,
+++      });
+++      P_IMMD(p, NVA0C0, INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI, {
+++         .lines = LINES_ALL,
+++      });
++    }
++ }
++ 
++@@ -983,7 +1002,7 @@
++           * we need to wfi here too.
++           * TODO: delete this
++           */
++-         P_IMMD(p, NVC86F, WFI, 0);
+++         __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NVC86F_WFI, 0);
++       }
++ 
++       if (nvk_cmd_buffer_compute_cls(cmd) >= AMPERE_COMPUTE_B)
++@@ -1001,9 +1020,9 @@
++       p = nvk_cmd_buffer_push(cmd, 5);
++       /* Stall the command streamer */
++       if (pdev->info.cls_compute >= HOPPER_COMPUTE_A) {
++-         P_IMMD(p, NVC86F, WFI, 0);
+++         __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NVC86F_WFI, 0);
++       } else {
++-         __push_immd(p, SUBC_NV9097, NV906F_SET_REFERENCE, 0);
+++         __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NV906F_SET_REFERENCE, 0);
++       }
++ 
++       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DISPATCH_INDIRECT));
++--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
+++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
++@@ -1166,9 +1166,9 @@
++       if (pdev->info.cls_eng3d >= MAXWELL_COMPUTE_B)
++          P_IMMD(p, NVB1C0, INVALIDATE_SKED_CACHES, 0);
++       if (pdev->info.cls_eng3d >= HOPPER_A)
++-         P_IMMD(p, NVC86F, WFI, 0);
+++         __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NVC86F_WFI, 0);
++       else
++-         __push_immd(p, SUBC_NV9097, NV906F_SET_REFERENCE, 0);
+++         __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NV906F_SET_REFERENCE, 0);
++    }
++ 
++    if (layout->stages & VK_SHADER_STAGE_COMPUTE_BIT) {
++--- a/src/nouveau/vulkan/nvk_cmd_meta.c
+++++ b/src/nouveau/vulkan/nvk_cmd_meta.c
++@@ -4,14 +4,21 @@
++  */
++ #include "nvk_buffer.h"
++ #include "nvk_cmd_buffer.h"
+++#include "nvk_queue.h"
++ #include "nvk_descriptor_set.h"
++ #include "nvk_device.h"
++ #include "nvk_entrypoints.h"
++ #include "nvk_image.h"
++ #include "nvk_physical_device.h"
++ 
+++#include "nvk_format.h"
+++#include "vk_enum_to_str.h"
++ #include "vk_format.h"
++ 
+++#include "nir_builder.h"
+++#include "util/format/u_format.h"
+++
+++#include "clcd97.h"
++ #include "nv_push_cl9097.h"
++ #include "nv_push_cl90c0.h"
++ #include "nv_push_clb197.h"
++@@ -350,20 +357,149 @@
++    return e.width * e.height * e.depth;
++ }
++ 
+++/* Image copies on a queue without a copy engine (the compute-only family)
+++ * run as compute meta for every format, as the proprietary driver serves
+++ * every transfer command on its compute queue with compute work on that
+++ * queue's own channel (libnvidia-eglcore.so 615.78.08: a compute
+++ * inline-to-memory parameter block and an inline-QMD kernel launch per
+++ * command).  Depth/stencil aspects and YCbCr planes are copied through
+++ * unsigned-integer views of the same element size (as panvk_meta.h does) and
+++ * compressed formats through views of their block size.  The one layout
+++ * that has no such view is pre-Blackwell D32_SFLOAT_S8_UINT, whose stencil
+++ * shares 64-bit elements with depth: vk_meta needs each aspect's bits to fill
+++ * whole components.
+++ */
+++static bool
+++nvk_meta_image_copy_compute_only_supported(struct nvk_image *img)
+++{
+++   return img->vk.format != VK_FORMAT_D32_SFLOAT_S8_UINT || img->separate_zs;
+++}
+++
+++static bool
+++nvk_meta_image_copy_compute_ok(struct nvk_cmd_buffer *cmd,
+++                               struct nvk_image *img)
+++{
+++   if (nvk_meta_image_copy_compute_supported(img))
+++      return true;
+++
+++   /* Queues with a copy engine keep it for these formats */
+++   if (nvk_queue_engines_from_queue_flags(nvk_cmd_buffer_queue_flags(cmd)) &
+++       NVKMD_ENGINE_COPY)
+++      return false;
+++
+++   return nvk_meta_image_copy_compute_only_supported(img);
+++}
+++
+++/* D24 depth has no compute copy view on the compute-only family: its
+++ * images use a Z24 GOB layout no colour view format selects on Blackwell,
+++ * and the ZS GOB before (nvk_image.c does not advertise
+++ * VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_COMPUTE_QUEUE_BIT_KHR for it).
+++ */
+++static bool
+++nvk_meta_zs_regions_copyable(struct nvk_cmd_buffer *cmd,
+++                             const struct nvk_image *img,
+++                             uint32_t region_count,
+++                             const VkBufferImageCopy2 *regions,
+++                             const char *what)
+++{
+++   if (nvk_queue_engines_from_queue_flags(nvk_cmd_buffer_queue_flags(cmd)) &
+++       NVKMD_ENGINE_COPY)
+++      return true;
+++
+++   const struct nvk_physical_device *pdev =
+++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+++   const bool z24 = img->vk.format == VK_FORMAT_X8_D24_UNORM_PACK32 ||
+++                    img->vk.format == VK_FORMAT_D24_UNORM_S8_UINT;
+++   for (uint32_t r = 0; r < region_count; r++) {
+++      const VkImageAspectFlags aspects = regions[r].imageSubresource.aspectMask;
+++      if ((aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) &&
+++          (pdev->info.cls_eng3d < BLACKWELL_A ||
+++           (z24 && (aspects & VK_IMAGE_ASPECT_DEPTH_BIT)))) {
+++         vk_command_buffer_set_error(&cmd->vk,
+++            vk_errorf(cmd, VK_ERROR_UNKNOWN,
+++                      "%s on the compute-only queue family: %s %s aspect has "
+++                      "no compute copy view (format does not advertise the "
+++                      "copy-on-compute-queue feature) and the queue has no "
+++                      "copy engine", what, vk_Format_to_str(img->vk.format),
+++                      (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? "depth" : "stencil"));
+++         return false;
+++      }
+++   }
+++   return true;
+++}
+++
+++static void
+++nvk_meta_copy_depth_stencil_properties(struct nvk_image *img,
+++                                       struct vk_meta_copy_image_properties *props)
+++{
+++   switch (img->vk.format) {
+++   case VK_FORMAT_D16_UNORM:
+++      props->depth.view_format = VK_FORMAT_R16_UINT;
+++      props->depth.component_mask = BITFIELD_MASK(1);
+++      break;
+++   case VK_FORMAT_X8_D24_UNORM_PACK32:
+++      /* Z24X8: depth in the low three bytes */
+++      props->depth.view_format = VK_FORMAT_R8G8B8A8_UINT;
+++      props->depth.component_mask = BITFIELD_MASK(3);
+++      break;
+++   case VK_FORMAT_D32_SFLOAT:
+++      props->depth.view_format = VK_FORMAT_R32_UINT;
+++      props->depth.component_mask = BITFIELD_MASK(1);
+++      break;
+++   case VK_FORMAT_S8_UINT:
+++      props->stencil.view_format = VK_FORMAT_R8_UINT;
+++      props->stencil.component_mask = BITFIELD_MASK(1);
+++      break;
+++   case VK_FORMAT_D24_UNORM_S8_UINT:
+++      props->depth.view_format = VK_FORMAT_R8G8B8A8_UINT;
+++      props->depth.component_mask = BITFIELD_MASK(3);
+++      if (img->separate_zs) {
+++         props->stencil.view_format = VK_FORMAT_R8_UINT;
+++         props->stencil.component_mask = BITFIELD_MASK(1);
+++      } else {
+++         /* Z24S8: stencil in the high byte of the same element */
+++         props->stencil.view_format = VK_FORMAT_R8G8B8A8_UINT;
+++         props->stencil.component_mask = BITFIELD_BIT(3);
+++      }
+++      break;
+++   case VK_FORMAT_D32_SFLOAT_S8_UINT:
+++      assert(img->separate_zs);
+++      props->depth.view_format = VK_FORMAT_R32_UINT;
+++      props->depth.component_mask = BITFIELD_MASK(1);
+++      props->stencil.view_format = VK_FORMAT_R8_UINT;
+++      props->stencil.component_mask = BITFIELD_MASK(1);
+++      break;
+++   default:
+++      UNREACHABLE("depth/stencil format without a compute copy view");
+++   }
+++}
+++
++ static struct vk_meta_copy_image_properties
++ nvk_meta_copy_get_image_properties(struct nvk_image *img,
++                                    bool is_destination)
++ {
++    struct vk_meta_copy_image_properties props = {};
++ 
++-   assert(!vk_format_is_depth_or_stencil(img->vk.format));
++-   assert(!vk_format_get_ycbcr_info(img->vk.format));
++-
++-   unsigned blk_sz = vk_format_get_blocksize(img->vk.format);
++-   props.color.view_format = vk_meta_get_uint_format_for_blk_size(blk_sz);
+++   const struct vk_format_ycbcr_info *ycbcr_info =
+++      vk_format_get_ycbcr_info(img->vk.format);
+++   if (vk_format_is_depth_or_stencil(img->vk.format)) {
+++      nvk_meta_copy_depth_stencil_properties(img, &props);
+++   } else if (ycbcr_info != NULL) {
+++      for (uint32_t p = 0; p < ycbcr_info->n_planes; p++) {
+++         const unsigned plane_blk_sz =
+++            vk_format_get_blocksize(ycbcr_info->planes[p].format);
+++         props.plane[p].view_format =
+++            vk_meta_get_uint_format_for_blk_size(plane_blk_sz);
+++      }
+++   } else {
+++      unsigned blk_sz = vk_format_get_blocksize(img->vk.format);
+++      props.color.view_format = vk_meta_get_uint_format_for_blk_size(blk_sz);
+++   }
++ 
++    const struct nvk_image_plane *plane = &img->planes[0];
++    const struct nil_image *nil_image = &plane->nil;
+++   /* The workgroup shape follows plane 0's element size */
+++   const unsigned blk_sz = util_format_get_blocksize(nil_image->format.p_format);
++ 
++    const struct nil_image_level *level =
++       &nil_image->levels[0];
++@@ -417,6 +553,573 @@
++    nvk_meta_end_compute(cmd, &save);
++ }
++ 
+++/* The compute-only family's channel has no copy engine: a transfer that only
+++ * the copy engine implements fails with a named reason instead of emitting
+++ * copy-engine methods into a channel without that object.
+++ */
+++static bool
+++nvk_cmd_has_copy_engine(struct nvk_cmd_buffer *cmd, const char *what)
+++{
+++   if (nvk_queue_engines_from_queue_flags(nvk_cmd_buffer_queue_flags(cmd)) &
+++       NVKMD_ENGINE_COPY)
+++      return true;
+++
+++   vk_command_buffer_set_error(&cmd->vk,
+++      vk_errorf(cmd, VK_ERROR_UNKNOWN,
+++                "%s on the compute-only queue family: D32_SFLOAT_S8_UINT with "
+++                "stencil inside 64-bit elements (pre-Blackwell) has no "
+++                "compute copy view and the queue has no copy engine",
+++                what));
+++   return false;
+++}
+++
+++/* A sampled view that reinterprets a compressed image as blocks covers one
+++ * level (nil_image_level_as_uncompressed()), and the texture header derives
+++ * the stride between array layers from the view's own single level, not from
+++ * the image's mip chain: layers past the first read the wrong bytes when the
+++ * image has more than one level.  Storage views carry the array stride
+++ * explicitly and are unaffected.  So compute copies out of such an image
+++ * (on the compute-only family, which has no copy engine) read through one
+++ * single-layer view per layer, whose address the descriptor places with the
+++ * image's real array stride.
+++ */
+++static bool
+++nvk_meta_compressed_layers_need_split(const struct nvk_image *img)
+++{
+++   return vk_format_is_compressed(img->vk.format) &&
+++          img->vk.image_type != VK_IMAGE_TYPE_3D &&
+++          img->vk.array_layers > 1 && img->vk.mip_levels > 1;
+++}
+++
+++#define NVK_META_OBJECT_KEY_COMPRESSED_TO_BUFFER (VK_META_OBJECT_KEY_DRIVER_OFFSET + 0x101)
+++
+++struct nvk_meta_blocks_to_buffer_key {
+++   enum vk_meta_object_key_type key_type;
+++   uint32_t block_B;
+++   /* false: image layer -> buffer, true: buffer -> image layer */
+++   bool to_image;
+++};
+++
+++struct nvk_meta_blocks_to_buffer_push {
+++   uint64_t buf_addr;
+++   uint32_t row_stride_B;
+++   uint32_t pad;
+++   int32_t offset_el[2];
+++   uint32_t extent_el[2];
+++};
+++
+++static nir_shader *
+++nvk_meta_build_blocks_to_buffer_shader(uint32_t block_B, bool to_image)
+++{
+++   nir_builder builder =
+++      nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL,
+++                                     "nvk-meta-compressed-layer-to-buffer");
+++   nir_builder *b = &builder;
+++   b->shader->info.workgroup_size[0] = 16;
+++   b->shader->info.workgroup_size[1] = 16;
+++   b->shader->info.workgroup_size[2] = 1;
+++
+++   const enum pipe_format view_pfmt = block_B == 8 ? PIPE_FORMAT_R32G32_UINT
+++                                                   : PIPE_FORMAT_R32G32B32A32_UINT;
+++   const struct glsl_type *res_type = to_image ?
+++      glsl_image_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_UINT) :
+++      glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_UINT);
+++   nir_variable *res_var =
+++      nir_variable_create(b->shader, nir_var_uniform, res_type, "blocks");
+++   res_var->data.descriptor_set = 0;
+++   res_var->data.binding = 0;
+++   nir_deref_instr *res = nir_build_deref_var(b, res_var);
+++
+++   nir_def *id = nir_trim_vector(b, nir_load_global_invocation_id(b, 32), 2);
+++   nir_def *extent = nir_load_push_constant(b, 2, 32,
+++      nir_imm_int(b, offsetof(struct nvk_meta_blocks_to_buffer_push, extent_el)));
+++   nir_def *inside = nir_iand(b, nir_ult(b, nir_channel(b, id, 0),
+++                                         nir_channel(b, extent, 0)),
+++                                 nir_ult(b, nir_channel(b, id, 1),
+++                                         nir_channel(b, extent, 1)));
+++   nir_push_if(b, inside);
+++   {
+++      nir_def *offset = nir_load_push_constant(b, 2, 32,
+++         nir_imm_int(b, offsetof(struct nvk_meta_blocks_to_buffer_push, offset_el)));
+++      nir_def *coord = nir_iadd(b, id, offset);
+++
+++      nir_def *buf_addr = nir_load_push_constant(b, 1, 64,
+++         nir_imm_int(b, offsetof(struct nvk_meta_blocks_to_buffer_push, buf_addr)));
+++      nir_def *row_stride = nir_load_push_constant(b, 1, 32,
+++         nir_imm_int(b, offsetof(struct nvk_meta_blocks_to_buffer_push, row_stride_B)));
+++      nir_def *byte_off =
+++         nir_iadd(b, nir_imul(b, nir_channel(b, id, 1), row_stride),
+++                     nir_imul_imm(b, nir_channel(b, id, 0), block_B));
+++      nir_def *addr = nir_iadd(b, buf_addr, nir_u2u64(b, byte_off));
+++
+++      if (to_image) {
+++         nir_def *block = nir_load_global(b, block_B / 4, 32, addr,
+++                                          .align_mul = 4);
+++         nir_def *zero = nir_imm_int(b, 0);
+++         nir_def *val = nir_pad_vector_imm_int(b, block, 0, 4);
+++         nir_image_deref_store(b, &res->def,
+++                               nir_vec4(b, nir_channel(b, coord, 0),
+++                                        nir_channel(b, coord, 1), zero, zero),
+++                               zero, val, zero,
+++                               .image_dim = GLSL_SAMPLER_DIM_2D,
+++                               .image_array = false, .format = view_pfmt,
+++                               .access = ACCESS_NON_READABLE,
+++                               .src_type = nir_type_uint32);
+++      } else {
+++         nir_def *texel = nir_txf(b, coord, .texture_deref = res);
+++         nir_store_global(b, nir_trim_vector(b, texel, block_B / 4), addr,
+++                          .align_mul = 4);
+++      }
+++   }
+++   nir_pop_if(b, NULL);
+++
+++   return b->shader;
+++}
+++
+++static VkResult
+++nvk_meta_get_blocks_to_buffer_pipeline(struct nvk_device *dev,
+++                                       uint32_t block_B, bool to_image,
+++                                       VkPipelineLayout *layout_out,
+++                                       VkPipeline *pipeline_out)
+++{
+++   struct nvk_meta_blocks_to_buffer_key key;
+++   memset(&key, 0, sizeof(key));
+++   key.key_type = NVK_META_OBJECT_KEY_COMPRESSED_TO_BUFFER;
+++   key.block_B = block_B;
+++   key.to_image = to_image;
+++
+++   /* One layout per direction: the descriptor type differs */
+++   const struct {
+++      enum vk_meta_object_key_type key_type;
+++      bool to_image;
+++   } layout_key = { key.key_type, to_image };
+++
+++   const VkDescriptorSetLayoutBinding binding = {
+++      .binding = 0,
+++      .descriptorType = to_image ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+++                                 : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+++      .descriptorCount = 1,
+++      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+++   };
+++   const VkDescriptorSetLayoutCreateInfo set_layout = {
+++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+++      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+++      .bindingCount = 1,
+++      .pBindings = &binding,
+++   };
+++   const VkPushConstantRange push_range = {
+++      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+++      .offset = 0,
+++      .size = sizeof(struct nvk_meta_blocks_to_buffer_push),
+++   };
+++   VkResult result = vk_meta_get_pipeline_layout(&dev->vk, &dev->meta,
+++                                                 &set_layout, &push_range,
+++                                                 &layout_key,
+++                                                 sizeof(layout_key),
+++                                                 layout_out);
+++   if (result != VK_SUCCESS)
+++      return result;
+++
+++   VkPipeline cached = vk_meta_lookup_pipeline(&dev->meta, &key, sizeof(key));
+++   if (cached != VK_NULL_HANDLE) {
+++      *pipeline_out = cached;
+++      return VK_SUCCESS;
+++   }
+++
+++   const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
+++      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+++      .nir = nvk_meta_build_blocks_to_buffer_shader(block_B, to_image),
+++   };
+++   const VkComputePipelineCreateInfo info = {
+++      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+++      .stage = {
+++         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+++         .pNext = &nir_info,
+++         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+++         .pName = "main",
+++      },
+++      .layout = *layout_out,
+++   };
+++   result = vk_meta_create_compute_pipeline(&dev->vk, &dev->meta, &info,
+++                                            &key, sizeof(key), pipeline_out);
+++   ralloc_free(nir_info.nir);
+++   return result;
+++}
+++
+++/* One compute pass per (region, layer) between a buffer and single-layer
+++ * views of a compressed image; to_image selects the direction.
+++ */
+++static void
+++nvk_cmd_copy_compressed_layers(struct nvk_cmd_buffer *cmd, bool to_image,
+++                               VkImage image, VkImageLayout image_layout,
+++                               VkBuffer buffer, uint32_t region_count,
+++                               const VkBufferImageCopy2 *regions)
+++{
+++   VK_FROM_HANDLE(nvk_image, src, image);
+++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+++   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+++   const VkCommandBuffer handle = nvk_cmd_buffer_to_handle(cmd);
+++
+++   const uint32_t block_B = vk_format_get_blocksize(src->vk.format);
+++   assert(block_B == 8 || block_B == 16);
+++   const VkFormat view_format = block_B == 8 ? VK_FORMAT_R32G32_UINT
+++                                             : VK_FORMAT_R32G32B32A32_UINT;
+++
+++   VkPipelineLayout layout;
+++   VkPipeline pipeline;
+++   VkResult result =
+++      nvk_meta_get_blocks_to_buffer_pipeline(dev, block_B, to_image,
+++                                             &layout, &pipeline);
+++   if (result != VK_SUCCESS) {
+++      vk_command_buffer_set_error(&cmd->vk, result);
+++      return;
+++   }
+++
+++   struct nvk_meta_save_compute save;
+++   nvk_meta_begin_compute(cmd, &save);
+++   disp->CmdBindPipeline(handle, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+++
+++   for (uint32_t r = 0; r < region_count; r++) {
+++      const VkBufferImageCopy2 *region = &regions[r];
+++      const struct vk_image_buffer_layout buf_layout =
+++         vk_image_buffer_copy_layout(&src->vk, region);
+++      const VkExtent3D extent_el =
+++         vk_image_extent_to_elements(&src->vk, region->imageExtent);
+++      const VkOffset3D offset_el =
+++         vk_image_offset_to_elements(&src->vk, region->imageOffset);
+++      const uint32_t layer_count =
+++         vk_image_subresource_layer_count(&src->vk, &region->imageSubresource);
+++
+++      for (uint32_t l = 0; l < layer_count; l++) {
+++         const VkImageViewUsageCreateInfo usage = {
+++            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+++            .usage = to_image ? VK_IMAGE_USAGE_STORAGE_BIT
+++                              : VK_IMAGE_USAGE_SAMPLED_BIT,
+++         };
+++         const VkImageViewCreateInfo view_info = {
+++            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+++            .pNext = &usage,
+++            .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+++            .image = image,
+++            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+++            .format = view_format,
+++            .subresourceRange = {
+++               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+++               .baseMipLevel = region->imageSubresource.mipLevel,
+++               .levelCount = 1,
+++               .baseArrayLayer = region->imageSubresource.baseArrayLayer + l,
+++               .layerCount = 1,
+++            },
+++         };
+++         VkImageView view;
+++         result = vk_meta_create_image_view(&cmd->vk, &dev->meta, &view_info,
+++                                            &view);
+++         if (result != VK_SUCCESS) {
+++            vk_command_buffer_set_error(&cmd->vk, result);
+++            break;
+++         }
+++
+++         const VkWriteDescriptorSet write = {
+++            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+++            .dstBinding = 0,
+++            .descriptorCount = 1,
+++            .descriptorType = to_image ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+++                                       : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+++            .pImageInfo = &(VkDescriptorImageInfo) {
+++               .imageView = view,
+++               .imageLayout = image_layout,
+++            },
+++         };
+++         disp->CmdPushDescriptorSetKHR(handle, VK_PIPELINE_BIND_POINT_COMPUTE,
+++                                    layout, 0, 1, &write);
+++
+++         const struct nvk_meta_blocks_to_buffer_push push = {
+++            .buf_addr = vk_meta_buffer_address(&dev->vk, buffer,
+++                                               region->bufferOffset +
+++                                               l * buf_layout.image_stride_B,
+++                                               VK_WHOLE_SIZE),
+++            .row_stride_B = buf_layout.row_stride_B,
+++            .offset_el = { offset_el.x, offset_el.y },
+++            .extent_el = { extent_el.width, extent_el.height },
+++         };
+++         disp->CmdPushConstants(handle, layout, VK_SHADER_STAGE_COMPUTE_BIT,
+++                                0, sizeof(push), &push);
+++         disp->CmdDispatch(handle, DIV_ROUND_UP(extent_el.width, 16),
+++                           DIV_ROUND_UP(extent_el.height, 16), 1);
+++      }
+++   }
+++
+++   nvk_meta_end_compute(cmd, &save);
+++}
+++
+++#define NVK_META_OBJECT_KEY_COMPRESSED_IMAGE_COPY (VK_META_OBJECT_KEY_DRIVER_OFFSET + 0x102)
+++
+++struct nvk_meta_layer_copy_key {
+++   enum vk_meta_object_key_type key_type;
+++   uint32_t block_B;
+++};
+++
+++struct nvk_meta_layer_copy_push {
+++   int32_t src_offset_el[2];
+++   int32_t dst_offset_el[2];
+++   uint32_t extent_el[2];
+++};
+++
+++/* Image-to-image counterpart of nvk_cmd_copy_compressed_layers(): one
+++ * single-layer sampled source view and one single-layer storage destination
+++ * view per layer, both unsigned-integer views of the element size.
+++ */
+++static nir_shader *
+++nvk_meta_build_layer_copy_shader(uint32_t block_B)
+++{
+++   nir_builder builder =
+++      nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL,
+++                                     "nvk-meta-compressed-layer-copy");
+++   nir_builder *b = &builder;
+++   b->shader->info.workgroup_size[0] = 16;
+++   b->shader->info.workgroup_size[1] = 16;
+++   b->shader->info.workgroup_size[2] = 1;
+++
+++   nir_variable *src_var =
+++      nir_variable_create(b->shader, nir_var_uniform,
+++                          glsl_texture_type(GLSL_SAMPLER_DIM_2D, false,
+++                                            GLSL_TYPE_UINT), "src");
+++   src_var->data.descriptor_set = 0;
+++   src_var->data.binding = 0;
+++   nir_variable *dst_var =
+++      nir_variable_create(b->shader, nir_var_uniform,
+++                          glsl_image_type(GLSL_SAMPLER_DIM_2D, false,
+++                                          GLSL_TYPE_UINT), "dst");
+++   dst_var->data.descriptor_set = 0;
+++   dst_var->data.binding = 1;
+++
+++   const enum pipe_format view_pfmt =
+++      vk_format_to_pipe_format(vk_meta_get_uint_format_for_blk_size(block_B));
+++
+++   nir_def *id = nir_trim_vector(b, nir_load_global_invocation_id(b, 32), 2);
+++   nir_def *extent = nir_load_push_constant(b, 2, 32,
+++      nir_imm_int(b, offsetof(struct nvk_meta_layer_copy_push, extent_el)));
+++   nir_def *inside = nir_iand(b, nir_ult(b, nir_channel(b, id, 0),
+++                                         nir_channel(b, extent, 0)),
+++                                 nir_ult(b, nir_channel(b, id, 1),
+++                                         nir_channel(b, extent, 1)));
+++   nir_push_if(b, inside);
+++   {
+++      nir_def *src_off = nir_load_push_constant(b, 2, 32,
+++         nir_imm_int(b, offsetof(struct nvk_meta_layer_copy_push, src_offset_el)));
+++      nir_def *dst_off = nir_load_push_constant(b, 2, 32,
+++         nir_imm_int(b, offsetof(struct nvk_meta_layer_copy_push, dst_offset_el)));
+++      nir_def *texel = nir_txf(b, nir_iadd(b, id, src_off),
+++                               .texture_deref = nir_build_deref_var(b, src_var));
+++      nir_def *dst = nir_iadd(b, id, dst_off);
+++      nir_def *zero = nir_imm_int(b, 0);
+++      nir_image_deref_store(b, &nir_build_deref_var(b, dst_var)->def,
+++                            nir_vec4(b, nir_channel(b, dst, 0),
+++                                     nir_channel(b, dst, 1), zero, zero),
+++                            zero, texel, zero,
+++                            .image_dim = GLSL_SAMPLER_DIM_2D,
+++                            .image_array = false, .format = view_pfmt,
+++                            .access = ACCESS_NON_READABLE,
+++                            .src_type = nir_type_uint32);
+++   }
+++   nir_pop_if(b, NULL);
+++
+++   return b->shader;
+++}
+++
+++static VkResult
+++nvk_meta_get_layer_copy_pipeline(struct nvk_device *dev, uint32_t block_B,
+++                                 VkPipelineLayout *layout_out,
+++                                 VkPipeline *pipeline_out)
+++{
+++   struct nvk_meta_layer_copy_key key;
+++   memset(&key, 0, sizeof(key));
+++   key.key_type = NVK_META_OBJECT_KEY_COMPRESSED_IMAGE_COPY;
+++   key.block_B = block_B;
+++
+++   const VkDescriptorSetLayoutBinding bindings[] = {
+++      {
+++         .binding = 0,
+++         .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+++         .descriptorCount = 1,
+++         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+++      },
+++      {
+++         .binding = 1,
+++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+++         .descriptorCount = 1,
+++         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+++      },
+++   };
+++   const VkDescriptorSetLayoutCreateInfo set_layout = {
+++      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+++      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+++      .bindingCount = ARRAY_SIZE(bindings),
+++      .pBindings = bindings,
+++   };
+++   const VkPushConstantRange push_range = {
+++      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+++      .offset = 0,
+++      .size = sizeof(struct nvk_meta_layer_copy_push),
+++   };
+++   VkResult result = vk_meta_get_pipeline_layout(&dev->vk, &dev->meta,
+++                                                 &set_layout, &push_range,
+++                                                 &key.key_type,
+++                                                 sizeof(key.key_type),
+++                                                 layout_out);
+++   if (result != VK_SUCCESS)
+++      return result;
+++
+++   VkPipeline cached = vk_meta_lookup_pipeline(&dev->meta, &key, sizeof(key));
+++   if (cached != VK_NULL_HANDLE) {
+++      *pipeline_out = cached;
+++      return VK_SUCCESS;
+++   }
+++
+++   const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
+++      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+++      .nir = nvk_meta_build_layer_copy_shader(block_B),
+++   };
+++   const VkComputePipelineCreateInfo info = {
+++      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+++      .stage = {
+++         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+++         .pNext = &nir_info,
+++         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+++         .pName = "main",
+++      },
+++      .layout = *layout_out,
+++   };
+++   result = vk_meta_create_compute_pipeline(&dev->vk, &dev->meta, &info,
+++                                            &key, sizeof(key), pipeline_out);
+++   ralloc_free(nir_info.nir);
+++   return result;
+++}
+++
+++static VkResult
+++nvk_meta_layer_view(struct nvk_cmd_buffer *cmd, VkImage image,
+++                    VkFormat format, VkImageUsageFlags usage_bit,
+++                    uint32_t level, uint32_t layer, VkImageView *view_out)
+++{
+++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+++   const VkImageViewUsageCreateInfo usage = {
+++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+++      .usage = usage_bit,
+++   };
+++   const VkImageViewCreateInfo info = {
+++      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+++      .pNext = &usage,
+++      .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+++      .image = image,
+++      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+++      .format = format,
+++      .subresourceRange = {
+++         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+++         .baseMipLevel = level,
+++         .levelCount = 1,
+++         .baseArrayLayer = layer,
+++         .layerCount = 1,
+++      },
+++   };
+++   return vk_meta_create_image_view(&cmd->vk, &dev->meta, &info, view_out);
+++}
+++
+++static void
+++nvk_cmd_copy_compressed_image_layers(struct nvk_cmd_buffer *cmd,
+++                                     const VkCopyImageInfo2 *info)
+++{
+++   VK_FROM_HANDLE(nvk_image, src, info->srcImage);
+++   VK_FROM_HANDLE(nvk_image, dst, info->dstImage);
+++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+++   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+++   const VkCommandBuffer handle = nvk_cmd_buffer_to_handle(cmd);
+++
+++   const uint32_t block_B = vk_format_get_blocksize(src->vk.format);
+++   assert(block_B == vk_format_get_blocksize(dst->vk.format));
+++   const VkFormat view_format = vk_meta_get_uint_format_for_blk_size(block_B);
+++
+++   VkPipelineLayout layout;
+++   VkPipeline pipeline;
+++   VkResult result =
+++      nvk_meta_get_layer_copy_pipeline(dev, block_B, &layout, &pipeline);
+++   if (result != VK_SUCCESS) {
+++      vk_command_buffer_set_error(&cmd->vk, result);
+++      return;
+++   }
+++
+++   struct nvk_meta_save_compute save;
+++   nvk_meta_begin_compute(cmd, &save);
+++   disp->CmdBindPipeline(handle, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+++
+++   for (uint32_t r = 0; r < info->regionCount; r++) {
+++      const VkImageCopy2 *region = &info->pRegions[r];
+++      const VkExtent3D extent_el =
+++         vk_image_extent_to_elements(&src->vk, region->extent);
+++      const VkOffset3D src_off =
+++         vk_image_offset_to_elements(&src->vk, region->srcOffset);
+++      const VkOffset3D dst_off =
+++         vk_image_offset_to_elements(&dst->vk, region->dstOffset);
+++      const uint32_t layer_count =
+++         vk_image_subresource_layer_count(&src->vk, &region->srcSubresource);
+++
+++      for (uint32_t l = 0; l < layer_count; l++) {
+++         VkImageView src_view, dst_view;
+++         result = nvk_meta_layer_view(cmd, info->srcImage, view_format,
+++                                      VK_IMAGE_USAGE_SAMPLED_BIT,
+++                                      region->srcSubresource.mipLevel,
+++                                      region->srcSubresource.baseArrayLayer + l,
+++                                      &src_view);
+++         if (result == VK_SUCCESS)
+++            result = nvk_meta_layer_view(cmd, info->dstImage, view_format,
+++                                         VK_IMAGE_USAGE_STORAGE_BIT,
+++                                         region->dstSubresource.mipLevel,
+++                                         region->dstSubresource.baseArrayLayer + l,
+++                                         &dst_view);
+++         if (result != VK_SUCCESS) {
+++            vk_command_buffer_set_error(&cmd->vk, result);
+++            break;
+++         }
+++
+++         const VkWriteDescriptorSet writes[] = {
+++            {
+++               .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+++               .dstBinding = 0,
+++               .descriptorCount = 1,
+++               .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+++               .pImageInfo = &(VkDescriptorImageInfo) {
+++                  .imageView = src_view,
+++                  .imageLayout = info->srcImageLayout,
+++               },
+++            },
+++            {
+++               .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+++               .dstBinding = 1,
+++               .descriptorCount = 1,
+++               .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+++               .pImageInfo = &(VkDescriptorImageInfo) {
+++                  .imageView = dst_view,
+++                  .imageLayout = info->dstImageLayout,
+++               },
+++            },
+++         };
+++         disp->CmdPushDescriptorSetKHR(handle, VK_PIPELINE_BIND_POINT_COMPUTE,
+++                                       layout, 0, ARRAY_SIZE(writes), writes);
+++
+++         const struct nvk_meta_layer_copy_push push = {
+++            .src_offset_el = { src_off.x, src_off.y },
+++            .dst_offset_el = { dst_off.x, dst_off.y },
+++            .extent_el = { extent_el.width, extent_el.height },
+++         };
+++         disp->CmdPushConstants(handle, layout, VK_SHADER_STAGE_COMPUTE_BIT,
+++                                0, sizeof(push), &push);
+++         disp->CmdDispatch(handle, DIV_ROUND_UP(extent_el.width, 16),
+++                           DIV_ROUND_UP(extent_el.height, 16), 1);
+++      }
+++   }
+++
+++   nvk_meta_end_compute(cmd, &save);
+++}
+++
++ VKAPI_ATTR void VKAPI_CALL
++ nvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
++                           const VkCopyImageToBufferInfo2 *pCopyImageToBufferInfo)
++@@ -426,9 +1129,23 @@
++ 
++    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
++    if ((queue_flags & VK_QUEUE_COMPUTE_BIT) &&
++-       nvk_meta_image_copy_compute_supported(src)) {
++-      nvk_cmd_copy_image_to_buffer_meta(cmd, pCopyImageToBufferInfo);
++-   } else {
+++       nvk_meta_image_copy_compute_ok(cmd, src)) {
+++      if (!nvk_meta_zs_regions_copyable(cmd, src,
+++                                        pCopyImageToBufferInfo->regionCount,
+++                                        pCopyImageToBufferInfo->pRegions,
+++                                        "vkCmdCopyImageToBuffer2"))
+++         return;
+++      if (!nvk_meta_image_copy_compute_supported(src) &&
+++          nvk_meta_compressed_layers_need_split(src))
+++         nvk_cmd_copy_compressed_layers(cmd, false,
+++                                        pCopyImageToBufferInfo->srcImage,
+++                                        pCopyImageToBufferInfo->srcImageLayout,
+++                                        pCopyImageToBufferInfo->dstBuffer,
+++                                        pCopyImageToBufferInfo->regionCount,
+++                                        pCopyImageToBufferInfo->pRegions);
+++      else
+++         nvk_cmd_copy_image_to_buffer_meta(cmd, pCopyImageToBufferInfo);
+++   } else if (nvk_cmd_has_copy_engine(cmd, "vkCmdCopyImageToBuffer2")) {
++       nvk_cmd_copy_image_to_buffer_ce(cmd, pCopyImageToBufferInfo);
++    }
++ }
++@@ -460,10 +1177,25 @@
++ 
++    VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
++    if ((queue_flags & VK_QUEUE_COMPUTE_BIT) &&
++-       nvk_meta_image_copy_compute_supported(dst)) {
++-      nvk_cmd_copy_buffer_to_image_meta(cmd, pCopyBufferToImageInfo,
++-                              VK_PIPELINE_BIND_POINT_COMPUTE);
++-   } else {
+++       nvk_meta_image_copy_compute_ok(cmd, dst)) {
+++      if (!nvk_meta_zs_regions_copyable(cmd, dst,
+++                                        pCopyBufferToImageInfo->regionCount,
+++                                        pCopyBufferToImageInfo->pRegions,
+++                                        "vkCmdCopyBufferToImage2"))
+++         return;
+++      if (!nvk_meta_image_copy_compute_supported(dst) &&
+++          nvk_meta_compressed_layers_need_split(dst)) {
+++         nvk_cmd_copy_compressed_layers(cmd, true,
+++                                        pCopyBufferToImageInfo->dstImage,
+++                                        pCopyBufferToImageInfo->dstImageLayout,
+++                                        pCopyBufferToImageInfo->srcBuffer,
+++                                        pCopyBufferToImageInfo->regionCount,
+++                                        pCopyBufferToImageInfo->pRegions);
+++      } else {
+++         nvk_cmd_copy_buffer_to_image_meta(cmd, pCopyBufferToImageInfo,
+++                                 VK_PIPELINE_BIND_POINT_COMPUTE);
+++      }
+++   } else if (nvk_cmd_has_copy_engine(cmd, "vkCmdCopyBufferToImage2")) {
++       nvk_cmd_copy_buffer_to_image_ce(cmd, pCopyBufferToImageInfo);
++    }
++ }
++@@ -505,11 +1237,34 @@
++       nvk_cmd_copy_image_meta(cmd, pCopyImageInfo,
++                               VK_PIPELINE_BIND_POINT_GRAPHICS);
++    } else if ((queue_flags & VK_QUEUE_COMPUTE_BIT) &&
++-       nvk_meta_image_copy_compute_supported(src) &&
++-       nvk_meta_image_copy_compute_supported(dst)) {
+++       nvk_meta_image_copy_compute_ok(cmd, src) &&
+++       nvk_meta_image_copy_compute_ok(cmd, dst)) {
+++      /* vk_meta's image-to-image copy views every layer at once, which
+++       * misplaces layers of a compressed array image with mip levels (see
+++       * nvk_meta_compressed_layers_need_split()): copy those per layer.
+++       */
+++      const bool split =
+++         (!nvk_meta_image_copy_compute_supported(src) &&
+++          nvk_meta_compressed_layers_need_split(src)) ||
+++         (!nvk_meta_image_copy_compute_supported(dst) &&
+++          nvk_meta_compressed_layers_need_split(dst));
+++      if (split) {
+++         if (src->vk.image_type == VK_IMAGE_TYPE_3D ||
+++             dst->vk.image_type == VK_IMAGE_TYPE_3D) {
+++            vk_command_buffer_set_error(&cmd->vk,
+++               vk_errorf(cmd, VK_ERROR_UNKNOWN,
+++                         "vkCmdCopyImage2 on the compute-only queue family: "
+++                         "between a 3D image and a compressed array image "
+++                         "with mip levels has no compute copy and the queue "
+++                         "has no copy engine"));
+++            return;
+++         }
+++         nvk_cmd_copy_compressed_image_layers(cmd, pCopyImageInfo);
+++         return;
+++      }
++       nvk_cmd_copy_image_meta(cmd, pCopyImageInfo,
++                               VK_PIPELINE_BIND_POINT_COMPUTE);
++-   } else {
+++   } else if (nvk_cmd_has_copy_engine(cmd, "vkCmdCopyImage2")) {
++       nvk_cmd_copy_image_ce(cmd, pCopyImageInfo);
++    }
++ }
++@@ -540,6 +1295,248 @@
++    }
++ }
++ 
+++/* vkCmdClearColorImage on a queue without the 3D class (the compute-only
+++ * family).  The proprietary driver clears an image there with its compute
+++ * fill kernel over the image's bytes (libnvidia-eglcore.so 615.78.08 on its
+++ * compute-queue channel: an inline-to-memory parameter block holding a
+++ * 16-byte pattern, then one inline-QMD launch of the same kernel it uses for
+++ * vkCmdFillBuffer, over 256x256x4 bytes for a 256x256 RGBA8 image).  A
+++ * colour subresource's elements are a permutation of its bytes in any
+++ * tiling, so filling every byte of each cleared level and layer with the
+++ * packed clear value repeated clears it.  The kernel below stores one word
+++ * of a 16-byte pattern per invocation.
+++ */
+++#define NVK_META_OBJECT_KEY_FILL_PATTERN16 (VK_META_OBJECT_KEY_DRIVER_OFFSET + 0x100)
+++
+++struct nvk_meta_fill16_push {
+++   uint64_t addr;
+++   uint32_t size_B;
+++   uint32_t pad;
+++   uint32_t pattern[4];
+++};
+++
+++#define NVK_META_FILL16_WG_SIZE 128
+++
+++static nir_shader *
+++nvk_meta_build_fill16_shader(void)
+++{
+++   nir_builder builder =
+++      nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL,
+++                                     "nvk-meta-fill-pattern16");
+++   nir_builder *b = &builder;
+++   b->shader->info.workgroup_size[0] = NVK_META_FILL16_WG_SIZE;
+++   b->shader->info.workgroup_size[1] = 1;
+++   b->shader->info.workgroup_size[2] = 1;
+++
+++   nir_def *id = nir_channel(b, nir_load_global_invocation_id(b, 32), 0);
+++   nir_def *offset = nir_imul_imm(b, id, 4);
+++   nir_def *size = nir_load_push_constant(b, 1, 32,
+++      nir_imm_int(b, offsetof(struct nvk_meta_fill16_push, size_B)));
+++
+++   nir_push_if(b, nir_ult(b, offset, size));
+++   {
+++      nir_def *addr = nir_load_push_constant(b, 1, 64,
+++         nir_imm_int(b, offsetof(struct nvk_meta_fill16_push, addr)));
+++      /* Word (offset / 4) % 4 of the pattern; the range starts on a
+++       * 16-byte boundary, so the pattern phase is the byte offset's.
+++       */
+++      nir_def *pattern = nir_load_push_constant(b, 4, 32,
+++         nir_imm_int(b, offsetof(struct nvk_meta_fill16_push, pattern)));
+++      nir_def *word = nir_vector_extract(b, pattern,
+++                                         nir_iand_imm(b, id, 3));
+++      nir_def *dst = nir_iadd(b, addr, nir_u2u64(b, offset));
+++
+++      nir_push_if(b, nir_uge(b, size, nir_iadd_imm(b, offset, 4)));
+++      {
+++         nir_store_global(b, word, dst, .align_mul = 4);
+++      }
+++      nir_push_else(b, NULL);
+++      {
+++         /* A pitch-linear level of 8/16-bit elements may end inside a
+++          * word: store its last bytes one by one.
+++          */
+++         for (unsigned i = 1; i < 4; i++) {
+++            nir_push_if(b, nir_ult(b, nir_iadd_imm(b, offset, i - 1), size));
+++            nir_store_global(b, nir_u2u8(b, nir_ushr_imm(b, word, 8 * (i - 1))),
+++                             nir_iadd_imm(b, dst, i - 1), .align_mul = 1);
+++            nir_pop_if(b, NULL);
+++         }
+++      }
+++      nir_pop_if(b, NULL);
+++   }
+++   nir_pop_if(b, NULL);
+++
+++   return b->shader;
+++}
+++
+++static VkResult
+++nvk_meta_get_fill16_pipeline(struct nvk_device *dev,
+++                             VkPipelineLayout *layout_out,
+++                             VkPipeline *pipeline_out)
+++{
+++   const enum vk_meta_object_key_type key = NVK_META_OBJECT_KEY_FILL_PATTERN16;
+++
+++   const VkPushConstantRange push_range = {
+++      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+++      .offset = 0,
+++      .size = sizeof(struct nvk_meta_fill16_push),
+++   };
+++   VkResult result = vk_meta_get_pipeline_layout(&dev->vk, &dev->meta, NULL,
+++                                                 &push_range, &key,
+++                                                 sizeof(key), layout_out);
+++   if (result != VK_SUCCESS)
+++      return result;
+++
+++   VkPipeline cached = vk_meta_lookup_pipeline(&dev->meta, &key, sizeof(key));
+++   if (cached != VK_NULL_HANDLE) {
+++      *pipeline_out = cached;
+++      return VK_SUCCESS;
+++   }
+++
+++   const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
+++      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+++      .nir = nvk_meta_build_fill16_shader(),
+++   };
+++   const VkComputePipelineCreateInfo info = {
+++      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+++      .stage = {
+++         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+++         .pNext = &nir_info,
+++         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+++         .pName = "main",
+++      },
+++      .layout = *layout_out,
+++   };
+++   result = vk_meta_create_compute_pipeline(&dev->vk, &dev->meta, &info,
+++                                            &key, sizeof(key), pipeline_out);
+++   ralloc_free(nir_info.nir);
+++   return result;
+++}
+++
+++static void
+++nvk_meta_fill16(struct nvk_cmd_buffer *cmd, VkPipelineLayout layout,
+++                uint64_t addr, uint64_t size_B, const uint32_t pattern[4])
+++{
+++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+++   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+++   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+++   const uint64_t per_dispatch_B =
+++      (uint64_t)pdev->vk.properties.maxComputeWorkGroupCount[0] *
+++      NVK_META_FILL16_WG_SIZE * 4;
+++
+++   while (size_B > 0) {
+++      /* Whole 16-byte periods per chunk keep the next chunk in phase */
+++      const uint32_t chunk_B = MIN3(size_B, per_dispatch_B, 1u << 30);
+++      struct nvk_meta_fill16_push push = {
+++         .addr = addr,
+++         .size_B = chunk_B,
+++      };
+++      memcpy(push.pattern, pattern, sizeof(push.pattern));
+++      disp->CmdPushConstants(nvk_cmd_buffer_to_handle(cmd), layout,
+++                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+++                             &push);
+++      disp->CmdDispatch(nvk_cmd_buffer_to_handle(cmd),
+++                        DIV_ROUND_UP(chunk_B, NVK_META_FILL16_WG_SIZE * 4),
+++                        1, 1);
+++      addr += chunk_B;
+++      size_B -= chunk_B;
+++   }
+++}
+++
+++void
+++nvk_cmd_clear_color_image_meta(struct nvk_cmd_buffer *cmd,
+++                               struct nvk_image *image,
+++                               const VkClearColorValue *color,
+++                               uint32_t range_count,
+++                               const VkImageSubresourceRange *ranges)
+++{
+++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+++
+++   VkFormat vk_format = image->vk.format;
+++   if (vk_format == VK_FORMAT_R64_UINT || vk_format == VK_FORMAT_R64_SINT)
+++      vk_format = VK_FORMAT_R32G32_UINT;
+++   const enum pipe_format p_format = nvk_format_to_pipe_format(vk_format);
+++   const unsigned blk_B = util_format_get_blocksize(p_format);
+++
+++   /* The fill covers whole elements of one plane in place: a pattern period
+++    * that divides 16 bytes, no YCbCr planes, no linear image whose data
+++    * lives in a tiled shadow.
+++    */
+++   if (image->plane_count != 1 || 16 % blk_B != 0 ||
+++       util_format_is_compressed(p_format) ||
+++       image->linear_tiled_shadows[0].nil.size_B > 0) {
+++      vk_command_buffer_set_error(&cmd->vk,
+++         vk_errorf(cmd, VK_ERROR_UNKNOWN,
+++                   "vkCmdClearColorImage on the compute-only queue family: "
+++                   "format %s (%u-byte elements, %u planes%s) has no compute "
+++                   "fill clear", util_format_short_name(p_format), blk_B,
+++                   image->plane_count,
+++                   image->linear_tiled_shadows[0].nil.size_B > 0 ?
+++                   ", linear with a tiled shadow" : ""));
+++      return;
+++   }
+++
+++   uint8_t element[16] = { 0 };
+++   util_format_pack_rgba(p_format, element, color->uint32, 1);
+++   uint32_t pattern[4];
+++   for (unsigned i = 0; i < 16; i += blk_B)
+++      memcpy((uint8_t *)pattern + i, element, blk_B);
+++
+++   VkPipelineLayout layout;
+++   VkPipeline pipeline;
+++   VkResult result = nvk_meta_get_fill16_pipeline(dev, &layout, &pipeline);
+++   if (result != VK_SUCCESS) {
+++      vk_command_buffer_set_error(&cmd->vk, result);
+++      return;
+++   }
+++
+++   struct nvk_meta_save_compute save;
+++   nvk_meta_begin_compute(cmd, &save);
+++   dev->vk.dispatch_table.CmdBindPipeline(nvk_cmd_buffer_to_handle(cmd),
+++                                          VK_PIPELINE_BIND_POINT_COMPUTE,
+++                                          pipeline);
+++
+++   const struct nvk_image_plane *plane = &image->planes[0];
+++   const uint64_t base = nvk_image_plane_base_address(plane);
+++   for (uint32_t r = 0; r < range_count; r++) {
+++      const uint32_t level_count =
+++         vk_image_subresource_level_count(&image->vk, &ranges[r]);
+++      const uint32_t layer_count =
+++         vk_image_subresource_layer_count(&image->vk, &ranges[r]);
+++      for (uint32_t l = 0; l < level_count; l++) {
+++         const uint32_t level = ranges[r].baseMipLevel + l;
+++         const uint64_t level_B =
+++            nil_image_level_layer_size_B(&plane->nil, level);
+++         for (uint32_t a = 0; a < layer_count; a++) {
+++            const uint32_t layer = ranges[r].baseArrayLayer + a;
+++            const uint64_t addr = base +
+++               nil_image_level_layer_offset_B(&plane->nil, level, layer);
+++            /* Levels start on whole GOBs, pitch-linear ones on their
+++             * row-pitch alignment.
+++             */
+++            assert(addr % 16 == 0);
+++            nvk_meta_fill16(cmd, layout, addr, level_B, pattern);
+++         }
+++      }
+++   }
+++
+++   nvk_meta_end_compute(cmd, &save);
+++}
+++
+++void
+++nvk_cmd_update_buffer_meta(struct nvk_cmd_buffer *cmd, VkBuffer dstBuffer,
+++                           VkDeviceSize dstOffset, VkDeviceSize dataSize,
+++                           const void *pData)
+++{
+++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+++
+++   struct nvk_meta_save_compute save;
+++   nvk_meta_begin_compute(cmd, &save);
+++   vk_meta_update_buffer(&cmd->vk, &dev->meta, dstBuffer, dstOffset,
+++                         dataSize, pData);
+++   nvk_meta_end_compute(cmd, &save);
+++}
+++
++ static void
++ nvk_cmd_fill_buffer_meta(struct nvk_cmd_buffer *cmd,
++                          VkBuffer dstBuffer,
++--- a/src/nouveau/vulkan/nvk_device.c
+++++ b/src/nouveau/vulkan/nvk_device.c
++@@ -398,11 +398,24 @@
++             goto fail_slm;
++       }
++ 
++-      for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
++-         for (unsigned q = 0; q < pCreateInfo->pQueueCreateInfos[i].queueCount; q++) {
++-            result = nvk_queue_create(dev, &pCreateInfo->pQueueCreateInfos[i], q);
++-            if (result != VK_SUCCESS)
++-               goto fail_queues;
+++      /* Graphics-family queues first, whatever order the application lists
+++       * its families in: the compute-only family's contexts join the channel
+++       * group of graphics queue 0, as the proprietary driver builds the
+++       * graphics queue's channels before the compute queue's.
+++       */
+++      for (unsigned pass = 0; pass < 2; pass++) {
+++         for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
+++            const VkDeviceQueueCreateInfo *qci = &pCreateInfo->pQueueCreateInfos[i];
+++            const bool graphics =
+++               pdev->queue_families[qci->queueFamilyIndex].queue_flags &
+++               VK_QUEUE_GRAPHICS_BIT;
+++            if (graphics != (pass == 0))
+++               continue;
+++            for (unsigned q = 0; q < qci->queueCount; q++) {
+++               result = nvk_queue_create(dev, qci, q);
+++               if (result != VK_SUCCESS)
+++                  goto fail_queues;
+++            }
++          }
++       }
++    }
++--- a/src/nouveau/vulkan/nvk_device.h
+++++ b/src/nouveau/vulkan/nvk_device.h
++@@ -48,6 +48,13 @@
++ 
++    struct nvkmd_dev *nvkmd;
++ 
+++   /* Context of the first queue created with a GR channel (graphics queue 0
+++    * when the device has one, else compute queue 0): the compute-only
+++    * family's queues put their contexts into its channel group.  Borrowed
+++    * from that queue; only read while queues are created.
+++    */
+++   struct nvkmd_ctx *gr_group_ctx;
+++
++    struct nvk_upload_queue upload;
++ 
++    struct nvk_layer_dispatch_tables layer_dispatch;
++--- a/src/nouveau/vulkan/nvk_image.c
+++++ b/src/nouveau/vulkan/nvk_image.c
++@@ -38,6 +38,44 @@
++                              VK_IMAGE_ASPECT_STENCIL_BIT);
++ }
++ 
+++/* Depth or stencil copies on queues with COMPUTE but no GRAPHICS
+++ * (VK_KHR_maintenance10).  Without the compute-only family every such copy
+++ * runs on a queue with a copy engine, which handles all depth/stencil
+++ * formats.  The compute-only family has no copy engine: there a copy reads
+++ * or writes the aspect through an unsigned-integer colour view
+++ * (nvk_cmd_meta.c), which addresses memory the way the hardware lays out
+++ * the view format's GOBs.  That matches the depth/stencil image only where
+++ * both formats choose the same GOB type (nil tiling.rs GOBType::choose()):
+++ * on Blackwell for 16-bit, 32-bit and 8-bit stencil planes, but not for the
+++ * Z24 GOB of D24 depth; before Blackwell depth/stencil images use the ZS
+++ * GOB, not established to match a colour view.  The bits are not advertised
+++ * for the rest, so applications do not record those copies there.
+++ */
+++static bool
+++nvk_has_compute_only_family(const struct nvk_physical_device *pdev)
+++{
+++   for (uint32_t i = 0; i < pdev->queue_family_count; i++) {
+++      const VkQueueFlags flags = pdev->queue_families[i].queue_flags;
+++      if ((flags & VK_QUEUE_COMPUTE_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT))
+++         return true;
+++   }
+++   return false;
+++}
+++
+++static bool
+++nvk_zs_copy_on_compute_queue(const struct nvk_physical_device *pdev,
+++                             VkFormat vk_format, VkImageAspectFlagBits aspect)
+++{
+++   if (!nvk_has_compute_only_family(pdev))
+++      return true;
+++   if (pdev->info.cls_eng3d < BLACKWELL_A)
+++      return false;
+++   if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
+++      return vk_format != VK_FORMAT_X8_D24_UNORM_PACK32 &&
+++             vk_format != VK_FORMAT_D24_UNORM_S8_UINT;
+++   return true;
+++}
+++
++ static VkFormatFeatureFlags2
++ nvk_get_image_plane_format_features(const struct nvk_physical_device *pdev,
++                                     VkFormat vk_format, VkImageTiling tiling,
++@@ -111,12 +149,16 @@
++ 
++       /* The copy engine handles depth and stencil just fine */
++       if (vk_format_has_depth(vk_format)) {
++-         features |= VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_COMPUTE_QUEUE_BIT_KHR |
++-                     VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
+++         features |= VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
+++         if (nvk_zs_copy_on_compute_queue(pdev, vk_format,
+++                                          VK_IMAGE_ASPECT_DEPTH_BIT))
+++            features |= VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_COMPUTE_QUEUE_BIT_KHR;
++       }
++       if (vk_format_has_stencil(vk_format)) {
++-         features |= VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_COMPUTE_QUEUE_BIT_KHR |
++-                     VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
+++         features |= VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
+++         if (nvk_zs_copy_on_compute_queue(pdev, vk_format,
+++                                          VK_IMAGE_ASPECT_STENCIL_BIT))
+++            features |= VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_COMPUTE_QUEUE_BIT_KHR;
++       }
++    }
++ 
++--- a/src/nouveau/vulkan/nvk_image_view.c
+++++ b/src/nouveau/vulkan/nvk_image_view.c
++@@ -158,8 +158,27 @@
++     * For depth/stencil, we may only have plane so simply assert
++     * and then map directly betweeen the image and view plane
++     */
++-   if (image->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT |
++-                            VK_IMAGE_ASPECT_STENCIL_BIT)) {
+++   /* A driver-internal colour view of a depth/stencil image (vk_meta's
+++    * compute copies, copy_create_src/dst_image_view() in
+++    * vk_meta_copy_fill_update.c, used where the queue has no copy engine)
+++    * reads or writes one aspect's elements as unsigned integers.  With
+++    * separate depth and stencil planes the 1-byte view is the stencil
+++    * plane, as panvk maps it (panvk_vX_image_view.c, "Depth/stencil are
+++    * viewed as color for copies").
+++    */
+++   const bool zs_as_color =
+++      (image->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT |
+++                            VK_IMAGE_ASPECT_STENCIL_BIT)) &&
+++      view->vk.aspects == VK_IMAGE_ASPECT_COLOR_BIT;
+++   if (zs_as_color) {
+++      assert(view->vk.create_flags &
+++             VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA);
+++      view->plane_count = 1;
+++      view->planes[0].image_plane =
+++         image->separate_zs &&
+++         vk_format_get_blocksize(view->vk.format) == 1 ? 1 : 0;
+++   } else if (image->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT |
+++                                   VK_IMAGE_ASPECT_STENCIL_BIT)) {
++       view->separate_zs =
++          image->separate_zs &&
++          view->vk.aspects == (VK_IMAGE_ASPECT_DEPTH_BIT |
++@@ -202,7 +221,9 @@
++          ycbcr_info->planes[view_plane].format : view->vk.format;
++ 
++       enum pipe_format p_format = nvk_format_to_pipe_format(plane_format);
++-      if (image->separate_zs)
+++      if (zs_as_color)
+++         ; /* the view's own unsigned-integer format */
+++      else if (image->separate_zs)
++          p_format = nil_image.format.p_format;
++       else if (view->vk.aspects == VK_IMAGE_ASPECT_STENCIL_BIT)
++          p_format = util_format_stencil_only(nil_image.format.p_format);
++--- a/src/nouveau/vulkan/nvk_physical_device.c
+++++ b/src/nouveau/vulkan/nvk_physical_device.c
++@@ -57,6 +57,7 @@
++ #include "clc997.h"
++ #include "clcdc0.h"
++ #include "clce97.h"
+++#include "clcec0.h"
++ 
++ static uint32_t
++ nvk_get_vk_version(const struct nv_device_info *info)
++@@ -1766,6 +1767,39 @@
++          .queue_count = 2,
++       };
++    }
+++   /* A compute-only family, placed after the graphics and transfer families
+++    * as the proprietary driver orders them (615.78.08 on GB202: 0 = G|C|T|S,
+++    * 1 = T|S, 2 = C|T|S x 8). Each of its queues gets a context in the
+++    * channel group of the device's first queue on a subcontext of its own,
+++    * so its work runs on the GR engine next to the graphics queue's.
+++    *
+++    * Such a context carries only the compute class: the 3D class runs only
+++    * on subcontext 0 and the KMD puts no copy engine there (the proprietary
+++    * driver's compute-queue channel has one compute object only). NVK needs
+++    * MME macros for indirect dispatch and compute-invocation queries, and the
+++    * compute class calls them only from AMPERE_COMPUTE_B on
+++    * (nvk_cmd_dispatch.c, CALL_MME_MACRO on NVC7C0); before that they run on
+++    * the 3D class, so earlier GPUs cannot have the family. Transfer commands
+++    * on it run as compute meta (nvk_cmd_meta.c).
+++    *
+++    * It is exposed only with BLACKWELL_COMPUTE_B (GB20x), the class it has
+++    * been verified on. With AMPERE_COMPUTE_B and ADA_COMPUTE_A it does not
+++    * work yet: its dispatches do not run concurrently with the graphics
+++    * queue's work, and CmdDispatchIndirect on it pushes to a subchannel the
+++    * context has no object bound on (nv_push subc_mask assert).
+++    * HOPPER_COMPUTE_A and BLACKWELL_COMPUTE_A were never run with it. No
+++    * queue is redirected: those GPUs keep the graphics and transfer
+++    * families only.
+++    */
+++   if (nvkmd->kmd_info.max_shared_ctx > 0 &&
+++       pdev->info.cls_compute >= BLACKWELL_COMPUTE_B) {
+++      pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
+++         .queue_flags = VK_QUEUE_COMPUTE_BIT |
+++                        VK_QUEUE_TRANSFER_BIT |
+++                        (nvkmd->kmd_info.has_sparse ? VK_QUEUE_SPARSE_BINDING_BIT : 0),
+++         .queue_count = MIN2(8, nvkmd->kmd_info.max_shared_ctx),
+++      };
+++   }
++    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));
++ 
++    pdev->vk.supported_sync_types = nvkmd->sync_types;
++--- a/src/nouveau/vulkan/nvk_physical_device.h
+++++ b/src/nouveau/vulkan/nvk_physical_device.h
++@@ -54,7 +54,7 @@
++    uint8_t mem_heap_count;
++    uint8_t mem_type_count;
++ 
++-   struct nvk_queue_family queue_families[3];
+++   struct nvk_queue_family queue_families[4];
++    uint8_t queue_family_count;
++ };
++ 
++--- a/src/nouveau/vulkan/nvk_query_pool.c
+++++ b/src/nouveau/vulkan/nvk_query_pool.c
++@@ -11,6 +11,7 @@
++ #include "nvk_event.h"
++ #include "nvk_mme.h"
++ #include "nvk_physical_device.h"
+++#include "nvk_queue.h"
++ #include "nvkmd/nvkmd.h"
++ 
++ #include "vk_common_entrypoints.h"
++@@ -249,6 +250,50 @@
++    return pool->mem->map + nvk_query_report_offset_B(pool, query);
++ }
++ 
+++/* Whether this command buffer's queue has the 3D class (all but the
+++ * compute-only family).
+++ */
+++static bool
+++nvk_cmd_has_3d(struct nvk_cmd_buffer *cmd)
+++{
+++   return nvk_queue_engines_from_queue_flags(nvk_cmd_buffer_queue_flags(cmd)) &
+++          NVKMD_ENGINE_3D;
+++}
+++
+++/* One-word release of `value` at `addr` once all preceding work is done.
+++ * Without 3D (compute-only family) it is the compute class's form, as the
+++ * proprietary driver ends compute-queue work: WAIT_FOR_IDLE, then
+++ * SET_REPORT_SEMAPHORE_D 0x10000000 (615.78.08, compute-queue channel).
+++ */
+++static void
+++nvk_cmd_release_word(struct nvk_cmd_buffer *cmd, uint64_t addr, uint32_t value)
+++{
+++   if (nvk_cmd_has_3d(cmd)) {
+++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
+++      P_MTHD(p, NV9097, SET_REPORT_SEMAPHORE_A);
+++      P_NV9097_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
+++      P_NV9097_SET_REPORT_SEMAPHORE_B(p, addr);
+++      P_NV9097_SET_REPORT_SEMAPHORE_C(p, value);
+++      P_NV9097_SET_REPORT_SEMAPHORE_D(p, {
+++         .operation = OPERATION_RELEASE,
+++         .release = RELEASE_AFTER_ALL_PRECEEDING_WRITES_COMPLETE,
+++         .pipeline_location = PIPELINE_LOCATION_ALL,
+++         .structure_size = STRUCTURE_SIZE_ONE_WORD,
+++      });
+++   } else {
+++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
+++      P_IMMD(p, NVA0C0, WAIT_FOR_IDLE, 0);
+++      P_MTHD(p, NV90C0, SET_REPORT_SEMAPHORE_A);
+++      P_NV90C0_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
+++      P_NV90C0_SET_REPORT_SEMAPHORE_B(p, addr);
+++      P_NV90C0_SET_REPORT_SEMAPHORE_C(p, value);
+++      P_NV90C0_SET_REPORT_SEMAPHORE_D(p, {
+++         .operation = OPERATION_RELEASE,
+++         .structure_size = STRUCTURE_SIZE_ONE_WORD,
+++      });
+++   }
+++}
+++
++ static void
++ nvk_sync_queries_to_gpu(struct nvk_query_pool *pool,
++                         uint32_t first_query, uint32_t count)
++@@ -351,7 +396,11 @@
++    const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++ 
++-   if (queryCount > 1 && pool->layout != NVK_QUERY_POOL_LAYOUT_ALIGNED_INTERLEAVED) {
+++   /* The compute-only family has no copy engine: it clears availability
+++    * per query.
+++    */
+++   if (queryCount > 1 && pool->layout != NVK_QUERY_POOL_LAYOUT_ALIGNED_INTERLEAVED &&
+++       nvk_cmd_has_3d(cmd)) {
++       uint64_t clear_size;
++       if (pool->layout == NVK_QUERY_POOL_LAYOUT_SEPARATE)
++          clear_size = queryCount * sizeof(uint32_t);
++@@ -365,18 +414,7 @@
++    } else {
++       for (uint32_t i = 0; i < queryCount; i++) {
++          uint64_t addr = nvk_query_available_addr(pool, firstQuery + i);
++-
++-         struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
++-         P_MTHD(p, NV9097, SET_REPORT_SEMAPHORE_A);
++-         P_NV9097_SET_REPORT_SEMAPHORE_A(p, addr >> 32);
++-         P_NV9097_SET_REPORT_SEMAPHORE_B(p, addr);
++-         P_NV9097_SET_REPORT_SEMAPHORE_C(p, 0);
++-         P_NV9097_SET_REPORT_SEMAPHORE_D(p, {
++-            .operation = OPERATION_RELEASE,
++-            .release = RELEASE_AFTER_ALL_PRECEEDING_WRITES_COMPLETE,
++-            .pipeline_location = PIPELINE_LOCATION_ALL,
++-            .structure_size = STRUCTURE_SIZE_ONE_WORD,
++-         });
+++         nvk_cmd_release_word(cmd, addr, 0);
++       }
++    }
++ 
++@@ -387,15 +425,15 @@
++     */
++    if (pdev->info.cls_eng3d >= HOPPER_A) {
++       struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
++-      P_IMMD(p, NVC86F, WFI, 0);
++-      P_MTHD(p, NVC86F, MEM_OP_A);
+++      __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NVC86F_WFI, 0);
+++      __push_mthd(p, nvk_cmd_buffer_host_subc(cmd), NVC86F_MEM_OP_A);
++       P_NVC86F_MEM_OP_A(p, {});
++       P_NVC86F_MEM_OP_B(p, 0);
++       P_NVC86F_MEM_OP_C(p, { .membar_type = 0 });
++       P_NVC86F_MEM_OP_D(p, { .operation = OPERATION_MEMBAR });
++    } else {
++       struct nv_push *p = nvk_cmd_buffer_push(cmd, 1);
++-      __push_immd(p, SUBC_NV9097, NV906F_SET_REFERENCE, 0);
+++      __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NV906F_SET_REFERENCE, 0);
++    }
++ }
++ 
++@@ -839,23 +877,16 @@
++    }
++ 
++ 
++-   struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++-   P_IMMD(p, NV9097, FLUSH_PENDING_WRITES, 0);
+++   /* Without 3D the availability release below waits for idle itself. */
+++   if (nvk_cmd_has_3d(cmd)) {
+++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+++      P_IMMD(p, NV9097, FLUSH_PENDING_WRITES, 0);
+++   }
++ 
++    nvk_cmd_set_statistics_counters(cmd, pool, false);
++ 
++    uint64_t available_addr = nvk_query_available_addr(pool, query);
++-   p = nvk_cmd_buffer_push(cmd, 5);
++-   P_MTHD(p, NV9097, SET_REPORT_SEMAPHORE_A);
++-   P_NV9097_SET_REPORT_SEMAPHORE_A(p, available_addr >> 32);
++-   P_NV9097_SET_REPORT_SEMAPHORE_B(p, available_addr);
++-   P_NV9097_SET_REPORT_SEMAPHORE_C(p, 1);
++-   P_NV9097_SET_REPORT_SEMAPHORE_D(p, {
++-      .operation = OPERATION_RELEASE,
++-      .release = RELEASE_AFTER_ALL_PRECEEDING_WRITES_COMPLETE,
++-      .pipeline_location = PIPELINE_LOCATION_ALL,
++-      .structure_size = STRUCTURE_SIZE_ONE_WORD,
++-   });
+++   nvk_cmd_release_word(cmd, available_addr, 1);
++ 
++    /* From the Vulkan spec:
++     *
++@@ -1145,7 +1176,7 @@
++          uint64_t avail_addr = nvk_query_available_addr(pool, firstQuery + i);
++ 
++          struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
++-         __push_mthd(p, SUBC_NV9097, NV906F_SEMAPHOREA);
+++         __push_mthd(p, nvk_cmd_buffer_host_subc(cmd), NV906F_SEMAPHOREA);
++          P_NV906F_SEMAPHOREA(p, avail_addr >> 32);
++          P_NV906F_SEMAPHOREB(p, (avail_addr & UINT32_MAX) >> 2);
++          P_NV906F_SEMAPHOREC(p, 1);
++--- a/src/nouveau/vulkan/nvk_queue.c
+++++ b/src/nouveau/vulkan/nvk_queue.c
++@@ -19,6 +19,8 @@
++ #include "cla1c0.h"
++ #include "nv_push_clc3c0.h"
++ #include "nv_push_clc397.h"
+++#include "nv_push_clc7c0.h"
+++#include "nvk_mme.h"
++ 
++ static VkResult
++ nvk_queue_push(struct nvk_queue *queue, const struct nv_push *push);
++@@ -414,6 +416,54 @@
++          return result;
++    }
++ 
+++   /* Without the 3D class the channel loads, through the compute class
+++    * (AMPERE_COMPUTE_B+ has the same LOAD_MME_* methods), the MME macros a
+++    * compute-only command buffer calls through the compute class, packed
+++    * from instruction 0.  The proprietary driver loads its compute-queue
+++    * macros the same way (615.78.08: LOAD_MME_START_ADDRESS_RAM_POINTER /
+++    * LOAD_MME_INSTRUCTION_RAM_POINTER on the compute subchannel of its
+++    * compute-queue channel, 1353 instruction words).
+++    *
+++    * Measured on GB202 (615.78.08): the macro RAM is per subcontext (a
+++    * subcontext that loaded nothing faults on CALL_MME_MACRO even when
+++    * subcontext 0 of its group loaded the macro), and a subcontext other than
+++    * 0 in a group with a 3D context gets Xid 13 ILLEGAL_MME_METHOD while
+++    * loading all of NVK's 32 macros (2700 words); subcontext 0 of a group of
+++    * its own loads them all.  So only these are loaded.
+++    */
+++   if ((queue->engines & NVKMD_ENGINE_COMPUTE) &&
+++       !(queue->engines & NVKMD_ENGINE_3D)) {
+++      static const enum nvk_mme compute_mmes[] = {
+++         NVK_MME_DISPATCH_INDIRECT,
+++         NVK_MME_ADD_CS_INVOCATIONS,
+++         NVK_MME_WRITE_CS_INVOCATIONS,
+++      };
+++      assert(pdev->info.cls_compute >= AMPERE_COMPUTE_B);
+++      uint32_t mme_pos = 0;
+++      for (uint32_t i = 0; i < ARRAY_SIZE(compute_mmes); i++) {
+++         const enum nvk_mme mme = compute_mmes[i];
+++         size_t size;
+++         uint32_t *dw = nvk_build_mme(&pdev->info, mme, &size);
+++         if (dw == NULL)
+++            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+++
+++         assert(size % sizeof(uint32_t) == 0);
+++         const uint32_t num_dw = size / sizeof(uint32_t);
+++
+++         P_MTHD(p, NVC7C0, LOAD_MME_START_ADDRESS_RAM_POINTER);
+++         P_NVC7C0_LOAD_MME_START_ADDRESS_RAM_POINTER(p, mme);
+++         P_NVC7C0_LOAD_MME_START_ADDRESS_RAM(p, mme_pos);
+++
+++         P_1INC(p, NVC7C0, LOAD_MME_INSTRUCTION_RAM_POINTER);
+++         P_NVC7C0_LOAD_MME_INSTRUCTION_RAM_POINTER(p, mme_pos);
+++         P_INLINE_ARRAY(p, dw, num_dw);
+++
+++         mme_pos += num_dw;
+++
+++         free(dw);
+++      }
+++   }
+++
++    return nvk_queue_push(queue, &push);
++ }
++ 
++@@ -474,10 +524,28 @@
++       nvk_queue_engines_from_queue_flags(queue_family->queue_flags);
++ 
++    if (queue->engines) {
++-      result = nvkmd_dev_create_ctx(dev->nvkmd, &dev->vk.base,
++-                                    queue->engines, &queue->exec_ctx);
+++      const bool gr = queue->engines & (NVKMD_ENGINE_3D | NVKMD_ENGINE_COMPUTE);
+++      const bool compute_only =
+++         !(queue_family->queue_flags & VK_QUEUE_GRAPHICS_BIT) &&
+++         (queue_family->queue_flags & VK_QUEUE_COMPUTE_BIT);
+++      if (compute_only && dev->gr_group_ctx != NULL) {
+++         /* The compute-only family's contexts share the channel group of
+++          * the device's first GR context, each on its own subcontext (the
+++          * proprietary driver puts every compute-queue channel into graphics
+++          * queue 0's group).
+++          */
+++         result = nvkmd_dev_create_shared_ctx(dev->nvkmd, &dev->vk.base,
+++                                              queue->engines,
+++                                              dev->gr_group_ctx,
+++                                              &queue->exec_ctx);
+++      } else {
+++         result = nvkmd_dev_create_ctx(dev->nvkmd, &dev->vk.base,
+++                                       queue->engines, &queue->exec_ctx);
+++      }
++       if (result != VK_SUCCESS)
++          goto fail_init;
+++      if (gr && dev->gr_group_ctx == NULL)
+++         dev->gr_group_ctx = queue->exec_ctx;
++ 
++       result = nvkmd_dev_alloc_mem(dev->nvkmd, &dev->vk.base,
++                                    4096, 0, NVKMD_MEM_LOCAL,
++@@ -515,8 +583,11 @@
++    if (queue->draw_cb0 != NULL)
++       nvkmd_mem_unref(queue->draw_cb0);
++ fail_exec_ctx:
++-   if (queue->exec_ctx != NULL)
+++   if (queue->exec_ctx != NULL) {
+++      if (dev->gr_group_ctx == queue->exec_ctx)
+++         dev->gr_group_ctx = NULL;
++       nvkmd_ctx_destroy(queue->exec_ctx);
+++   }
++ fail_init:
++    nvk_queue_state_finish(dev, &queue->state);
++    vk_queue_finish(&queue->vk);
++@@ -538,8 +609,11 @@
++    nvk_queue_state_finish(dev, &queue->state);
++    if (queue->bind_ctx != NULL)
++       nvkmd_ctx_destroy(queue->bind_ctx);
++-   if (queue->exec_ctx != NULL)
+++   if (queue->exec_ctx != NULL) {
+++      if (dev->gr_group_ctx == queue->exec_ctx)
+++         dev->gr_group_ctx = NULL;
++       nvkmd_ctx_destroy(queue->exec_ctx);
+++   }
++    vk_queue_finish(&queue->vk);
++    vk_free(&dev->vk.alloc, queue);
++ }
++--- a/src/nouveau/vulkan/nvk_queue.h
+++++ b/src/nouveau/vulkan/nvk_queue.h
++@@ -77,8 +77,13 @@
++    }
++    if (queue_flags & VK_QUEUE_COMPUTE_BIT) {
++       engines |= NVKMD_ENGINE_COMPUTE;
++-      /* We currently rely on 3D engine MMEs for indirect dispatch */
++-      engines |= NVKMD_ENGINE_3D;
+++      /* The compute-only family (nvk_physical_device.c) runs on a
+++       * subcontext that carries the compute class alone: its MME macros are
+++       * called through the compute class and its transfers run as compute
+++       * meta.  Only the universal family also has 3D and copy.
+++       */
+++      if (!(queue_flags & VK_QUEUE_GRAPHICS_BIT))
+++         return engines;
++    }
++    if (queue_flags & VK_QUEUE_TRANSFER_BIT)
++       engines |= NVKMD_ENGINE_COPY;
++--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
+++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
++@@ -126,6 +126,10 @@
++     * rm_compress); has_compression (dedicated-allocation compression) is
++     * the nouveau KMD's. */
++    bool has_rm_compression;
+++   /* Number of contexts that can join another context's channel group on
+++    * their own subcontext (VEID) through create_shared_ctx; 0 when the KMD
+++    * has no shared contexts. */
+++   uint32_t max_shared_ctx;
++ };
++ 
++ struct nvkmd_pdev_ops {
++@@ -197,6 +201,15 @@
++                           struct vk_object_base *log_obj,
++                           enum nvkmd_engines engines,
++                           struct nvkmd_ctx **ctx_out);
+++
+++   /* Optional (kmd_info.max_shared_ctx != 0): a context whose channel joins
+++    * the channel group of `share` on its own subcontext, so work on the two
+++    * contexts runs on the GR engine at the same time. */
+++   VkResult (*create_shared_ctx)(struct nvkmd_dev *dev,
+++                                 struct vk_object_base *log_obj,
+++                                 enum nvkmd_engines engines,
+++                                 struct nvkmd_ctx *share,
+++                                 struct nvkmd_ctx **ctx_out);
++ };
++ 
++ struct nvkmd_dev {
++@@ -489,6 +502,17 @@
++    return dev->ops->create_ctx(dev, log_obj, engines, ctx_out);
++ }
++ 
+++static inline VkResult MUST_CHECK
+++nvkmd_dev_create_shared_ctx(struct nvkmd_dev *dev,
+++                            struct vk_object_base *log_obj,
+++                            enum nvkmd_engines engines,
+++                            struct nvkmd_ctx *share,
+++                            struct nvkmd_ctx **ctx_out)
+++{
+++   assert(dev->pdev->kmd_info.max_shared_ctx > 0);
+++   return dev->ops->create_shared_ctx(dev, log_obj, engines, share, ctx_out);
+++}
+++
++ static inline struct nvkmd_mem *
++ nvkmd_mem_ref(struct nvkmd_mem *mem)
++ {
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-stock-compute-init.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-stock-compute-init.patch
+new file mode 100644
+index 0000000..650e6b4
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-stock-compute-init.patch
+@@ -0,0 +1,218 @@
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
++@@ -1051,9 +1051,8 @@
++       }
++    }
++ 
++-   if ((barriers & NVK_BARRIER_INVALIDATE_QMD_DATA) &&
++-       pdev->info.cls_compute >= MAXWELL_COMPUTE_B)
++-      P_IMMD(p, NVB1C0, INVALIDATE_SKED_CACHES, 0);
+++   if (barriers & NVK_BARRIER_INVALIDATE_QMD_DATA)
+++      nvk_cmd_invalidate_sked_caches(cmd);
++ }
++ 
++ static void
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
++@@ -366,6 +366,9 @@
++ 
++ void nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
++                                    const VkCommandBufferBeginInfo *pBeginInfo);
+++bool nvk_compute_sked_cache_shared(const struct nvk_physical_device *pdev);
+++void nvk_cmd_invalidate_sked_caches(struct nvk_cmd_buffer *cmd);
+++
++ void nvk_cmd_buffer_begin_compute(struct nvk_cmd_buffer *cmd,
++                                   const VkCommandBufferBeginInfo *pBeginInfo);
++ 
++--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++@@ -32,6 +32,46 @@
++ #include "nv_push_clc86f.h"
++ #include "nv_push_clcec0.h"
++ 
+++/* SET_SPA_VERSION and SET_QMD_VERSION words of the proprietary driver's
+++ * compute-context initialiser (libnvidia-eglcore.so.615.78.08 E 0x56f1c0),
+++ * selected by the SM ISA code: one SET_SPA_VERSION per code, plus
+++ * SET_QMD_VERSION from 0x900 on.  Codes the initialiser does not list take
+++ * its default arm (E 0x56fa60, SPA 0x500), which is not reproduced: what the
+++ * selector holds for codes outside this table is not established.
+++ */
+++static bool
+++nvk_stock_spa_qmd_version(uint32_t sm_isa, uint32_t *spa, uint32_t *qmd)
+++{
+++   static const struct { uint16_t isa, spa; uint32_t qmd; } table[] = {
+++      { 0x502, 0x502, 0 }, { 0x503, 0x503, 0 }, { 0x600, 0x505, 0 },
+++      { 0x601, 0x505, 0 }, { 0x602, 0x506, 0 }, { 0x700, 0x700, 0 },
+++      { 0x702, 0x702, 0 }, { 0x703, 0x703, 0 }, { 0x705, 0x705, 0 },
+++      { 0x802, 0x802, 0 }, { 0x806, 0x806, 0 }, { 0x807, 0x806, 0 },
+++      { 0x809, 0x809, 0 }, { 0x900, 0x900, 0x10040 },
+++      { 0xa00, 0xa00, 0x10041 }, { 0xa01, 0xa01, 0x10041 },
+++      { 0xa03, 0xa03, 0x10041 }, { 0xa04, 0xa04, 0x10050 },
+++   };
+++   for (uint32_t i = 0; i < ARRAY_SIZE(table); i++) {
+++      if (table[i].isa == sm_isa) {
+++         *spa = table[i].spa;
+++         *qmd = table[i].qmd;
+++         return true;
+++      }
+++   }
+++   return false;
+++}
+++
+++/* Whether compute contexts start with the proprietary driver's initialiser
+++ * (below), whose SET_SKED_CACHE_CONTROL IGNORE_VEID makes the SKED QMD cache
+++ * one cache for every subcontext of a channel group.
+++ */
+++bool
+++nvk_compute_sked_cache_shared(const struct nvk_physical_device *pdev)
+++{
+++   return pdev->info.cls_compute >= VOLTA_COMPUTE_A &&
+++          pdev->nvkmd->kmd_info.sm_isa_version != 0;
+++}
+++
++ VkResult
++ nvk_push_dispatch_state_init(struct nvk_queue *queue, struct nv_push *p)
++ {
++@@ -47,6 +87,27 @@
++    if (pdev->info.cls_compute == MAXWELL_COMPUTE_A)
++       P_IMMD(p, NVB0C0, SET_SELECT_MAXWELL_TEXTURE_HEADERS, V_TRUE);
++ 
+++   /* The proprietary driver's compute-context initialiser (615.78.08,
+++    * E 0x56f1c0; on GB202 the stream of every compute channel it creates,
+++    * graphics queue and compute queue alike) is followed where its methods
+++    * are public and Volta+ (clc3c0.h onwards): SPA/QMD version here, the
+++    * SKED cache sequence and CWD slot count after the memory windows.  NVK
+++    * keeps its own shared/local memory windows.  Not sent: the methods
+++    * 0x0da0..0x0db0 (no public meaning; stock fills them from a per-chip
+++    * scheduling word) and the MME program loader tail (0x39c0..0x39cc) and
+++    * SET_MME_SWITCH_STATE, which name stock's own macro slots.
+++    */
+++   const uint32_t sm_isa = dev->nvkmd->pdev->kmd_info.sm_isa_version;
+++   const bool stock_init = nvk_compute_sked_cache_shared(pdev);
+++   uint32_t spa, qmd;
+++   if (stock_init && nvk_stock_spa_qmd_version(sm_isa, &spa, &qmd)) {
+++      __push_immd(p, SUBC_NV90C0, NVC3C0_SET_SPA_VERSION, spa);
+++      if (qmd != 0) {
+++         P_MTHD(p, NVC3C0, SET_QMD_VERSION);
+++         P_INLINE_DATA(p, qmd);
+++      }
+++   }
+++
++    if (pdev->info.cls_compute < VOLTA_COMPUTE_A) {
++       uint64_t shader_base_addr =
++          nvk_heap_contiguous_base_address(&dev->shader_heap);
++@@ -89,6 +150,35 @@
++       P_NVA0C0_SET_SHADER_SHARED_MEMORY_WINDOW(p, 0xfe << 24);
++    }
++ 
+++   if (stock_init) {
+++      /* E 0x56f868..0x56f8bb, unconditional in stock: an FE atomic
+++       * sequence holding a host WFI of every SCG type, a SKED cache
+++       * invalidate and SET_SKED_CACHE_CONTROL IGNORE_VEID.  With
+++       * IGNORE_VEID the SKED QMD cache is shared by all subcontexts of the
+++       * channel group, so a SKED cache invalidate also drops QMDs another
+++       * queue's subcontext still runs or waits on (Xid 13
+++       * SKEDCHECK22_INVALIDATE_ACTIVE_QMD, and
+++       * SKEDCHECK36_DEPENDENCE_COUNTER_UNDERFLOW when an inline-loaded
+++       * dependency QMD is refetched from memory).  Stock invalidates the
+++       * cache only here, after a WFI of every subcontext; command buffers
+++       * rely on each launch's PCAS INVALIDATE for their own QMD, and
+++       * nvk_cmd_invalidate_sked_caches() keeps any other invalidate inside
+++       * this same WFI-ALL sequence.
+++       */
+++      P_IMMD(p, NVC3C0, FE_ATOMIC_SEQUENCE_BEGIN, 0);
+++      __push_immd(p, SUBC_NV90C0, NVC86F_WFI, NVC86F_WFI_SCOPE_ALL);
+++      P_IMMD(p, NVC3C0, INVALIDATE_SKED_CACHES, 0);
+++      P_IMMD(p, NVC3C0, SET_SKED_CACHE_CONTROL, IGNORE_VEID_TRUE);
+++      P_IMMD(p, NVC3C0, FE_ATOMIC_SEQUENCE_END, 0);
+++
+++      /* E 0x56f91f: SET_CWD_SLOT_COUNT 0x40 when the chip-family word has
+++       * a bit of 0x6c031e0, as on GB202 (0x40011e0).  That word is known
+++       * only for GB202 here, so the slot count is sent for SM ISA 0xa04.
+++       */
+++      if (sm_isa == 0xa04)
+++         P_IMMD(p, NVC3C0, SET_CWD_SLOT_COUNT, 0x40);
+++   }
+++
++    return VK_SUCCESS;
++ }
++ 
++@@ -106,7 +196,13 @@
++ {
++    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
++       struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
++-      if (nvk_cmd_buffer_compute_cls(cmd) >= MAXWELL_COMPUTE_B) {
+++      /* With the SKED cache shared by the channel group's subcontexts the
+++       * proprietary driver invalidates it at no submission: every dispatch
+++       * is launched with PCAS INVALIDATE for its own QMD, which picks up
+++       * QMDs written by the CPU.
+++       */
+++      if (nvk_cmd_buffer_compute_cls(cmd) >= MAXWELL_COMPUTE_B &&
+++          !nvk_compute_sked_cache_shared(nvk_device_physical(nvk_cmd_buffer_device(cmd)))) {
++          P_IMMD(p, NVB1C0, INVALIDATE_SKED_CACHES, 0);
++       }
++       P_IMMD(p, NVA0C0, INVALIDATE_SAMPLER_CACHE_NO_WFI, {
++@@ -137,6 +233,31 @@
++    }
++ }
++ 
+++/* A SKED cache invalidate inside a command buffer.  With a shared cache it
+++ * takes the proprietary driver's only form (compute initialiser E 0x56f868):
+++ * an FE atomic sequence that first waits for every subcontext of the group
+++ * to idle, so no QMD is active while the cache is dropped.
+++ */
+++void
+++nvk_cmd_invalidate_sked_caches(struct nvk_cmd_buffer *cmd)
+++{
+++   const struct nvk_physical_device *pdev =
+++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+++
+++   if (pdev->info.cls_compute < MAXWELL_COMPUTE_B)
+++      return;
+++
+++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
+++   if (nvk_compute_sked_cache_shared(pdev)) {
+++      P_IMMD(p, NVC3C0, FE_ATOMIC_SEQUENCE_BEGIN, 0);
+++      __push_immd(p, SUBC_NV90C0, NVC86F_WFI, NVC86F_WFI_SCOPE_ALL);
+++      P_IMMD(p, NVC3C0, INVALIDATE_SKED_CACHES, 0);
+++      P_IMMD(p, NVC3C0, FE_ATOMIC_SEQUENCE_END, 0);
+++   } else {
+++      P_IMMD(p, NVB1C0, INVALIDATE_SKED_CACHES, 0);
+++   }
+++}
+++
++ void
++ nvk_cmd_invalidate_compute_state(struct nvk_cmd_buffer *cmd)
++ {
++--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
+++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
++@@ -1157,14 +1157,15 @@
++       nvk_cmd_flush_process_state(cmd, info);
++       nvk_cmd_process_cmds(cmd, info, &cmd->state);
++ 
++-      struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++       P_IMMD(p, NVA0C0, INVALIDATE_SHADER_CACHES, {
++          .data = DATA_TRUE,
++          .constant = CONSTANT_TRUE,
++          .flush_data = FLUSH_DATA_TRUE,
++       });
++       if (pdev->info.cls_eng3d >= MAXWELL_COMPUTE_B)
++-         P_IMMD(p, NVB1C0, INVALIDATE_SKED_CACHES, 0);
+++         nvk_cmd_invalidate_sked_caches(cmd);
+++      p = nvk_cmd_buffer_push(cmd, 2);
++       if (pdev->info.cls_eng3d >= HOPPER_A)
++          __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NVC86F_WFI, 0);
++       else
++--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
+++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
++@@ -130,6 +130,9 @@
++     * their own subcontext (VEID) through create_shared_ctx; 0 when the KMD
++     * has no shared contexts. */
++    uint32_t max_shared_ctx;
+++   /* The KMD's SM ISA code (RM NV2080_CTRL_GR_INFO_INDEX_SM_VERSION, e.g.
+++    * 0xa04 on GB20x); 0 when the KMD does not report one. */
+++   uint32_t sm_isa_version;
++ };
++ 
++ struct nvkmd_pdev_ops {
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c b/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c
+index 2c1e018..63cc35c 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c
++++ b/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c
+@@ -533,6 +533,11 @@ nvkmd_rm_try_create_pdev(struct _drmDevice* drm,
+        * Turing+ generic compressible kind. NVK's dedicated-allocation
+        * compression (has_compression) stays off. */
+       .has_rm_compression = info->generic_kind == 0x06,
++      /* Subcontexts exist from Volta (VOLTA_COMPUTE_A 0xc3c0): a channel group
++       * has 64 VEIDs, VEID 0 belongs to the group's first context, so up to
++       * 63 contexts can join it (nv_rm_context_create_shared). */
++      .max_shared_ctx = pdev->base.dev_info.cls_compute >= 0xc3c0 ? 63 : 0,
++      .sm_isa_version = info->sm_isa,
+    };
+    pdev->base.drm.render_dev = st.st_rdev;
+    pdev->fd = fd;
+@@ -1326,4 +1331,5 @@ const struct nvkmd_dev_ops nvkmd_rm_dev_ops = { .destroy = rm_dev_destroy,
+                                                 .alloc_tiled_mem = rm_mem_tiled,
+                                                 .import_dma_buf = rm_mem_import,
+                                                 .alloc_va = rm_va_alloc,
+-                                                .create_ctx = rm_ctx_create };
++                                                .create_ctx = rm_ctx_create,
++                                                .create_shared_ctx = nvkmd_rm_create_shared_ctx };
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/README.md b/nvidia-prolapse/driver-source/native/mesa/tests/README.md
+index 0852abd..8cde457 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/tests/README.md
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/README.md
+@@ -786,3 +786,20 @@ instruction invalidate, 0x80-aligned addresses, 8 of 8 uses flagged.
+ 
+ Android: build the same source with the NDK's `x86_64-linux-android33-clang ... -lvulkan` and run it
+ in the guest.
++
++`vk-async-compute.c` (build lines in its header, shaders in
++`vk-async-compute.glsl`) runs a graphics queue and a compute-only-family queue
++of one device on a real GPU: `overlap` times a busy draw and a busy dispatch
++alone and together (overlap factor), `pingpong` chains 16 dependent
++dispatches across the two queues with a timeline semaphore (in step order and
++with the compute steps submitted first) and with binary semaphores, the
++compute queue's steps dispatched indirectly, `teardown` destroys the device
++with both queues busy, `solo` runs a device with only a compute-family queue.
++Every result is checked; exit 77 means the device has no compute-only family.
++
++`vk-compute-queue-compressed.c` (build line in its header) runs only on a compute-only-family queue: BC1 and BC7
++2D images (64x64, 4 levels, 3 layers) are filled by vkCmdCopyBufferToImage, copied to a second image by
++vkCmdCopyImage and read back by vkCmdCopyImageToBuffer, every block compared. That queue has no copy engine, so
++these copies are compute work, and a view that reinterprets a compressed level as blocks gets its layer stride
++from that single level: layers past the first need one view per layer. Exit 77 = no compute-only family.
++10-25 (RTX 5090): PASS on NVK + Rust RM and on the stock driver. 0 Xid.
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/vk-async-compute.c b/nvidia-prolapse/driver-source/native/mesa/tests/vk-async-compute.c
+new file mode 100644
+index 0000000..df27ef6
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/vk-async-compute.c
+@@ -0,0 +1,555 @@
++/*
++ * A graphics queue and a compute-only-family queue of one device.
++ *
++ *   overlap   a busy draw on the graphics queue and a busy dispatch on the
++ *             compute queue, alone and submitted together; prints the wall
++ *             times and the overlap factor (alone sum / together). Results of
++ *             both are checked.
++ *   solo      a device with only a compute-family queue (its context in a
++ *             group of its own): one busy dispatch, result checked.
++ *   teardown  a busy draw and a busy dispatch submitted on both queues, then
++ *             vkDestroyDevice at once: the device must drain both queues
++ *             before freeing their channels (no fault, bounded time).
++ *   pingpong  STEPS dependent dispatches alternating between the two queues
++ *             (the compute queue's dispatched indirectly), each v[k+1] = v[k] + 1: with a timeline semaphore submitted in
++ *             step order, with the timeline submitted compute-queue steps
++ *             first (GPU-side wait before signal), and with binary
++ *             semaphores. Every chain must end at STEPS.
++ *
++ * The device's queue create infos list the compute family first: queue
++ * creation must not depend on that order.
++ *
++ * Build: glslangValidator -V --target-env vulkan1.3 -S comp -DSTAGE_SPIN  --vn spin_spv  -o spin.h  vk-async-compute.glsl
++ *        (and -DSTAGE_CHAIN chain_spv, -S vert -DSTAGE_VERT vert_spv, -S frag -DSTAGE_FRAG frag_spv)
++ *        cc -O2 -o vk-async-compute vk-async-compute.c -I<dir with the four headers> -lvulkan
++ * usage: vk-async-compute overlap|pingpong [TARGET_MS]
++ * Exit 0 pass, 1 fail, 77 no compute-only family.
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <vulkan/vulkan.h>
++
++#include "spin.h"
++#include "chain.h"
++#include "vert.h"
++#include "frag.h"
++
++#define VKCHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { \
++   fprintf(stderr, "%s:%d: %s = %d\n", __FILE__, __LINE__, #x, r_); exit(2); } } while (0)
++
++#define SPIN_GROUPS 16
++#define SPIN_N (SPIN_GROUPS * 64)
++#define RT 64
++#define STEPS 16
++
++static VkDevice dev;
++static VkPhysicalDevice pd;
++static uint32_t gfx_family, comp_family;
++static VkQueue gq, cq;
++static VkCommandPool gpool, cpool;
++
++static double now_ms(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
++}
++
++static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want)
++{
++   VkPhysicalDeviceMemoryProperties mp;
++   vkGetPhysicalDeviceMemoryProperties(pd, &mp);
++   for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
++      if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want)
++         return i;
++   fprintf(stderr, "no memory type\n");
++   exit(2);
++}
++
++struct buf { VkBuffer b; VkDeviceMemory m; uint32_t *map; };
++
++static struct buf make_buffer(VkDeviceSize size, VkBufferUsageFlags usage)
++{
++   struct buf r;
++   uint32_t fams[2] = { gfx_family, comp_family };
++   VkBufferCreateInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
++      .usage = usage, .sharingMode = VK_SHARING_MODE_CONCURRENT,
++      .queueFamilyIndexCount = 2, .pQueueFamilyIndices = fams };
++   VKCHECK(vkCreateBuffer(dev, &bi, NULL, &r.b));
++   VkMemoryRequirements mr;
++   vkGetBufferMemoryRequirements(dev, r.b, &mr);
++   VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
++      .memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
++   VKCHECK(vkAllocateMemory(dev, &ai, NULL, &r.m));
++   VKCHECK(vkBindBufferMemory(dev, r.b, r.m, 0));
++   VKCHECK(vkMapMemory(dev, r.m, 0, size, 0, (void **)&r.map));
++   memset(r.map, 0, size);
++   return r;
++}
++
++static VkShaderModule module(const uint32_t *code, size_t size)
++{
++   VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++      .codeSize = size, .pCode = code };
++   VkShaderModule m;
++   VKCHECK(vkCreateShaderModule(dev, &ci, NULL, &m));
++   return m;
++}
++
++static VkDescriptorSetLayout dsl;
++static VkPipelineLayout cpl, gpl;
++static VkPipeline spin_pipe, chain_pipe, draw_pipe;
++static VkDescriptorPool dpool;
++
++static VkDescriptorSet buffer_set(VkBuffer b)
++{
++   VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
++      .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl };
++   VkDescriptorSet s;
++   VKCHECK(vkAllocateDescriptorSets(dev, &ai, &s));
++   VkDescriptorBufferInfo bi = { b, 0, VK_WHOLE_SIZE };
++   VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = s,
++      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi };
++   vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
++   return s;
++}
++
++static void make_pipelines(void)
++{
++   VkDescriptorSetLayoutBinding b = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT };
++   VkDescriptorSetLayoutCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++      .bindingCount = 1, .pBindings = &b };
++   VKCHECK(vkCreateDescriptorSetLayout(dev, &dci, NULL, &dsl));
++   VkPushConstantRange cr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 16 };
++   VkPipelineLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++      .setLayoutCount = 1, .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &cr };
++   VKCHECK(vkCreatePipelineLayout(dev, &lci, NULL, &cpl));
++   VkPushConstantRange gr = { VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4 };
++   VkPipelineLayoutCreateInfo glci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++      .pushConstantRangeCount = 1, .pPushConstantRanges = &gr };
++   VKCHECK(vkCreatePipelineLayout(dev, &glci, NULL, &gpl));
++
++   VkComputePipelineCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++      .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .pName = "main",
++                 .module = module(spin_spv, sizeof(spin_spv)) }, .layout = cpl };
++   VKCHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, &spin_pipe));
++   cpi.stage.module = module(chain_spv, sizeof(chain_spv));
++   VKCHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, &chain_pipe));
++
++   VkPipelineShaderStageCreateInfo st[2] = {
++      { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
++        .module = module(vert_spv, sizeof(vert_spv)), .pName = "main" },
++      { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
++        .module = module(frag_spv, sizeof(frag_spv)), .pName = "main" } };
++   VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++   VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
++      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
++   VkViewport vp = { 0, 0, RT, RT, 0, 1 };
++   VkRect2D sc = { { 0, 0 }, { RT, RT } };
++   VkPipelineViewportStateCreateInfo vs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
++      .viewportCount = 1, .pViewports = &vp, .scissorCount = 1, .pScissors = &sc };
++   VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
++      .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1 };
++   VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
++      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
++   VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = 0xf };
++   VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
++      .attachmentCount = 1, .pAttachments = &cba };
++   VkFormat fmt = VK_FORMAT_R32G32B32A32_UINT;
++   VkPipelineRenderingCreateInfo ri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
++      .colorAttachmentCount = 1, .pColorAttachmentFormats = &fmt };
++   VkGraphicsPipelineCreateInfo gpi = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
++      .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
++      .pViewportState = &vs, .pRasterizationState = &rs, .pMultisampleState = &ms,
++      .pColorBlendState = &cb, .layout = gpl };
++   VKCHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &draw_pipe));
++}
++
++static VkCommandBuffer begin(VkCommandPool pool)
++{
++   VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++      .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
++   VkCommandBuffer c;
++   VKCHECK(vkAllocateCommandBuffers(dev, &ai, &c));
++   VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
++   VKCHECK(vkBeginCommandBuffer(c, &bi));
++   return c;
++}
++
++/* x after `iters` LCG steps, as one affine map. */
++static uint32_t lcg(uint32_t x, uint32_t iters)
++{
++   uint32_t a = 1, c = 0, sa = 1664525u, sc = 1013904223u;
++   while (iters) {
++      if (iters & 1) { c = sa * c + sc; a = sa * a; }
++      sc = sa * sc + sc;
++      sa = sa * sa;
++      iters >>= 1;
++   }
++   return a * x + c;
++}
++
++/* ---------------- overlap ---------------- */
++static struct buf spin_out, rt_read;
++static VkImage rt;
++static VkImageView rt_view;
++static VkDescriptorSet spin_set;
++
++static void make_rt(void)
++{
++   VkImageCreateInfo ii = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
++      .format = VK_FORMAT_R32G32B32A32_UINT, .extent = { RT, RT, 1 }, .mipLevels = 1, .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
++   VKCHECK(vkCreateImage(dev, &ii, NULL, &rt));
++   VkMemoryRequirements mr;
++   vkGetImageMemoryRequirements(dev, rt, &mr);
++   VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
++      .memoryTypeIndex = mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) };
++   VkDeviceMemory m;
++   VKCHECK(vkAllocateMemory(dev, &ai, NULL, &m));
++   VKCHECK(vkBindImageMemory(dev, rt, m, 0));
++   VkImageViewCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = rt,
++      .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = ii.format,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++   VKCHECK(vkCreateImageView(dev, &vi, NULL, &rt_view));
++}
++
++static VkCommandBuffer record_draw(uint32_t iters)
++{
++   VkCommandBuffer c = begin(gpool);
++   VkImageMemoryBarrier2 to_att = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
++      .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
++      .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++      .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = rt,
++      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++   VkDependencyInfo d = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
++      .pImageMemoryBarriers = &to_att };
++   vkCmdPipelineBarrier2(c, &d);
++   VkRenderingAttachmentInfo att = { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = rt_view,
++      .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
++      .storeOp = VK_ATTACHMENT_STORE_OP_STORE };
++   VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { RT, RT } },
++      .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &att };
++   vkCmdBeginRendering(c, &ri);
++   vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, draw_pipe);
++   vkCmdPushConstants(c, gpl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4, &iters);
++   vkCmdDraw(c, 3, 1, 0, 0);
++   vkCmdEndRendering(c);
++   VkImageMemoryBarrier2 to_src = to_att;
++   to_src.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
++   to_src.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
++   to_src.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
++   to_src.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
++   to_src.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++   to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++   d.pImageMemoryBarriers = &to_src;
++   vkCmdPipelineBarrier2(c, &d);
++   VkBufferImageCopy bic = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++      .imageExtent = { RT, RT, 1 } };
++   vkCmdCopyImageToBuffer(c, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, rt_read.b, 1, &bic);
++   VKCHECK(vkEndCommandBuffer(c));
++   return c;
++}
++
++static VkCommandBuffer record_spin(uint32_t iters, uint32_t seed)
++{
++   VkCommandBuffer c = begin(cpool);
++   vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, spin_pipe);
++   vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, cpl, 0, 1, &spin_set, 0, NULL);
++   uint32_t pc[2] = { iters, seed };
++   vkCmdPushConstants(c, cpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, pc);
++   vkCmdDispatch(c, SPIN_GROUPS, 1, 1);
++   VKCHECK(vkEndCommandBuffer(c));
++   return c;
++}
++
++static double run(VkCommandBuffer g, VkCommandBuffer c)
++{
++   VkFence f[2];
++   VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++   VKCHECK(vkCreateFence(dev, &fi, NULL, &f[0]));
++   VKCHECK(vkCreateFence(dev, &fi, NULL, &f[1]));
++   double t0 = now_ms();
++   uint32_t n = 0;
++   if (g) {
++      VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g };
++      VKCHECK(vkQueueSubmit(gq, 1, &si, f[n++]));
++   }
++   if (c) {
++      VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &c };
++      VKCHECK(vkQueueSubmit(cq, 1, &si, f[n++]));
++   }
++   VKCHECK(vkWaitForFences(dev, n, f, VK_TRUE, 10ull * 1000 * 1000 * 1000));
++   double t = now_ms() - t0;
++   vkDestroyFence(dev, f[0], NULL);
++   vkDestroyFence(dev, f[1], NULL);
++   return t;
++}
++
++static int cmp_d(const void *a, const void *b)
++{
++   double x = *(const double *)a, y = *(const double *)b;
++   return x < y ? -1 : x > y;
++}
++
++static int check_spin(uint32_t iters, uint32_t seed)
++{
++   for (uint32_t i = 0; i < SPIN_N; i++)
++      if (spin_out.map[i] != lcg(seed + i, iters)) {
++         fprintf(stderr, "spin[%u] = %#x, want %#x\n", i, spin_out.map[i], lcg(seed + i, iters));
++         return 1;
++      }
++   return 0;
++}
++
++static int check_draw(uint32_t iters)
++{
++   /* Pixel (x, y) of the R32G32B32A32 target, row-major, tightly packed. */
++   for (uint32_t y = 0; y < RT; y += 21)
++      for (uint32_t x = 0; x < RT; x += 13) {
++         uint32_t got = rt_read.map[(y * RT + x) * 4];
++         uint32_t want = lcg(x * 4096u + y, iters);
++         if (got != want) {
++            fprintf(stderr, "pixel (%u,%u) = %#x, want %#x\n", x, y, got, want);
++            return 1;
++         }
++      }
++   return 0;
++}
++
++static int overlap(double target)
++{
++   spin_out = make_buffer(SPIN_N * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++   rt_read = make_buffer(RT * RT * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++   spin_set = buffer_set(spin_out.b);
++   make_rt();
++   /* Calibrate each side to `target` ms alone. */
++   uint32_t ic = 1u << 20, ig = 1u << 16;
++   double tc = run(VK_NULL_HANDLE, record_spin(ic, 1));
++   tc = run(VK_NULL_HANDLE, record_spin(ic, 1));
++   double tg = run(record_draw(ig), VK_NULL_HANDLE);
++   tg = run(record_draw(ig), VK_NULL_HANDLE);
++   ic = (uint32_t)(ic * target / tc);
++   ig = (uint32_t)(ig * target / tg);
++   printf("calibrated: compute %u iterations, fragment %u iterations\n", ic, ig);
++   VkCommandBuffer c = record_spin(ic, 7), g = record_draw(ig);
++   double a[5], b[5], ab[5];
++   for (int r = 0; r < 5; r++) {
++      a[r] = run(g, VK_NULL_HANDLE);
++      if (check_draw(ig)) return 1;
++      b[r] = run(VK_NULL_HANDLE, c);
++      if (check_spin(ic, 7)) return 1;
++      memset(spin_out.map, 0, SPIN_N * 4);
++      memset(rt_read.map, 0, RT * RT * 16);
++      ab[r] = run(g, c);
++      if (check_draw(ig) || check_spin(ic, 7)) return 1;
++   }
++   qsort(a, 5, sizeof(double), cmp_d);
++   qsort(b, 5, sizeof(double), cmp_d);
++   qsort(ab, 5, sizeof(double), cmp_d);
++   printf("graphics queue draw alone %.2f ms, compute queue dispatch alone %.2f ms, together %.2f ms: overlap %.2fx\n",
++          a[2], b[2], ab[2], (a[2] + b[2]) / ab[2]);
++   return 0;
++}
++
++/* ---------------- pingpong ---------------- */
++static struct buf chain, indirect;
++static VkDescriptorSet chain_set;
++
++static VkCommandBuffer record_step(uint32_t k, uint32_t iters)
++{
++   VkCommandBuffer c = begin(k & 1 ? cpool : gpool);
++   vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, chain_pipe);
++   vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, cpl, 0, 1, &chain_set, 0, NULL);
++   uint32_t pc[3] = { k, k + 1, iters };
++   vkCmdPushConstants(c, cpl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 12, pc);
++   /* Compute-queue steps dispatch indirectly: that runs an MME macro
++    * through the compute class on the compute queue's subcontext.
++    */
++   if (k & 1)
++      vkCmdDispatchIndirect(c, indirect.b, 0);
++   else
++      vkCmdDispatch(c, 1, 1, 1);
++   VKCHECK(vkEndCommandBuffer(c));
++   return c;
++}
++
++static int check_chain(const char *what)
++{
++   for (uint32_t k = 0; k <= STEPS; k++)
++      if (chain.map[k] != k) {
++         fprintf(stderr, "%s: v[%u] = %u, want %u\n", what, k, chain.map[k], k);
++         return 1;
++      }
++   printf("%s: chain of %u steps across both queues correct\n", what, STEPS);
++   return 0;
++}
++
++static int pingpong(void)
++{
++   chain = make_buffer(4096 * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++   indirect = make_buffer(16, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
++   indirect.map[0] = indirect.map[1] = indirect.map[2] = 1;
++   chain_set = buffer_set(chain.b);
++   const uint32_t iters = 1u << 18;
++   VkCommandBuffer steps[STEPS];
++   for (uint32_t k = 0; k < STEPS; k++)
++      steps[k] = record_step(k, iters);
++
++   /* Timeline, in step order and then with the compute steps first. */
++   for (int reverse = 0; reverse < 2; reverse++) {
++      memset(chain.map, 0, 4096 * 4);
++      VkSemaphoreTypeCreateInfo ti = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
++         .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE };
++      VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ti };
++      VkSemaphore tl;
++      VKCHECK(vkCreateSemaphore(dev, &sci, NULL, &tl));
++      for (int pass = 0; pass < 2; pass++) {
++         for (uint32_t k = 0; k < STEPS; k++) {
++            /* reverse: compute-queue (odd) steps in pass 0, graphics in pass 1. */
++            int odd = k & 1;
++            if (reverse ? (pass == 0) != odd : pass == 1)
++               continue;
++            uint64_t wait = k, signal = k + 1;
++            VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
++            VkTimelineSemaphoreSubmitInfo tsi = { .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
++               .waitSemaphoreValueCount = k ? 1 : 0, .pWaitSemaphoreValues = &wait,
++               .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &signal };
++            VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &tsi,
++               .waitSemaphoreCount = k ? 1 : 0, .pWaitSemaphores = &tl, .pWaitDstStageMask = &stage,
++               .commandBufferCount = 1, .pCommandBuffers = &steps[k],
++               .signalSemaphoreCount = 1, .pSignalSemaphores = &tl };
++            VKCHECK(vkQueueSubmit(odd ? cq : gq, 1, &si, VK_NULL_HANDLE));
++         }
++      }
++      uint64_t want = STEPS;
++      VkSemaphoreWaitInfo wi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
++         .pSemaphores = &tl, .pValues = &want };
++      VKCHECK(vkWaitSemaphores(dev, &wi, 10ull * 1000 * 1000 * 1000));
++      if (check_chain(reverse ? "timeline, compute steps submitted first" : "timeline, step order"))
++         return 1;
++      vkDestroySemaphore(dev, tl, NULL);
++   }
++
++   /* Binary semaphores in step order. */
++   memset(chain.map, 0, 4096 * 4);
++   VkSemaphore bs[STEPS];
++   VkSemaphoreCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
++   for (uint32_t k = 0; k < STEPS; k++)
++      VKCHECK(vkCreateSemaphore(dev, &bci, NULL, &bs[k]));
++   VkFence done;
++   VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++   VKCHECK(vkCreateFence(dev, &fi, NULL, &done));
++   for (uint32_t k = 0; k < STEPS; k++) {
++      VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
++      VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++         .waitSemaphoreCount = k ? 1 : 0, .pWaitSemaphores = k ? &bs[k - 1] : NULL, .pWaitDstStageMask = &stage,
++         .commandBufferCount = 1, .pCommandBuffers = &steps[k],
++         .signalSemaphoreCount = k + 1 < STEPS ? 1 : 0, .pSignalSemaphores = &bs[k] };
++      VKCHECK(vkQueueSubmit(k & 1 ? cq : gq, 1, &si, k + 1 == STEPS ? done : VK_NULL_HANDLE));
++   }
++   VKCHECK(vkWaitForFences(dev, 1, &done, VK_TRUE, 10ull * 1000 * 1000 * 1000));
++   return check_chain("binary semaphores");
++}
++
++int main(int argc, char **argv)
++{
++   setvbuf(stdout, NULL, _IONBF, 0);
++   const char *mode = argc > 1 ? argv[1] : "overlap";
++   double target = argc > 2 ? atof(argv[2]) : 100.0;
++   VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_3 };
++   VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
++   VkInstance inst;
++   VKCHECK(vkCreateInstance(&ici, NULL, &inst));
++   uint32_t n = 1;
++   VkResult r = vkEnumeratePhysicalDevices(inst, &n, &pd);
++   if (r != VK_SUCCESS && r != VK_INCOMPLETE) return 2;
++   uint32_t fc = 0;
++   vkGetPhysicalDeviceQueueFamilyProperties(pd, &fc, NULL);
++   VkQueueFamilyProperties qf[16];
++   if (fc > 16) fc = 16;
++   vkGetPhysicalDeviceQueueFamilyProperties(pd, &fc, qf);
++   gfx_family = comp_family = UINT32_MAX;
++   for (uint32_t i = 0; i < fc; i++) {
++      if ((qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && gfx_family == UINT32_MAX) gfx_family = i;
++      if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
++          comp_family == UINT32_MAX) comp_family = i;
++   }
++   if (comp_family == UINT32_MAX) {
++      printf("no compute-only queue family\n");
++      return 77;
++   }
++   printf("graphics family %u, compute family %u (x%u)\n", gfx_family, comp_family, qf[comp_family].queueCount);
++   float prio = 1.0f;
++   VkDeviceQueueCreateInfo qci[2] = {
++      { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = comp_family, .queueCount = 1, .pQueuePriorities = &prio },
++      { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = gfx_family, .queueCount = 1, .pQueuePriorities = &prio } };
++   VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
++      .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE };
++   VkPhysicalDeviceVulkan12Features f12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
++      .pNext = &f13, .timelineSemaphore = VK_TRUE };
++   const int solo = !strcmp(mode, "solo");
++   VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f12,
++      .queueCreateInfoCount = solo ? 1 : 2, .pQueueCreateInfos = qci };
++   VKCHECK(vkCreateDevice(pd, &dci, NULL, &dev));
++   if (!solo)
++      vkGetDeviceQueue(dev, gfx_family, 0, &gq);
++   vkGetDeviceQueue(dev, comp_family, 0, &cq);
++   VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = gfx_family };
++   if (!solo)
++      VKCHECK(vkCreateCommandPool(dev, &pci, NULL, &gpool));
++   pci.queueFamilyIndex = comp_family;
++   VKCHECK(vkCreateCommandPool(dev, &pci, NULL, &cpool));
++   VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 };
++   VkDescriptorPoolCreateInfo dpi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8,
++      .poolSizeCount = 1, .pPoolSizes = &ps };
++   VKCHECK(vkCreateDescriptorPool(dev, &dpi, NULL, &dpool));
++   make_pipelines();
++   int ret;
++   if (!strcmp(mode, "teardown")) {
++      spin_out = make_buffer(SPIN_N * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++      rt_read = make_buffer(RT * RT * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
++      spin_set = buffer_set(spin_out.b);
++      make_rt();
++      VkCommandBuffer g = record_draw(4u << 20), c = record_spin(4u << 20, 5);
++      VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g };
++      VKCHECK(vkQueueSubmit(gq, 1, &si, VK_NULL_HANDLE));
++      si.pCommandBuffers = &c;
++      VKCHECK(vkQueueSubmit(cq, 1, &si, VK_NULL_HANDLE));
++      double t0 = now_ms();
++      vkDestroyPipeline(dev, spin_pipe, NULL);
++      vkDestroyPipeline(dev, chain_pipe, NULL);
++      vkDestroyPipeline(dev, draw_pipe, NULL);
++      vkDestroyDevice(dev, NULL);
++      printf("device destroyed with both queues busy in %.2f ms\n", now_ms() - t0);
++      vkDestroyInstance(inst, NULL);
++      printf("PASS\n");
++      return 0;
++   }
++   if (solo) {
++      spin_out = make_buffer(SPIN_N * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
++      spin_set = buffer_set(spin_out.b);
++      double t = run(VK_NULL_HANDLE, record_spin(1u << 16, 3));
++      ret = check_spin(1u << 16, 3);
++      printf("solo compute queue dispatch %.2f ms\n", t);
++   } else {
++      ret = !strcmp(mode, "pingpong") ? pingpong() : overlap(target);
++   }
++   /* Work is idle here: destroying the device tears down both queues. */
++   VKCHECK(vkDeviceWaitIdle(dev));
++   vkDestroyPipeline(dev, spin_pipe, NULL);
++   vkDestroyPipeline(dev, chain_pipe, NULL);
++   vkDestroyPipeline(dev, draw_pipe, NULL);
++   vkDestroyDevice(dev, NULL);
++   vkDestroyInstance(inst, NULL);
++   printf("%s\n", ret ? "FAIL" : "PASS");
++   return ret;
++}
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/vk-async-compute.glsl b/nvidia-prolapse/driver-source/native/mesa/tests/vk-async-compute.glsl
+new file mode 100644
+index 0000000..b19742d
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/vk-async-compute.glsl
+@@ -0,0 +1,43 @@
++// Shaders of vk-async-compute.c; split by the build line with -DSTAGE_*.
++#version 450
++#if defined(STAGE_SPIN)
++// Each invocation runs `iters` LCG steps from `seed + index` and stores it.
++layout(local_size_x = 64) in;
++layout(std430, set = 0, binding = 0) buffer Out { uint v[]; } o;
++layout(push_constant) uniform P { uint iters; uint seed; } p;
++void main() {
++   uint i = gl_GlobalInvocationID.x;
++   uint x = p.seed + i;
++   for (uint k = 0u; k < p.iters; k++)
++      x = x * 1664525u + 1013904223u;
++   o.v[i] = x;
++}
++#elif defined(STAGE_CHAIN)
++// One ping-pong step: v[dst] = v[src] + 1, plus `iters` LCG steps of busy work stored at dst + 1024.
++layout(local_size_x = 1) in;
++layout(std430, set = 0, binding = 0) buffer Out { uint v[]; } o;
++layout(push_constant) uniform P { uint src; uint dst; uint iters; } p;
++void main() {
++   uint x = o.v[p.src];
++   uint y = x;
++   for (uint k = 0u; k < p.iters; k++)
++      y = y * 1664525u + 1013904223u;
++   o.v[p.dst] = x + 1u;
++   o.v[p.dst + 1024u] = y; /* keeps the busy work */
++}
++#elif defined(STAGE_VERT)
++void main() {
++   vec2 pos = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
++   gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);
++}
++#elif defined(STAGE_FRAG)
++// Busy fragment shader: `iters` LCG steps per fragment.
++layout(location = 0) out uvec4 color;
++layout(push_constant) uniform P { uint iters; } p;
++void main() {
++   uint x = uint(gl_FragCoord.x) * 4096u + uint(gl_FragCoord.y);
++   for (uint k = 0u; k < p.iters; k++)
++      x = x * 1664525u + 1013904223u;
++   color = uvec4(x, 0u, 0u, 1u);
++}
++#endif
+diff --git a/nvidia-prolapse/driver-source/native/mesa/tests/vk-compute-queue-compressed.c b/nvidia-prolapse/driver-source/native/mesa/tests/vk-compute-queue-compressed.c
+new file mode 100644
+index 0000000..51fd690
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/tests/vk-compute-queue-compressed.c
+@@ -0,0 +1,128 @@
++/* vk-compute-queue-compressed: compressed array images with mip levels through a COMPUTE-without-GRAPHICS queue.
++ * A BC1 (8-byte blocks) and a BC7 (16-byte blocks) 2D image, 64x64, 4 levels, 3 layers each: every level/layer is
++ * written with random blocks by vkCmdCopyBufferToImage, copied to a second image by vkCmdCopyImage, read back by
++ * vkCmdCopyImageToBuffer (per level, all layers in one region) and compared block by block. All transfers run on
++ * the compute-only queue. Exit 0 = PASS, 1 = mismatch/error, 77 = no compute-only family or format unsupported.
++ * Build: cc -std=c11 -O2 -Wall -Wextra -Werror -o vk-compute-queue-compressed vk-compute-queue-compressed.c -lvulkan
++ * Run:   VK_DRIVER_FILES=<NVK ICD json> ./vk-compute-queue-compressed */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <vulkan/vulkan.h>
++
++#define C(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { fprintf(stderr, "%s:%d %s = %d\n", __FILE__, __LINE__, #x, r_); exit(1); } } while (0)
++
++static VkDevice dev; static VkPhysicalDevice pd; static VkQueue q; static VkCommandPool pool; static uint32_t qf;
++
++static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
++   VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(pd, &mp);
++   for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
++      if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
++   fprintf(stderr, "no memory type\n"); exit(1);
++}
++struct buf { VkBuffer b; VkDeviceMemory m; void *map; };
++static struct buf mkbuf(VkDeviceSize size) {
++   struct buf r; VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, 0, 0, size,
++      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, 0 };
++   C(vkCreateBuffer(dev, &bi, 0, &r.b)); VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, r.b, &mr);
++   VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size,
++      mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
++   C(vkAllocateMemory(dev, &ai, 0, &r.m)); C(vkBindBufferMemory(dev, r.b, r.m, 0)); C(vkMapMemory(dev, r.m, 0, size, 0, &r.map));
++   return r;
++}
++static void freebuf(struct buf *b) { vkUnmapMemory(dev, b->m); vkDestroyBuffer(dev, b->b, 0); vkFreeMemory(dev, b->m, 0); }
++struct img { VkImage i; VkDeviceMemory m; };
++static struct img mkimg(VkFormat f, uint32_t levels, uint32_t layers) {
++   struct img r; VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, 0, 0, VK_IMAGE_TYPE_2D, f, {64, 64, 1}, levels, layers,
++      VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++      VK_SHARING_MODE_EXCLUSIVE, 0, 0, VK_IMAGE_LAYOUT_UNDEFINED };
++   C(vkCreateImage(dev, &ii, 0, &r.i)); VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, r.i, &mr);
++   VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 0, mr.size, mem_type(mr.memoryTypeBits, 0) };
++   C(vkAllocateMemory(dev, &ai, 0, &r.m)); C(vkBindImageMemory(dev, r.i, r.m, 0)); return r;
++}
++static VkCommandBuffer begin(void) {
++   VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, 0, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
++   VkCommandBuffer cb; C(vkAllocateCommandBuffers(dev, &ai, &cb));
++   VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, 0, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, 0 };
++   C(vkBeginCommandBuffer(cb, &bi)); return cb;
++}
++static void barrier(VkCommandBuffer cb) {
++   VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, 0, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
++      VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT };
++   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, 0, 0, 0);
++}
++static void to_general(VkCommandBuffer cb, VkImage i) {
++   VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, 0, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
++      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, i,
++      { VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS } };
++   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, 0, 0, 0, 1, &b);
++}
++static void submit(VkCommandBuffer cb) {
++   C(vkEndCommandBuffer(cb));
++   VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO, 0, 0, 0, 0, 1, &cb, 0, 0 };
++   C(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE)); C(vkQueueWaitIdle(q)); vkFreeCommandBuffers(dev, pool, 1, &cb);
++}
++
++/* 0 = pass, 1 = fail, 77 = unsupported */
++static int run(VkFormat f, uint32_t block_B, const char *name) {
++   VkImageFormatProperties ifp;
++   if (vkGetPhysicalDeviceImageFormatProperties(pd, f, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
++          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, &ifp) != VK_SUCCESS) {
++      printf("%s: unsupported\n", name); return 77;
++   }
++   const uint32_t levels = 4, layers = 3;
++   VkDeviceSize off[4], total = 0;
++   for (uint32_t l = 0; l < levels; l++) { uint32_t bw = ((64 >> l) + 3) / 4; off[l] = total; total += (VkDeviceSize)bw * bw * block_B * layers; }
++   struct buf up = mkbuf(total), down = mkbuf(total);
++   srand(1234u + block_B);
++   for (VkDeviceSize i = 0; i < total; i++) ((unsigned char *)up.map)[i] = (unsigned char)rand();
++   memset(down.map, 0, total);
++   struct img a = mkimg(f, levels, layers), b = mkimg(f, levels, layers);
++   VkBufferImageCopy rg[4]; VkImageCopy ic[4];
++   for (uint32_t l = 0; l < levels; l++) {
++      uint32_t w = 64 >> l;
++      rg[l] = (VkBufferImageCopy){ off[l], 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, l, 0, layers }, {0, 0, 0}, {w, w, 1} };
++      ic[l] = (VkImageCopy){ { VK_IMAGE_ASPECT_COLOR_BIT, l, 0, layers }, {0, 0, 0}, { VK_IMAGE_ASPECT_COLOR_BIT, l, 0, layers }, {0, 0, 0}, {w, w, 1} };
++   }
++   VkCommandBuffer cb = begin(); to_general(cb, a.i); to_general(cb, b.i);
++   vkCmdCopyBufferToImage(cb, up.b, a.i, VK_IMAGE_LAYOUT_GENERAL, levels, rg); barrier(cb);
++   vkCmdCopyImage(cb, a.i, VK_IMAGE_LAYOUT_GENERAL, b.i, VK_IMAGE_LAYOUT_GENERAL, levels, ic); barrier(cb);
++   vkCmdCopyImageToBuffer(cb, b.i, VK_IMAGE_LAYOUT_GENERAL, down.b, levels, rg); barrier(cb);
++   submit(cb);
++   int bad = 0;
++   for (uint32_t l = 0; l < levels; l++) {
++      uint32_t bw = ((64 >> l) + 3) / 4; VkDeviceSize n = (VkDeviceSize)bw * bw * block_B;
++      for (uint32_t y = 0; y < layers; y++)
++         if (memcmp((char *)up.map + off[l] + y * n, (char *)down.map + off[l] + y * n, n)) { printf("%s: level %u layer %u differs\n", name, l, y); bad = 1; }
++   }
++   vkDestroyImage(dev, a.i, 0); vkFreeMemory(dev, a.m, 0); vkDestroyImage(dev, b.i, 0); vkFreeMemory(dev, b.m, 0);
++   freebuf(&up); freebuf(&down);
++   printf("%s: %s\n", name, bad ? "FAIL" : "ok");
++   return bad;
++}
++
++int main(void) {
++   VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO, 0, "vk-compute-queue-compressed", 1, 0, 0, VK_API_VERSION_1_3 };
++   VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, 0, 0, &app, 0, 0, 0, 0 };
++   VkInstance inst; C(vkCreateInstance(&ici, 0, &inst));
++   uint32_t n = 8; VkPhysicalDevice pds[8]; C(vkEnumeratePhysicalDevices(inst, &n, pds));
++   pd = VK_NULL_HANDLE;
++   for (uint32_t i = 0; i < n; i++) { VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(pds[i], &p); if (p.vendorID == 0x10de) { pd = pds[i]; break; } }
++   if (!pd) { printf("no NVIDIA device\n"); return 77; }
++   uint32_t nf = 16; VkQueueFamilyProperties qfp[16]; vkGetPhysicalDeviceQueueFamilyProperties(pd, &nf, qfp);
++   qf = UINT32_MAX;
++   for (uint32_t i = 0; i < nf; i++) if ((qfp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qfp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { qf = i; break; }
++   if (qf == UINT32_MAX) { printf("no compute-only queue family\n"); return 77; }
++   float prio = 1.0f;
++   VkDeviceQueueCreateInfo qci = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, 0, 0, qf, 1, &prio };
++   VkPhysicalDeviceFeatures feat = { 0 }; feat.textureCompressionBC = VK_TRUE;
++   VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, 0, 0, 1, &qci, 0, 0, 0, 0, &feat };
++   C(vkCreateDevice(pd, &dci, 0, &dev)); vkGetDeviceQueue(dev, qf, 0, &q);
++   VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, 0, 0, qf }; C(vkCreateCommandPool(dev, &pci, 0, &pool));
++   int r1 = run(VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, "bc1 64x64 4 levels 3 layers");
++   int r2 = run(VK_FORMAT_BC7_UNORM_BLOCK, 16, "bc7 64x64 4 levels 3 layers");
++   vkDestroyCommandPool(dev, pool, 0); vkDestroyDevice(dev, 0); vkDestroyInstance(inst, 0);
++   int r = (r1 == 1 || r2 == 1) ? 1 : (r1 == 77 && r2 == 77) ? 77 : 0;
++   printf("%s\n", r == 0 ? "PASS" : r == 77 ? "UNSUPPORTED" : "FAIL");
++   return r;
++}
+diff --git a/nvidia-prolapse/driver-source/native/src/gpu.rs b/nvidia-prolapse/driver-source/native/src/gpu.rs
+index 80e4ec3..25831dd 100644
+--- a/nvidia-prolapse/driver-source/native/src/gpu.rs
++++ b/nvidia-prolapse/driver-source/native/src/gpu.rs
+@@ -1052,6 +1052,9 @@ pub(crate) struct Queue {
+     /// the VEID returns to the TSG only after RM freed the share, and the TSG
+     /// reference drops last.
+     subcontext: Subcontext,
++    /// Compute class without 3D on this channel: every batch's tail starts
++    /// with a compute-class WAIT_FOR_IDLE (see `submit_encoded`).
++    compute_only: bool,
+     error_notifier: rm::Mapping,
+     ring: rm::Mapping,
+     _ring_gpu: GpuMapping,
+@@ -1714,6 +1717,7 @@ impl Queue {
+             engines,
+             channel,
+             subcontext,
++            compute_only: mask & 16 != 0 && mask & 4 == 0,
+             error_notifier,
+             ring,
+             _ring_gpu: ring_gpu,
+@@ -1987,6 +1991,19 @@ impl Queue {
+         for op in waits {
+             encode_op(&mut scratch.prefix, self.channel_class, slot_native64, *op)?;
+         }
++        if self.compute_only {
++            // A channel with the compute class alone completes a batch the
++            // way the proprietary driver completes its compute queue's
++            // (615.78.08: compute-class WAIT_FOR_IDLE before the completion
++            // release): the host WFI and RELEASE_WFI below do not wait for
++            // compute grids launched on such a channel, and the 3D-class
++            // subchannel switch that idles GR on a graphics channel does not
++            // happen there. Measured on GB202 without it: the release came
++            // first and a later grid wrote freed memory (Xid 31).
++            // NVC7C0_WAIT_FOR_IDLE 0x0110 on the compute subchannel 1
++            // (clc7c0.h; NVK binds the compute class there).
++            method(&mut scratch.signals, 1, 0x110, &[0]);
++        }
+         signal_methods(
+             &mut scratch.signals,
+             self.channel_class,
+diff --git a/nvidia-prolapse/driver-source/native/src/mesa.rs b/nvidia-prolapse/driver-source/native/src/mesa.rs
+index d8f10b8..b1498b1 100644
+--- a/nvidia-prolapse/driver-source/native/src/mesa.rs
++++ b/nvidia-prolapse/driver-source/native/src/mesa.rs
+@@ -73,7 +73,9 @@ pub struct Info {
+     zcull_ctxsw_size: u32,
+     zcull_ctxsw_align: u32,
+     has_zcull_info: u32,
+-    reserved: u32,
++    /// RM's SM ISA code (NV2080_CTRL_GR_INFO_INDEX_SM_VERSION), from which
++    /// `sm` is derived.
++    sm_isa: u32,
+ }
+ #[repr(C)]
+ #[derive(Clone, Copy)]
+@@ -1661,7 +1663,7 @@ fn query_info(d: &Device) -> Result<Info> {
+         zcull_ctxsw_size,
+         zcull_ctxsw_align,
+         has_zcull_info,
+-        reserved: 0,
++        sm_isa: gr[0][1],
+     })
+ }
+ 
+@@ -2848,6 +2850,7 @@ mod tests {
+         assert_eq!(offset_of!(Info, zcull), 152);
+         assert_eq!(offset_of!(Info, zcull_ctxsw_size), 192);
+         assert_eq!(offset_of!(Info, has_zcull_info), 200);
++        assert_eq!(offset_of!(Info, sm_isa), 204);
+         assert_eq!(offset_of!(Info, generic_kind), 68);
+         assert_eq!(offset_of!(Info, vram_size), 72);
+         assert_eq!(offset_of!(Info, bar_size), 80);
+-- 
+2.56.0
+

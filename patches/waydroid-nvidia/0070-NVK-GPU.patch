@@ -1,0 +1,1952 @@
+From 7ee65ea409f5eb3722c0fca329cab1cbfb21f8ba Mon Sep 17 00:00:00 2001
+From: Shiro836 <noreply>
+Date: Tue, 27 Oct 2026 22:40:03 +0300
+Subject: [PATCH 70/72] =?utf-8?q?NVK=EF=BC=9A=E6=94=AF=E6=8C=81=E8=AE=A1?=
+ =?utf-8?q?=E7=AE=97=E9=98=9F=E5=88=97=E9=97=B4=E6=8E=A5=E5=86=85=E5=AD=98?=
+ =?utf-8?q?=E6=8B=B7=E8=B4=9D=E4=B8=8E=20GPU=20=E4=B8=93=E7=94=A8=E6=B1=A0?=
+ =?utf-8?q?=E5=9D=97?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 859cb41176e124ec83802084286da46d6d85ce57)
+---
+ .../driver-source/native/mesa/build.py        |   9 +-
+ .../driver-source/native/mesa/nv_rm.h         |   7 +
+ ...k-compute-queue-copy-memory-indirect.patch | 993 ++++++++++++++++++
+ .../driver-source/native/mesa/nvkmd_rm.c      |  16 +
+ .../driver-source/native/src/gpu.rs           |  52 +-
+ .../driver-source/native/src/mesa.rs          |  69 +-
+ .../driver-source/native/src/rm.rs            | 198 +++-
+ tools/native-vulkan-copy-indirect.c           | 300 ++++++
+ tools/native-vulkan-regression.py             |   3 +
+ tools/native-vulkan-shaders/README.md         |  16 +-
+ 10 files changed, 1626 insertions(+), 37 deletions(-)
+ mode change 100755 => 100644 nvidia-prolapse/driver-source/native/mesa/build.py
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-copy-memory-indirect.patch
+ create mode 100644 tools/native-vulkan-copy-indirect.c
+
+diff --git a/nvidia-prolapse/driver-source/native/mesa/build.py b/nvidia-prolapse/driver-source/native/mesa/build.py
+old mode 100755
+new mode 100644
+index b105048..d7a60ff
+--- a/nvidia-prolapse/driver-source/native/mesa/build.py
++++ b/nvidia-prolapse/driver-source/native/mesa/build.py
+@@ -191,12 +191,11 @@ NVK_PATCH_LIST = [
+     # A 3D view of a 2D image (invalid usage NVIDIA's driver accepts) is
+     # described as a depth-1 3D image instead of tripping nil's assert.
+     HERE / "nvk-3d-view-of-2d-image.patch",
+-    # Blackwell B: colour-attachment output -> fragment reads drain with
+-    # PIXEL_SHADER_BARRIER instead of WAIT_FOR_IDLE, and QMDs carry
+-    # CWD_MEMBAR_TYPE = L1_MEMBAR, as NVIDIA's driver does.
++    # Colour-attachment output -> fragment reads drain with
++    # PIXEL_SHADER_BARRIER on every 3D class; Turing+ QMDs carry L1_MEMBAR.
+     HERE / "nvk-pixel-shader-barrier.patch",
+     HERE / "nak-qmd-cwd-membar.patch",
+-    # Blackwell B: compute -> compute barriers order through QMD
++    # Ampere B..Blackwell B: compute barriers order through QMD
+     # dependencies (an empty join QMD per barrier, host dependency
+     # decrements) instead of WAIT_FOR_IDLE, as NVIDIA's driver does.
+     HERE / "nak-qmd-dependency.patch",
+@@ -222,6 +221,8 @@ NVK_PATCH_LIST = [
+     # Shared SKED cache invalidation and compute classes without MME.
+     HERE / "nvk-turing-sked-qmd-invalidate.patch",
+     HERE / "nvk-compute-queue-no-mme.patch",
++    # Compute-only indirect copies read commands through GPU-only pool blocks.
++    HERE / "nvk-compute-queue-copy-memory-indirect.patch",
+ ]
+ # NVK and GL consume exactly the same ordered stack.
+ NVK_PATCHES = tuple(patch.name for patch in NVK_PATCH_LIST)
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nv_rm.h b/nvidia-prolapse/driver-source/native/mesa/nv_rm.h
+index e39de65..e1cceb5 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nv_rm.h
++++ b/nvidia-prolapse/driver-source/native/mesa/nv_rm.h
+@@ -136,6 +136,13 @@ int32_t nv_rm_context_signal(struct NvRmDevice*, uint64_t context,
+  * requested (uncompressed) kind. Size must be a 64 KiB multiple; the alignment
+  * is raised to 64 KiB. */
+ #define NV_RM_PLACEMENT_VRAM_COMPRESSIBLE 2u
++/* One GPU-internal pool block: 2 MiB of device memory in one physically
++ * contiguous huge page, GPU-cached, uncompressed, never CPU-mapped or
++ * exported (the NVOS32 request the proprietary driver uses for the memory
++ * holding its command buffers' QMDs and launch counters). Size must be
++ * exactly 2 MiB and the kind 0; nv_rm_map fails on it, and it binds whole at a
++ * 2 MiB aligned VA. */
++#define NV_RM_PLACEMENT_VRAM_POOL_BLOCK 3u
+ /* C owns [16 GiB, 1 TiB), Rust internal mappings must remain below 16 GiB. */
+ #define NV_RM_VA_START (UINT64_C(1) << 34)
+ #define NV_RM_VA_END (UINT64_C(1) << 40)
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-copy-memory-indirect.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-copy-memory-indirect.patch
+new file mode 100644
+index 0000000..59a1700
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-copy-memory-indirect.patch
+@@ -0,0 +1,993 @@
++--- a/src/nouveau/compiler/nak.h
+++++ b/src/nouveau/compiler/nak.h
++@@ -357,7 +357,7 @@
++                              bool texture_data, bool shader_data,
++                              bool shader_constant);
++ 
++-/* QMD V02_02 (Volta, Turing): RELEASE0 as a one-word reduction ADD. */
+++/* RELEASE0 as a one-word reduction ADD (Volta and later QMD layouts). */
++ void nak_qmd_set_release0_add(const struct nv_device_info *dev,
++                               void *qmd, size_t qmd_size,
++                               uint64_t addr, uint32_t payload);
++--- a/src/nouveau/compiler/nak/qmd.rs
+++++ b/src/nouveau/compiler/nak/qmd.rs
++@@ -1214,14 +1214,18 @@
++     }
++ }
++ 
++-/// RELEASE0 of a Volta/Turing (QMD V02_02) dispatch: a one-word semaphore
++-/// reduction ADD of `payload` (unsigned 32-bit) to `addr` when the grid
++-/// completes.  The proprietary driver gives every dispatch QMD this release
++-/// to a per-command-buffer launch counter, payload 1
++-/// (libnvidia-eglcore.so.615.78.08 ELF 0xaee500, called for each dispatch
++-/// at ELF 0xbdffd6; its V02 arm sets SEMAPHORE_RELEASE_ENABLE0, the address,
++-/// payload 1, REDUCTION_ENABLE and STRUCTURE_SIZE ONE_WORD with RED_ADD /
++-/// UNSIGNED_32).  Other QMD layouts are not handled here.
+++/// RELEASE0 of a dispatch: a one-word semaphore reduction ADD of `payload`
+++/// (unsigned 32-bit) to `addr` when the grid completes.  The proprietary
+++/// driver gives every dispatch QMD this release to a per-command-buffer
+++/// launch counter, payload 1 (libnvidia-eglcore.so.615.78.08 ELF 0xaee500,
+++/// called for each dispatch at ELF 0xbdffd6 and for each internal kernel
+++/// launch).  It has one arm per QMD layout: V02 sets
+++/// SEMAPHORE_RELEASE_ENABLE0 (ELF 0xaee51e), V03 RELEASE0_ENABLE |
+++/// REDUCTION_ENABLE | STRUCTURE_SIZE ONE_WORD (ELF 0xaee555 `or
+++/// $0x44800000`), V04 and V05 RELEASE_ENABLE(0) | STRUCTURE_SIZE(0)
+++/// ONE_WORD | REDUCTION_ENABLE(0) (ELF 0xaee5b5 / ELF 0xaee578 `or $0x13`),
+++/// each with the address, payload 1 and the reduction op and format cleared
+++/// to RED_ADD / UNSIGNED (32-bit); the membar type stays as the QMD has it.
++ #[no_mangle]
++ pub extern "C" fn nak_qmd_set_release0_add(
++     dev: &nv_device_info,
++@@ -1231,22 +1235,83 @@
++     payload: u32,
++ ) {
++     assert!(
++-        dev.cls_compute >= clc3c0::VOLTA_COMPUTE_A
++-            && dev.cls_compute < clc6c0::AMPERE_COMPUTE_A,
++-        "QMD RELEASE0 is only set in the QMD V02_02 layout (Volta, Turing)"
+++        dev.cls_compute >= clc3c0::VOLTA_COMPUTE_A,
+++        "QMD RELEASE0 needs a Volta or later QMD layout"
++     );
++     assert!(!qmd.is_null());
++-    assert!(qmd_size == size_of::<Qmd2_2>());
++     let words =
++         unsafe { std::slice::from_raw_parts_mut(qmd as *mut u32, qmd_size / 4) };
++-    use nvidia_headers::classes::clc3c0::qmd as q;
+++    let lo = addr as u32;
+++    let hi = (addr >> 32) as u32;
++     let mut bv = QMDBitView::new(words);
++-    set_enum!(bv, q, QMDV02_02, SEMAPHORE_RELEASE_ENABLE0, TRUE);
++-    set_field!(bv, q, QMDV02_02, RELEASE0_ADDRESS_LOWER, addr as u32);
++-    set_field!(bv, q, QMDV02_02, RELEASE0_ADDRESS_UPPER, (addr >> 32) as u32);
++-    set_enum!(bv, q, QMDV02_02, RELEASE0_REDUCTION_OP, RED_ADD);
++-    set_enum!(bv, q, QMDV02_02, RELEASE0_REDUCTION_FORMAT, UNSIGNED_32);
++-    set_enum!(bv, q, QMDV02_02, RELEASE0_REDUCTION_ENABLE, TRUE);
++-    set_enum!(bv, q, QMDV02_02, RELEASE0_STRUCTURE_SIZE, ONE_WORD);
++-    set_field!(bv, q, QMDV02_02, RELEASE0_PAYLOAD, payload);
+++    if dev.cls_compute >= clcdc0::BLACKWELL_COMPUTE_A {
+++        assert!(qmd_size == size_of::<Qmd5_0>());
+++        use nvidia_headers::classes::clcdc0::qmd as q;
+++        set_array!(bv, q, QMDV05_00, RELEASE_ENABLE, 0, q::QMDV05_00_RELEASE_ENABLE_TRUE);
+++        set_array!(bv, q, QMDV05_00, RELEASE_STRUCTURE_SIZE, 0,
+++                   q::QMDV05_00_RELEASE_STRUCTURE_SIZE_SEMAPHORE_ONE_WORD);
+++        set_array!(bv, q, QMDV05_00, RELEASE_REDUCTION_ENABLE, 0,
+++                   q::QMDV05_00_RELEASE_REDUCTION_ENABLE_TRUE);
+++        set_array!(bv, q, QMDV05_00, RELEASE_REDUCTION_OP, 0,
+++                   q::QMDV05_00_RELEASE_REDUCTION_OP_RED_ADD);
+++        set_array!(bv, q, QMDV05_00, RELEASE_REDUCTION_FORMAT, 0,
+++                   q::QMDV05_00_RELEASE_REDUCTION_FORMAT_UNSIGNED);
+++        set_array!(bv, q, QMDV05_00, RELEASE_PAYLOAD64B, 0,
+++                   q::QMDV05_00_RELEASE_PAYLOAD64B_FALSE);
+++        set_field!(bv, q, QMDV05_00, RELEASE_SEMAPHORE0_ADDR_LOWER, lo);
+++        set_field!(bv, q, QMDV05_00, RELEASE_SEMAPHORE0_ADDR_UPPER, hi);
+++        set_field!(bv, q, QMDV05_00, RELEASE_SEMAPHORE0_PAYLOAD_LOWER, payload);
+++    } else if dev.cls_compute >= clcbc0::HOPPER_COMPUTE_A {
+++        assert!(qmd_size == size_of::<Qmd4_0>());
+++        use nvidia_headers::classes::clcbc0::qmd as q;
+++        set_array!(bv, q, QMDV04_00, RELEASE_ENABLE, 0, q::QMDV04_00_RELEASE_ENABLE_TRUE);
+++        set_array!(bv, q, QMDV04_00, RELEASE_STRUCTURE_SIZE, 0,
+++                   q::QMDV04_00_RELEASE_STRUCTURE_SIZE_SEMAPHORE_ONE_WORD);
+++        set_array!(bv, q, QMDV04_00, RELEASE_REDUCTION_ENABLE, 0,
+++                   q::QMDV04_00_RELEASE_REDUCTION_ENABLE_TRUE);
+++        set_array!(bv, q, QMDV04_00, RELEASE_REDUCTION_OP, 0,
+++                   q::QMDV04_00_RELEASE_REDUCTION_OP_RED_ADD);
+++        set_array!(bv, q, QMDV04_00, RELEASE_REDUCTION_FORMAT, 0,
+++                   q::QMDV04_00_RELEASE_REDUCTION_FORMAT_UNSIGNED);
+++        set_array!(bv, q, QMDV04_00, RELEASE_PAYLOAD64B, 0,
+++                   q::QMDV04_00_RELEASE_PAYLOAD64B_FALSE);
+++        set_field!(bv, q, QMDV04_00, RELEASE_SEMAPHORE0_ADDR_LOWER, lo);
+++        set_field!(bv, q, QMDV04_00, RELEASE_SEMAPHORE0_ADDR_UPPER, hi);
+++        set_field!(bv, q, QMDV04_00, RELEASE_SEMAPHORE0_PAYLOAD_LOWER, payload);
+++    } else if dev.cls_compute >= clc7c0::AMPERE_COMPUTE_B {
+++        assert!(qmd_size == size_of::<Qmd3_0>());
+++        use nvidia_headers::classes::clc7c0::qmd as q;
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_ENABLE, TRUE);
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_STRUCTURE_SIZE, SEMAPHORE_ONE_WORD);
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_REDUCTION_ENABLE, TRUE);
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_REDUCTION_OP, RED_ADD);
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_REDUCTION_FORMAT, UNSIGNED);
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_PAYLOAD64B, FALSE);
+++        set_field!(bv, q, QMDV03_00, RELEASE0_ADDRESS_LOWER, lo);
+++        set_field!(bv, q, QMDV03_00, RELEASE0_ADDRESS_UPPER, hi);
+++        set_field!(bv, q, QMDV03_00, RELEASE0_PAYLOAD_LOWER, payload);
+++    } else if dev.cls_compute >= clc6c0::AMPERE_COMPUTE_A {
+++        assert!(qmd_size == size_of::<Qmd3_0>());
+++        use nvidia_headers::classes::clc6c0::qmd as q;
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_ENABLE, TRUE);
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_STRUCTURE_SIZE, SEMAPHORE_ONE_WORD);
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_REDUCTION_ENABLE, TRUE);
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_REDUCTION_OP, RED_ADD);
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_REDUCTION_FORMAT, UNSIGNED_32);
+++        set_enum!(bv, q, QMDV03_00, RELEASE0_PAYLOAD64B, FALSE);
+++        set_field!(bv, q, QMDV03_00, RELEASE0_ADDRESS_LOWER, lo);
+++        set_field!(bv, q, QMDV03_00, RELEASE0_ADDRESS_UPPER, hi);
+++        set_field!(bv, q, QMDV03_00, RELEASE0_PAYLOAD_LOWER, payload);
+++    } else {
+++        assert!(qmd_size == size_of::<Qmd2_2>());
+++        use nvidia_headers::classes::clc3c0::qmd as q;
+++        set_enum!(bv, q, QMDV02_02, SEMAPHORE_RELEASE_ENABLE0, TRUE);
+++        set_field!(bv, q, QMDV02_02, RELEASE0_ADDRESS_LOWER, lo);
+++        set_field!(bv, q, QMDV02_02, RELEASE0_ADDRESS_UPPER, hi);
+++        set_enum!(bv, q, QMDV02_02, RELEASE0_REDUCTION_OP, RED_ADD);
+++        set_enum!(bv, q, QMDV02_02, RELEASE0_REDUCTION_FORMAT, UNSIGNED_32);
+++        set_enum!(bv, q, QMDV02_02, RELEASE0_REDUCTION_ENABLE, TRUE);
+++        set_enum!(bv, q, QMDV02_02, RELEASE0_STRUCTURE_SIZE, ONE_WORD);
+++        set_field!(bv, q, QMDV02_02, RELEASE0_PAYLOAD, payload);
+++    }
++ }
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
++@@ -68,6 +68,8 @@
++    util_dynarray_fini(&cmd->pushes);
++    util_dynarray_fini(&cmd->copy_memory_indirect_temps);
++    util_dynarray_fini(&cmd->sked.qmds);
+++   if (cmd->cntr.scratch != 0)
+++      nvk_cmd_pool_free_counter_scratch(pool, cmd->cntr.scratch);
++    vk_command_buffer_finish(&cmd->vk);
++    vk_free(&pool->vk.alloc, cmd);
++ }
++@@ -142,6 +144,12 @@
++    cmd->sked.wfi_drain = false;
++    cmd->sked.render_override = false;
++    util_dynarray_clear(&cmd->sked.qmds);
+++   cmd->cntr.started = false;
+++   cmd->cntr.launches = 0;
+++   cmd->cntr.pending = 0;
+++   cmd->cntr.other_work = false;
+++   cmd->cntr.mark = NULL;
+++   cmd->cntr.waited = false;
++ 
++    util_dynarray_clear(&cmd->pushes);
++    util_dynarray_clear(&cmd->copy_memory_indirect_temps);
++@@ -426,9 +434,149 @@
++    if (queue_flags & VK_QUEUE_GRAPHICS_BIT)
++       nvk_cmd_buffer_begin_graphics(cmd, pBeginInfo);
++ 
+++   cmd->cntr.mark = cmd->push.end;
+++
+++   return VK_SUCCESS;
+++}
+++
+++/* The launch counter of the copy kernels that vkCmdCopyMemoryIndirectKHR
+++ * records on a queue without a copy engine, as the proprietary driver
+++ * counts its kernel launches (libnvidia-eglcore.so 615.78.08): word 2 of a
+++ * 0x100-byte scratch block of GPU-only device memory (ELF 0xc5b52a /
+++ * ELF 0xc5a490), reset at the command buffer's first launch with a host
+++ * semaphore release of 0 and an acquire of 0 (ELF 0xc5b300), increased by
+++ * the RELEASE0 of each launch's QMD (ELF 0xaee500).  A barrier after such
+++ * launches waits for the counter to reach the number of launches (host
+++ * ACQ_CIRC_GEQ) and issues a compute NO_OPERATION, without idling the
+++ * compute engine (ELF 0xc5a530), then invalidates the destination's caches;
+++ * the end of the command buffer waits for the counter
+++ * once more (ELF 0xc5c980 -> ELF 0xc5c500 -> ELF 0xc5a530).  A secondary
+++ * command buffer has a counter of its own; the primary that executes it
+++ * does not count its launches.  Volta/Turing count every dispatch on
+++ * cmd->sked's counter, which this reuses there.
+++ */
+++VkResult
+++nvk_cmd_counted_launch(struct nvk_cmd_buffer *cmd, uint64_t *addr_out)
+++{
+++   if (cmd->cntr.scratch == 0) {
+++      VkResult result =
+++         nvk_cmd_pool_alloc_counter_scratch(nvk_cmd_buffer_pool(cmd),
+++                                            &cmd->cntr.scratch);
+++      if (unlikely(result != VK_SUCCESS))
+++         return result;
+++   }
+++   const uint64_t addr = cmd->cntr.scratch + 8;
+++   if (!cmd->cntr.started) {
+++      const uint8_t host = nvk_cmd_buffer_host_subc(cmd);
+++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 12);
+++      __push_mthd(p, host, NVC86F_SEM_ADDR_LO);
+++      P_NVC86F_SEM_ADDR_LO(p, (uint32_t)addr >> 2);
+++      P_NVC86F_SEM_ADDR_HI(p, addr >> 32);
+++      P_NVC86F_SEM_PAYLOAD_LO(p, 0);
+++      P_NVC86F_SEM_PAYLOAD_HI(p, 0);
+++      P_NVC86F_SEM_EXECUTE(p, {
+++         .operation = OPERATION_RELEASE,
+++         .payload_size = PAYLOAD_SIZE_32BIT,
+++      });
+++      __push_mthd(p, host, NVC86F_SEM_ADDR_LO);
+++      P_NVC86F_SEM_ADDR_LO(p, (uint32_t)addr >> 2);
+++      P_NVC86F_SEM_ADDR_HI(p, addr >> 32);
+++      P_NVC86F_SEM_PAYLOAD_LO(p, 0);
+++      P_NVC86F_SEM_PAYLOAD_HI(p, 0);
+++      P_NVC86F_SEM_EXECUTE(p, {
+++         .operation = OPERATION_ACQUIRE,
+++         .payload_size = PAYLOAD_SIZE_32BIT,
+++      });
+++      cmd->cntr.started = true;
+++   }
+++   cmd->cntr.launches++;
+++   *addr_out = addr;
++    return VK_SUCCESS;
++ }
++ 
+++void
+++nvk_cmd_counted_launches_begin(struct nvk_cmd_buffer *cmd)
+++{
+++   if (cmd->push.end != cmd->cntr.mark)
+++      cmd->cntr.other_work = true;
+++}
+++
+++void
+++nvk_cmd_counted_launches_end(struct nvk_cmd_buffer *cmd, uint32_t count)
+++{
+++   cmd->cntr.pending += count;
+++   cmd->cntr.mark = cmd->push.end;
+++}
+++
+++/* The counter and its expected value, or false when the launches since the
+++ * last wait cannot be waited for on it.
+++ */
+++static bool
+++nvk_cmd_counter_target(struct nvk_cmd_buffer *cmd,
+++                       uint64_t *addr, uint32_t *count)
+++{
+++   const struct nvk_physical_device *pdev =
+++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+++   if (nvk_cmd_sked_qmds_tracked(pdev)) {
+++      if (cmd->sked.counter_addr == 0 || cmd->sked.wfi_drain)
+++         return false;
+++      *addr = cmd->sked.counter_addr;
+++      *count = cmd->sked.launches;
+++      return true;
+++   }
+++   if (!cmd->cntr.started)
+++      return false;
+++   *addr = cmd->cntr.scratch + 8;
+++   *count = cmd->cntr.launches;
+++   return true;
+++}
+++
+++static void
+++nvk_cmd_counter_wait(struct nvk_cmd_buffer *cmd, uint64_t addr, uint32_t count)
+++{
+++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
+++   __push_mthd(p, nvk_cmd_buffer_host_subc(cmd), NVC86F_SEM_ADDR_LO);
+++   P_NVC86F_SEM_ADDR_LO(p, (uint32_t)addr >> 2);
+++   P_NVC86F_SEM_ADDR_HI(p, addr >> 32);
+++   P_NVC86F_SEM_PAYLOAD_LO(p, count);
+++   P_NVC86F_SEM_PAYLOAD_HI(p, 0);
+++   P_NVC86F_SEM_EXECUTE(p, {
+++      .operation = OPERATION_ACQ_CIRC_GEQ,
+++      .payload_size = PAYLOAD_SIZE_32BIT,
+++   });
+++   P_IMMD(p, NVA0C0, NO_OPERATION, 0);
+++}
+++
+++/* Barrier after counted launches only (nothing else recorded since the
+++ * last wait): the counter wait replaces the compute idle and the
+++ * shader-data flush; the destination's cache invalidates follow from
+++ * nvk_cmd_invalidate_deps() (texture data and global data for a transfer
+++ * read, the same two invalidates the proprietary driver issues there).
+++ */
+++static bool
+++nvk_cmd_counter_barrier(struct nvk_cmd_buffer *cmd)
+++{
+++   uint64_t addr;
+++   uint32_t count;
+++   if (cmd->cntr.pending == 0 || cmd->cntr.other_work ||
+++       cmd->push.end != cmd->cntr.mark ||
+++       !nvk_cmd_counter_target(cmd, &addr, &count))
+++      return false;
+++
+++   nvk_cmd_counter_wait(cmd, addr, count);
+++   return true;
+++}
+++
+++static void
+++nvk_cmd_counter_end(struct nvk_cmd_buffer *cmd)
+++{
+++   const struct nvk_physical_device *pdev =
+++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+++   if (nvk_cmd_sked_qmds_tracked(pdev) || !cmd->cntr.started)
+++      return;
+++   nvk_cmd_counter_wait(cmd, cmd->cntr.scratch + 8, cmd->cntr.launches);
+++}
+++
++ static void
++ flush_mem_list(struct nvk_cmd_buffer *cmd, struct list_head *mem_list)
++ {
++@@ -442,6 +590,7 @@
++    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++ 
++    nvk_cmd_cs_join_close(cmd);
+++   nvk_cmd_counter_end(cmd);
++    nvk_cmd_sked_end(cmd);
++    nvk_cmd_buffer_flush_push(cmd, false);
++ 
++@@ -544,8 +693,12 @@
++    if (access & VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
++       barriers |= NVK_BARRIER_FLUSH_SHADER_DATA;
++ 
+++   /* Indirect memory copies are shader writes on a queue without a copy
+++    * engine (nvk_CmdCopyMemoryIndirectKHR), like the compute meta copies.
+++    */
++    if ((access & VK_ACCESS_2_TRANSFER_WRITE_BIT) &&
++-       (stages & VK_PIPELINE_STAGE_2_COPY_BIT))
+++       (stages & (VK_PIPELINE_STAGE_2_COPY_BIT |
+++                  VK_PIPELINE_STAGE_2_COPY_INDIRECT_BIT_KHR)))
++       barriers |= NVK_BARRIER_FLUSH_SHADER_DATA;
++ 
++    if (access & VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT)
++@@ -823,6 +976,14 @@
++    if (!barriers)
++       return;
++ 
+++   if (wait && (barriers & NVK_BARRIER_WFI)) {
+++      if (nvk_cmd_counter_barrier(cmd))
+++         barriers &= ~(NVK_BARRIER_WFI | NVK_BARRIER_FLUSH_SHADER_DATA);
+++      cmd->cntr.pending = 0;
+++      cmd->cntr.other_work = false;
+++      cmd->cntr.waited = true;
+++   }
+++
++    if (barriers & NVK_BARRIER_FLUSH_SHADER_DATA) {
++       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++ 
++@@ -1111,6 +1272,10 @@
++    nvk_cmd_flush_wait_dep(cmd, pDependencyInfo, true);
++    nvk_cmd_image_layout_transition(cmd, pDependencyInfo);
++    nvk_cmd_invalidate_deps(cmd, 1, pDependencyInfo);
+++   if (cmd->cntr.waited) {
+++      cmd->cntr.mark = cmd->push.end;
+++      cmd->cntr.waited = false;
+++   }
++ }
++ 
++ void
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
++@@ -310,6 +310,29 @@
++       bool gpu;
++    } cs_inv;
++ 
+++   /* Launch counter of the copy kernels nvk_CmdCopyMemoryIndirectKHR
+++    * records on a queue without a copy engine (nvk_cmd_counted_launch):
+++    * each launch's QMD RELEASE0 adds 1 to the counter, and a barrier that
+++    * only follows such launches waits for the counter instead of idling the
+++    * compute engine.  On Volta/Turing the counter is `sked`'s.
+++    */
+++   struct {
+++      /** Pool scratch (nvk_cmd_pool.h), kept across resets; 0 = none */
+++      uint64_t scratch;
+++      /** The counter was reset in this recording */
+++      bool started;
+++      /** Counted launches in this recording */
+++      uint32_t launches;
+++      /** Counted launches since the last wait or idle */
+++      uint32_t pending;
+++      /** Something else was recorded since the last wait or idle */
+++      bool other_work;
+++      /** cmd->push.end after the last counted launch, wait or idle */
+++      uint32_t *mark;
+++      /** The barrier being recorded waited (for the counter or for idle) */
+++      bool waited;
+++   } cntr;
+++
++    struct nvk_cmd_state {
++       uint64_t descriptor_buffers[NVK_MAX_SETS];
++       struct nvk_graphics_state gfx;
++@@ -396,6 +419,8 @@
++ bool nvk_compute_sked_cache_shared(const struct nvk_physical_device *pdev);
++ bool nvk_cmd_sked_qmds_tracked(const struct nvk_physical_device *pdev);
++ VkResult nvk_cmd_sked_counter(struct nvk_cmd_buffer *cmd, uint64_t *addr_out);
+++VkResult nvk_cmd_counted_launch(struct nvk_cmd_buffer *cmd,
+++                                uint64_t *addr_out);
++ void nvk_cmd_sked_end(struct nvk_cmd_buffer *cmd);
++ bool nvk_cmd_buffer_compute_has_mme(struct nvk_cmd_buffer *cmd);
++ uint64_t nvk_cmd_cs_invocations_gpu_acc(struct nvk_cmd_buffer *cmd);
++@@ -542,6 +567,8 @@
++    NVK_QMD_LAUNCH_CONDITIONAL,
++    /* Never launched itself (copied by the GPU) */
++    NVK_QMD_TEMPLATE,
+++   /* Launched once and counted on the launch counter (cmd->cntr) */
+++   NVK_QMD_LAUNCH_COUNTED,
++ };
++ 
++ static inline enum nvk_qmd_launch
++@@ -574,6 +601,15 @@
++                              uint32_t groupCountY,
++                              uint32_t groupCountZ);
++ 
+++void nvk_cmd_dispatch_shader_counted(struct nvk_cmd_buffer *cmd,
+++                                     struct nvk_shader *shader,
+++                                     const void *push_data, size_t push_size,
+++                                     uint32_t groupCountX,
+++                                     uint32_t groupCountY,
+++                                     uint32_t groupCountZ);
+++void nvk_cmd_counted_launches_begin(struct nvk_cmd_buffer *cmd);
+++void nvk_cmd_counted_launches_end(struct nvk_cmd_buffer *cmd,
+++                                  uint32_t count);
++ void nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
++                                 struct nvk_shader *shader,
++                                 const void *root,
++--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++@@ -1027,8 +1027,17 @@
++        * every dispatch QMD, ELF 0xaee500 at ELF 0xbdffd6), so the end of
++        * the command buffer can wait for it before invalidating its QMDs.
++        */
++-      if (nvk_cmd_sked_qmds_tracked(pdev)) {
++-         if (launch == NVK_QMD_LAUNCH_ONCE) {
+++      if (launch == NVK_QMD_LAUNCH_COUNTED &&
+++          !nvk_cmd_sked_qmds_tracked(pdev)) {
+++         uint64_t counter_addr;
+++         result = nvk_cmd_counted_launch(cmd, &counter_addr);
+++         if (unlikely(result != VK_SUCCESS))
+++            return result;
+++         nak_qmd_set_release0_add(&pdev->info, qmd, qmd_size_B,
+++                                  counter_addr, 1);
+++      } else if (nvk_cmd_sked_qmds_tracked(pdev)) {
+++         if (launch == NVK_QMD_LAUNCH_ONCE ||
+++             launch == NVK_QMD_LAUNCH_COUNTED) {
++             uint64_t counter_addr;
++             result = nvk_cmd_sked_counter(cmd, &counter_addr);
++             if (unlikely(result != VK_SUCCESS))
++@@ -1180,14 +1189,15 @@
++       nvk_cs_join_launched(cmd);
++ }
++ 
++-void
++-nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
++-                           struct nvk_shader *shader,
++-                           const void *root,
++-                           size_t root_size,
++-                           uint32_t groupCountX,
++-                           uint32_t groupCountY,
++-                           uint32_t groupCountZ)
+++static void
+++nvk_cmd_dispatch_with_root_launch(struct nvk_cmd_buffer *cmd,
+++                                  struct nvk_shader *shader,
+++                                  const void *root,
+++                                  size_t root_size,
+++                                  uint32_t groupCountX,
+++                                  uint32_t groupCountY,
+++                                  uint32_t groupCountZ,
+++                                  enum nvk_qmd_launch launch)
++ {
++    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++ 
++@@ -1201,7 +1211,7 @@
++    VkResult result = nvk_cmd_upload_qmd(cmd, shader, NULL,
++                                         root, root_size,
++                                         group_count, false,
++-                                        NVK_QMD_LAUNCH_ONCE,
+++                                        launch,
++                                         &qmd_addr, NULL, NULL);
++    if (result != VK_SUCCESS) {
++       vk_command_buffer_set_error(&cmd->vk, result);
++@@ -1235,12 +1245,27 @@
++ }
++ 
++ void
++-nvk_cmd_dispatch_shader(struct nvk_cmd_buffer *cmd,
++-                        struct nvk_shader *shader,
++-                        const void *push_data, size_t push_size,
++-                        uint32_t groupCountX,
++-                        uint32_t groupCountY,
++-                        uint32_t groupCountZ)
+++nvk_cmd_dispatch_with_root(struct nvk_cmd_buffer *cmd,
+++                           struct nvk_shader *shader,
+++                           const void *root,
+++                           size_t root_size,
+++                           uint32_t groupCountX,
+++                           uint32_t groupCountY,
+++                           uint32_t groupCountZ)
+++{
+++   nvk_cmd_dispatch_with_root_launch(cmd, shader, root, root_size,
+++                                     groupCountX, groupCountY, groupCountZ,
+++                                     NVK_QMD_LAUNCH_ONCE);
+++}
+++
+++static void
+++nvk_cmd_dispatch_shader_launch(struct nvk_cmd_buffer *cmd,
+++                               struct nvk_shader *shader,
+++                               const void *push_data, size_t push_size,
+++                               uint32_t groupCountX,
+++                               uint32_t groupCountY,
+++                               uint32_t groupCountZ,
+++                               enum nvk_qmd_launch launch)
++ {
++    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++ 
++@@ -1259,8 +1284,39 @@
++       root.printf_buffer_addr = bo->va->addr;
++    }
++ 
++-   nvk_cmd_dispatch_with_root(cmd, shader, &root, sizeof(root),
++-                              groupCountX, groupCountY, groupCountZ);
+++   nvk_cmd_dispatch_with_root_launch(cmd, shader, &root, sizeof(root),
+++                                     groupCountX, groupCountY, groupCountZ,
+++                                     launch);
+++}
+++
+++void
+++nvk_cmd_dispatch_shader(struct nvk_cmd_buffer *cmd,
+++                        struct nvk_shader *shader,
+++                        const void *push_data, size_t push_size,
+++                        uint32_t groupCountX,
+++                        uint32_t groupCountY,
+++                        uint32_t groupCountZ)
+++{
+++   nvk_cmd_dispatch_shader_launch(cmd, shader, push_data, push_size,
+++                                  groupCountX, groupCountY, groupCountZ,
+++                                  NVK_QMD_LAUNCH_ONCE);
+++}
+++
+++/* An internal launch whose completion the launch counter records
+++ * (nvk_cmd_counted_launch).  Callers bracket a run of them with
+++ * nvk_cmd_counted_launches_begin()/_end().
+++ */
+++void
+++nvk_cmd_dispatch_shader_counted(struct nvk_cmd_buffer *cmd,
+++                                struct nvk_shader *shader,
+++                                const void *push_data, size_t push_size,
+++                                uint32_t groupCountX,
+++                                uint32_t groupCountY,
+++                                uint32_t groupCountZ)
+++{
+++   nvk_cmd_dispatch_shader_launch(cmd, shader, push_data, push_size,
+++                                  groupCountX, groupCountY, groupCountZ,
+++                                  NVK_QMD_LAUNCH_COUNTED);
++ }
++ 
++ static void
++--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
+++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
++@@ -1415,6 +1415,134 @@
++    return VK_SUCCESS;
++ }
++ 
+++/* On a queue without a copy engine (the compute-only family: its channel
+++ * binds the compute class alone) the copy-engine methods the shader above
+++ * writes would reach a subchannel with no object bound, a push-buffer error.
+++ * There every copy command is a compute kernel that reads the command and
+++ * copies the bytes itself, which is how the proprietary driver records the
+++ * command on every queue with compute (libnvidia-eglcore.so 615.78.08:
+++ * E 0xc41a10 checks the queue family's compute bit, E 0xc4d5f0 launches one
+++ * kernel per command with its 8-byte parameter = copyAddressRange.address +
+++ * i * stride; captured on an RTX 5090: an inline-to-memory parameter block
+++ * and one inline-QMD launch of 32x1x1 workgroups of 256x1x1 invocations per
+++ * command, the same grid for 4-byte and whole-buffer copies, no copy-engine
+++ * method on any channel).  Its launches carry no wait between them; each
+++ * releases the command buffer's launch counter and the application's
+++ * barrier after the copy waits for that counter (nvk_cmd_counted_launch).
+++ *
+++ * VkCopyMemoryIndirectCommandKHR addresses and sizes are 4-byte aligned
+++ * (as for VK_NV_copy_memory_indirect, VUIDs 07657..07659), so the kernel
+++ * moves 32-bit words, each invocation striding over the whole grid.
+++ */
+++#define NVK_COPY_INDIRECT_COMPUTE_WG_SIZE 256
+++#define NVK_COPY_INDIRECT_COMPUTE_GROUPS 32
+++
+++struct nvk_copy_indirect_compute_push {
+++   uint64_t cmd;
+++};
+++
+++static nir_shader *
+++build_copy_indirect_compute_shader(void)
+++{
+++   nir_builder build =
+++      nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL,
+++                                     "nvk-meta-copy-indirect-compute");
+++   nir_builder *b = &build;
+++
+++   struct glsl_struct_field push_fields[] = {
+++      { .type = glsl_uint64_t_type(), .name = "cmd", .offset = 0 },
+++   };
+++   const struct glsl_type *push_iface_type =
+++      glsl_interface_type(push_fields, ARRAY_SIZE(push_fields),
+++                          GLSL_INTERFACE_PACKING_STD140,
+++                          false /* row_major */, "push");
+++   nir_variable *push = nir_variable_create(b->shader, nir_var_mem_push_const,
+++                                            push_iface_type, "push");
+++
+++   b->shader->info.workgroup_size[0] = NVK_COPY_INDIRECT_COMPUTE_WG_SIZE;
+++   b->shader->info.workgroup_size[1] = 1;
+++   b->shader->info.workgroup_size[2] = 1;
+++
+++   /* { srcAddress, dstAddress, size }: 64 bits each, 4-byte aligned */
+++   nir_def *cmd_addr = load_struct_var(b, push, 0);
+++   nir_def *addrs = nir_load_global(b, 4, 32, cmd_addr, .align_mul = 4);
+++   nir_def *size = nir_load_global(b, 2, 32, nir_iadd_imm(b, cmd_addr, 16),
+++                                   .align_mul = 4);
+++   nir_def *src = nir_pack_64_2x32(b, nir_channels(b, addrs, 0x3));
+++   nir_def *dst = nir_pack_64_2x32(b, nir_channels(b, addrs, 0xc));
+++   nir_def *words = nir_ushr_imm(b, nir_pack_64_2x32(b, size), 2);
+++
+++   nir_def *id = nir_channel(b, nir_load_global_invocation_id(b, 32), 0);
+++   nir_variable *i = nir_local_variable_create(b->impl, glsl_uint64_t_type(),
+++                                               "i");
+++   nir_store_var(b, i, nir_u2u64(b, id), 0x1);
+++
+++   nir_push_loop(b);
+++   {
+++      nir_def *w = nir_load_var(b, i);
+++      nir_break_if(b, nir_uge(b, w, words));
+++
+++      nir_def *offset = nir_ishl_imm(b, w, 2);
+++      nir_def *data = nir_load_global(b, 1, 32, nir_iadd(b, src, offset),
+++                                      .align_mul = 4);
+++      nir_store_global(b, data, nir_iadd(b, dst, offset), .align_mul = 4);
+++
+++      nir_store_var(b, i,
+++                    nir_iadd_imm(b, w, NVK_COPY_INDIRECT_COMPUTE_GROUPS *
+++                                       NVK_COPY_INDIRECT_COMPUTE_WG_SIZE),
+++                    0x1);
+++   }
+++   nir_pop_loop(b, NULL);
+++
+++   return build.shader;
+++}
+++
+++static VkResult
+++get_copy_indirect_compute_shader(struct nvk_device *dev,
+++                                 struct nvk_shader **shader_out)
+++{
+++   struct nvk_shader *shader = p_atomic_read(&dev->copy_indirect_compute);
+++   if (shader != NULL) {
+++      *shader_out = shader;
+++      return VK_SUCCESS;
+++   }
+++
+++   nir_shader *nir = build_copy_indirect_compute_shader();
+++   VkResult result = nvk_compile_nir_shader(dev, nir, &dev->vk.alloc, &shader);
+++   if (result != VK_SUCCESS)
+++      return result;
+++
+++   *shader_out = atomic_set_or_destroy_shader(dev, &dev->copy_indirect_compute,
+++                                              shader, &dev->vk.alloc);
+++
+++   return VK_SUCCESS;
+++}
+++
+++static void
+++nvk_cmd_copy_memory_indirect_compute(struct nvk_cmd_buffer *cmd,
+++                                     const VkCopyMemoryIndirectInfoKHR *info)
+++{
+++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+++
+++   struct nvk_shader *shader;
+++   VkResult result = get_copy_indirect_compute_shader(dev, &shader);
+++   if (result != VK_SUCCESS) {
+++      vk_command_buffer_set_error(&cmd->vk, result);
+++      return;
+++   }
+++
+++   nvk_cmd_counted_launches_begin(cmd);
+++   for (uint32_t i = 0; i < info->copyCount; i++) {
+++      const struct nvk_copy_indirect_compute_push push = {
+++         .cmd = info->copyAddressRange.address +
+++                (uint64_t)i * info->copyAddressRange.stride,
+++      };
+++      nvk_cmd_dispatch_shader_counted(cmd, shader, &push, sizeof(push),
+++                                      NVK_COPY_INDIRECT_COMPUTE_GROUPS, 1, 1);
+++   }
+++   nvk_cmd_counted_launches_end(cmd, info->copyCount);
+++}
+++
++ VKAPI_ATTR void VKAPI_CALL
++ nvk_CmdCopyMemoryIndirectKHR(VkCommandBuffer commandBuffer,
++                              const VkCopyMemoryIndirectInfoKHR* info)
++@@ -1433,6 +1561,12 @@
++    if (info->copyCount == 0)
++       return;
++ 
+++   if (!(nvk_queue_engines_from_queue_flags(nvk_cmd_buffer_queue_flags(cmd)) &
+++         NVKMD_ENGINE_COPY)) {
+++      nvk_cmd_copy_memory_indirect_compute(cmd, info);
+++      return;
+++   }
+++
++    struct nvk_shader *shader;
++    result = get_copy_indirect_shader(dev, &shader);
++    if (result != VK_SUCCESS) {
++--- a/src/nouveau/vulkan/nvk_cmd_pool.c
+++++ b/src/nouveau/vulkan/nvk_cmd_pool.c
++@@ -101,6 +101,10 @@
++    list_inithead(&pool->free_mem);
++    list_inithead(&pool->free_gart_mem);
++    list_inithead(&pool->free_qmd);
+++   pool->gpu.pieces = UTIL_DYNARRAY_INIT;
+++   pool->gpu.cursor = 0;
+++   pool->gpu.left_B = 0;
+++   pool->gpu.free_scratch = UTIL_DYNARRAY_INIT;
++ 
++    *pCmdPool = nvk_cmd_pool_to_handle(pool);
++ 
++@@ -209,9 +213,47 @@
++ 
++    vk_command_pool_finish(&pool->vk);
++    nvk_cmd_pool_destroy_mem(pool);
+++   util_dynarray_foreach(&pool->gpu.pieces, uint64_t, va)
+++      nvk_device_gpu_pool_return_piece(device, *va);
+++   util_dynarray_fini(&pool->gpu.pieces);
+++   util_dynarray_fini(&pool->gpu.free_scratch);
++    vk_free2(&device->vk.alloc, pAllocator, pool);
++ }
++ 
+++/* A command buffer keeps its scratch across resets and re-recording (the
+++ * proprietary driver's counter address of a re-recorded command buffer is
+++ * the one it had); scratch of a freed command buffer is reused first.
+++ */
+++VkResult
+++nvk_cmd_pool_alloc_counter_scratch(struct nvk_cmd_pool *pool,
+++                                   uint64_t *va_out)
+++{
+++   if (util_dynarray_num_elements(&pool->gpu.free_scratch, uint64_t) > 0) {
+++      *va_out = util_dynarray_pop(&pool->gpu.free_scratch, uint64_t);
+++      return VK_SUCCESS;
+++   }
+++   if (pool->gpu.left_B < NVK_CMD_COUNTER_SCRATCH_SIZE) {
+++      uint64_t piece;
+++      VkResult result =
+++         nvk_device_gpu_pool_take_piece(nvk_cmd_pool_device(pool), &piece);
+++      if (result != VK_SUCCESS)
+++         return result;
+++      util_dynarray_append(&pool->gpu.pieces, piece);
+++      pool->gpu.cursor = piece;
+++      pool->gpu.left_B = NVK_GPU_POOL_PIECE_SIZE;
+++   }
+++   *va_out = pool->gpu.cursor;
+++   pool->gpu.cursor += NVK_CMD_COUNTER_SCRATCH_SIZE;
+++   pool->gpu.left_B -= NVK_CMD_COUNTER_SCRATCH_SIZE;
+++   return VK_SUCCESS;
+++}
+++
+++void
+++nvk_cmd_pool_free_counter_scratch(struct nvk_cmd_pool *pool, uint64_t va)
+++{
+++   util_dynarray_append(&pool->gpu.free_scratch, va);
+++}
+++
++ VKAPI_ATTR void VKAPI_CALL
++ nvk_TrimCommandPool(VkDevice device,
++                     VkCommandPool commandPool,
++--- a/src/nouveau/vulkan/nvk_cmd_pool.h
+++++ b/src/nouveau/vulkan/nvk_cmd_pool.h
++@@ -8,6 +8,7 @@
++ #include "nvk_private.h"
++ 
++ #include "vk_command_pool.h"
+++#include "util/u_dynarray.h"
++ 
++ #define NVK_CMD_MEM_SIZE 64*1024
++ 
++@@ -38,8 +39,28 @@
++    struct list_head free_mem;
++    struct list_head free_gart_mem;
++    struct list_head free_qmd;
+++
+++   /* Launch-counter scratch (0x100 bytes per command buffer) carved
+++    * linearly from 64 KiB pieces of the device's GPU-internal pool
+++    * (nvk_device.h); the pieces go back to the device with the pool.
+++    */
+++   struct {
+++      /** Array of uint64_t: GPU VAs of the pieces this pool took */
+++      struct util_dynarray pieces;
+++      uint64_t cursor;
+++      uint32_t left_B;
+++      /** Array of uint64_t: scratch freed by destroyed command buffers */
+++      struct util_dynarray free_scratch;
+++   } gpu;
++ };
++ 
+++#define NVK_CMD_COUNTER_SCRATCH_SIZE 0x100u
+++
+++VkResult nvk_cmd_pool_alloc_counter_scratch(struct nvk_cmd_pool *pool,
+++                                            uint64_t *va_out);
+++void nvk_cmd_pool_free_counter_scratch(struct nvk_cmd_pool *pool,
+++                                       uint64_t va);
+++
++ VK_DEFINE_NONDISP_HANDLE_CASTS(nvk_cmd_pool, vk.base, VkCommandPool,
++                                VK_OBJECT_TYPE_COMMAND_POOL)
++ 
++--- a/src/nouveau/vulkan/nvk_device.c
+++++ b/src/nouveau/vulkan/nvk_device.c
++@@ -13,6 +13,8 @@
++ #include "layers/nvk_app_workarounds.h"
++ #include "nvkmd/nvkmd.h"
++ 
+++#include "clc6c0.h"
+++
++ #include "vk_common_entrypoints.h"
++ #include "vk_drm_syncobj.h"
++ #include "vk_pipeline_cache.h"
++@@ -224,6 +226,80 @@
++    add_entrypoints(&b, &vk_common_device_entrypoints, NVK_DISPATCH_TABLE_COUNT);
++ }
++ 
+++/* The proprietary driver keeps its command buffers' QMDs, kernel parameter
+++ * blocks and launch counters in device memory the GPU alone uses: 2 MiB
+++ * blocks of one contiguous huge page, allocated when the device is created
+++ * and one more whenever they are full, never freed before the device (as
+++ * measured with libnvidia-eglcore.so 615.78.08 on an RTX 5090: the blocks
+++ * are handed out to command pools in 64 KiB pieces, top of the block
+++ * first).  Here the pool holds the launch counters of the copy kernels that
+++ * vkCmdCopyMemoryIndirectKHR records on a queue without a copy engine.
+++ */
+++bool
+++nvk_device_has_gpu_pool(const struct nvk_device *dev)
+++{
+++   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+++   if (pdev->info.cls_compute < AMPERE_COMPUTE_A)
+++      return false;
+++   for (uint8_t i = 0; i < pdev->queue_family_count; i++) {
+++      const VkQueueFlags flags = pdev->queue_families[i].queue_flags;
+++      if ((flags & VK_QUEUE_COMPUTE_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT))
+++         return true;
+++   }
+++   return false;
+++}
+++
+++static VkResult
+++nvk_device_gpu_pool_grow_locked(struct nvk_device *dev)
+++{
+++   struct nvkmd_mem *mem;
+++   VkResult result = nvkmd_dev_alloc_mem(dev->nvkmd, &dev->vk.base,
+++                                         NVKMD_POOL_BLOCK_SIZE,
+++                                         NVKMD_POOL_BLOCK_SIZE,
+++                                         NVKMD_MEM_LOCAL | NVKMD_MEM_POOL_BLOCK,
+++                                         &mem);
+++   if (result != VK_SUCCESS)
+++      return result;
+++
+++   util_dynarray_append(&dev->gpu_pool.blocks, mem);
+++   /* Pieces leave from the end of the array: the block's top piece first */
+++   for (uint64_t off = 0; off < NVKMD_POOL_BLOCK_SIZE;
+++        off += NVK_GPU_POOL_PIECE_SIZE)
+++      util_dynarray_append(&dev->gpu_pool.free_pieces, mem->va->addr + off);
+++   return VK_SUCCESS;
+++}
+++
+++VkResult
+++nvk_device_gpu_pool_take_piece(struct nvk_device *dev, uint64_t *va_out)
+++{
+++   VkResult result = VK_SUCCESS;
+++   simple_mtx_lock(&dev->gpu_pool.mutex);
+++   if (util_dynarray_num_elements(&dev->gpu_pool.free_pieces, uint64_t) == 0)
+++      result = nvk_device_gpu_pool_grow_locked(dev);
+++   if (result == VK_SUCCESS)
+++      *va_out = util_dynarray_pop(&dev->gpu_pool.free_pieces, uint64_t);
+++   simple_mtx_unlock(&dev->gpu_pool.mutex);
+++   return result;
+++}
+++
+++void
+++nvk_device_gpu_pool_return_piece(struct nvk_device *dev, uint64_t va)
+++{
+++   simple_mtx_lock(&dev->gpu_pool.mutex);
+++   util_dynarray_append(&dev->gpu_pool.free_pieces, va);
+++   simple_mtx_unlock(&dev->gpu_pool.mutex);
+++}
+++
+++static void
+++nvk_device_gpu_pool_finish(struct nvk_device *dev)
+++{
+++   util_dynarray_foreach(&dev->gpu_pool.blocks, struct nvkmd_mem *, mem)
+++      nvkmd_mem_unref(*mem);
+++   util_dynarray_fini(&dev->gpu_pool.blocks);
+++   util_dynarray_fini(&dev->gpu_pool.free_pieces);
+++   simple_mtx_destroy(&dev->gpu_pool.mutex);
+++}
+++
++ VKAPI_ATTR VkResult VKAPI_CALL
++ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
++                  const VkDeviceCreateInfo *pCreateInfo,
++@@ -441,6 +517,17 @@
++          goto fail_mem_cache;
++    }
++ 
+++   simple_mtx_init(&dev->gpu_pool.mutex, mtx_plain);
+++   dev->gpu_pool.blocks = UTIL_DYNARRAY_INIT;
+++   dev->gpu_pool.free_pieces = UTIL_DYNARRAY_INIT;
+++   if (nvk_device_has_gpu_pool(dev)) {
+++      result = nvk_device_gpu_pool_grow_locked(dev);
+++      if (result != VK_SUCCESS) {
+++         nvk_device_gpu_pool_finish(dev);
+++         goto fail_mem_cache;
+++      }
+++   }
+++
++    *pDevice = nvk_device_to_handle(dev);
++ 
++    return VK_SUCCESS;
++@@ -498,10 +585,17 @@
++       vk_shader_destroy(&dev->vk, &dev->copy_queries->vk, &dev->vk.alloc);
++    if (dev->cs_invocations)
++       vk_shader_destroy(&dev->vk, &dev->cs_invocations->vk, &dev->vk.alloc);
+++   if (dev->copy_indirect)
+++      vk_shader_destroy(&dev->vk, &dev->copy_indirect->vk, &dev->vk.alloc);
+++   if (dev->copy_indirect_compute)
+++      vk_shader_destroy(&dev->vk, &dev->copy_indirect_compute->vk,
+++                        &dev->vk.alloc);
++ 
++    if (dev->nvkmd)
++       nvk_device_finish_meta(dev);
++ 
+++   nvk_device_gpu_pool_finish(dev);
+++
++    vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
++ 
++    vk_foreach_queue_safe(iter, &dev->vk) {
++--- a/src/nouveau/vulkan/nvk_device.h
+++++ b/src/nouveau/vulkan/nvk_device.h
++@@ -11,6 +11,8 @@
++ #include "nvk_descriptor_table.h"
++ #include "nvk_heap.h"
++ #include "nvk_queue.h"
+++#include "util/simple_mtx.h"
+++#include "util/u_dynarray.h"
++ #include "nvk_upload_queue.h"
++ #include "vk_device.h"
++ #include "vk_meta.h"
++@@ -75,8 +77,28 @@
++    struct nvk_shader *copy_queries;
++    struct nvk_shader *cs_invocations;
++    struct nvk_shader *copy_indirect;
+++   struct nvk_shader *copy_indirect_compute;
+++
+++   /* GPU-internal pool (nvk_device_gpu_pool_*): NVKMD_MEM_POOL_BLOCK blocks
+++    * cut into 64 KiB pieces that command pools carve their command buffers'
+++    * launch-counter scratch from.
+++    */
+++   struct {
+++      simple_mtx_t mutex;
+++      /** Array of struct nvkmd_mem * */
+++      struct util_dynarray blocks;
+++      /** Array of uint64_t: GPU VAs of free 64 KiB pieces */
+++      struct util_dynarray free_pieces;
+++   } gpu_pool;
++ };
++ 
+++#define NVK_GPU_POOL_PIECE_SIZE (64u * 1024u)
+++
+++bool nvk_device_has_gpu_pool(const struct nvk_device *dev);
+++VkResult nvk_device_gpu_pool_take_piece(struct nvk_device *dev,
+++                                        uint64_t *va_out);
+++void nvk_device_gpu_pool_return_piece(struct nvk_device *dev, uint64_t va);
+++
++ VK_DEFINE_HANDLE_CASTS(nvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
++ 
++ VkResult nvk_device_ensure_slm(struct nvk_device *dev,
++--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
+++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
++@@ -56,8 +56,16 @@
++ 
++    /** This memory object has coherent CPU maps */
++    NVKMD_MEM_COHERENT   = 1 << 5,
+++
+++   /** A GPU-internal pool block: NVKMD_POOL_BLOCK_SIZE bytes of VRAM in one
+++    * physically contiguous huge page, GPU-cached, uncompressed, never mapped
+++    * or shared (backends that offer it only).
+++    */
+++   NVKMD_MEM_POOL_BLOCK = 1 << 6,
++ };
++ 
+++#define NVKMD_POOL_BLOCK_SIZE (UINT64_C(2) << 20)
+++
++ #define NVKMD_MEM_PLACEMENT_FLAGS \
++    (NVKMD_MEM_LOCAL | NVKMD_MEM_GART | NVKMD_MEM_VRAM)
++ 
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c b/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c
+index 0af610d..95dca56 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c
++++ b/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c
+@@ -780,6 +780,22 @@ rm_mem_alloc_kind(struct nvkmd_dev* base,
+       return vk_error(log, VK_ERROR_OUT_OF_HOST_MEMORY);
+    uint32_t placement =
+      (flags & NVKMD_MEM_GART) ? NV_RM_PLACEMENT_GART : NV_RM_PLACEMENT_VRAM;
++   /* A GPU-internal pool block (nvk_pool_mem.c): one 2 MiB contiguous huge
++    * page of device memory, never mapped or shared (NV_RM_PLACEMENT_VRAM_POOL_
++    * BLOCK in nv_rm.h), bound whole at a 2 MiB aligned VA. */
++   const bool pool_block = flags & NVKMD_MEM_POOL_BLOCK;
++   if (pool_block) {
++      if (size != NVKMD_POOL_BLOCK_SIZE || kind != 0 ||
++          (flags & (NVKMD_MEM_GART | NVKMD_MEM_CAN_MAP | NVKMD_MEM_SHARED))) {
++         free(mem);
++         return vk_errorf(log, VK_ERROR_UNKNOWN,
++                          "pool block: %" PRIu64 " bytes kind %u flags %#x (needs "
++                          "exactly 2 MiB, kind 0, VRAM, not mappable or shared)",
++                          size, kind, flags);
++      }
++      placement = NV_RM_PLACEMENT_VRAM_POOL_BLOCK;
++      alignment = NVKMD_POOL_BLOCK_SIZE;
++   }
+    /* Device-local memory is allocated in whole 64 KiB big pages, as the stock
+     * driver allocates device-local memory (BIG pages, seen in its RM alloc
+     * requests) and as NVK did itself up to Mesa 25.2
+diff --git a/nvidia-prolapse/driver-source/native/src/gpu.rs b/nvidia-prolapse/driver-source/native/src/gpu.rs
+index 13ae327..21a44c3 100644
+--- a/nvidia-prolapse/driver-source/native/src/gpu.rs
++++ b/nvidia-prolapse/driver-source/native/src/gpu.rs
+@@ -249,14 +249,18 @@ fn mapping_plan(
+         allocation_size,
+         address,
+         kind,
+-        false,
++        crate::rm::PhysicalPages::Small4K,
+         KIND_GENERIC,
+     )
+ }
+ 
+-/// `big_pages`: the physical allocation uses big pages. A mapping whose
+-/// offset, length and fixed VA are all 64 KiB aligned then asks for big PTEs
++/// `pages`: the physical allocation's page size. With big pages a mapping
++/// whose offset, length and fixed VA are all 64 KiB aligned asks for big PTEs
+ /// (stock maps device-local memory with NVOS46 PAGE_SIZE BIG, flags 0x208).
++/// A huge-page pool block maps whole with NVOS46 flags 0 apart from the fixed
++/// offset: PAGE_SIZE DEFAULT (RM maps the 2 MiB page), no CACHE_SNOOP, no
++/// kind, as stock maps its QMD/launch-counter blocks (NV_ESC_RM_MAP_MEMORY_DMA
++/// flags 0).
+ // One argument per independent RM input (layout, placement, kind, page and
+ // architecture facts); a parameter struct would only rename them.
+ #[allow(clippy::too_many_arguments)]
+@@ -267,7 +271,7 @@ fn mapping_plan_paged(
+     allocation_size: u64,
+     address: Option<u64>,
+     kind: Option<u32>,
+-    big_pages: bool,
++    pages: crate::rm::PhysicalPages,
+     generic_kind: u32,
+ ) -> Result<MappingPlan> {
+     if length == 0
+@@ -295,6 +299,24 @@ fn mapping_plan_paged(
+     // RM picks the kind (observed in stock's RM alloc requests).
+     let s8_chooser = generic_kind != KIND_GENERIC && kind == Some(KIND_S8);
+     let typed = kind.is_some() && (!compat.supports_kind_override() || s8_chooser);
++    if pages == crate::rm::PhysicalPages::Huge2M {
++        let block = crate::rm::POOL_BLOCK_SIZE as u64;
++        if kind.is_some()
++            || offset != 0
++            || length != block
++            || address.is_some_and(|a| !a.is_multiple_of(block))
++        {
++            return Err(Error::Contract(
++                "a huge-page pool block maps whole, without a kind, at a 2 MiB aligned VA".into(),
++            ));
++        }
++        return Ok(MappingPlan {
++            typed: None,
++            flags: if address.is_some() { 1 << 15 } else { 0 },
++            wire_kind: 0,
++        });
++    }
++    let big_pages = pages == crate::rm::PhysicalPages::Big64K;
+     let big = big_pages
+         && offset.is_multiple_of(BIG_PAGE)
+         && length.is_multiple_of(BIG_PAGE)
+@@ -382,7 +404,13 @@ impl AddressSpace {
+         address: Option<u64>,
+         kind: u32,
+     ) -> Result<GpuMapping> {
+-        self.map_internal(memory, offset, length, address, Some(kind))
++        // A pool block maps without a kind; nvkmd's kind 0 means "none".
++        let kind = if memory.pages == crate::rm::PhysicalPages::Huge2M && kind == 0 {
++            None
++        } else {
++            Some(kind)
++        };
++        self.map_internal(memory, offset, length, address, kind)
+     }
+     fn map_internal(
+         &self,
+@@ -418,7 +446,7 @@ impl AddressSpace {
+             memory.size as u64,
+             address,
+             kind,
+-            memory.big_pages,
++            memory.pages,
+             generic_kind,
+         )?;
+         if !Rc::ptr_eq(&self.device, &memory.device) {
+@@ -2385,7 +2413,7 @@ mod compression_tests {
+                 1 << 24,
+                 Some(1 << 34),
+                 kind,
+-                false,
++                crate::rm::PhysicalPages::Small4K,
+                 generic,
+             )
+             .unwrap()
+@@ -2458,7 +2486,7 @@ mod compression_tests {
+             1 << 24,
+             Some(1 << 34),
+             Some(0x11),
+-            false,
++            crate::rm::PhysicalPages::Small4K,
+             G,
+         )
+         .unwrap();
+@@ -2478,7 +2506,7 @@ mod compression_tests {
+                 1 << 24,
+                 Some(1 << 34),
+                 Some(kind),
+-                false,
++                crate::rm::PhysicalPages::Small4K,
+                 generic,
+             )
+             .unwrap()
+@@ -2606,7 +2634,7 @@ mod compression_tests {
+                 1 << 24,
+                 Some(address),
+                 Some(6),
+-                true,
++                crate::rm::PhysicalPages::Big64K,
+                 KIND_GENERIC,
+             )
+             .unwrap()
+@@ -2624,7 +2652,7 @@ mod compression_tests {
+             1 << 24,
+             Some(1 << 34),
+             Some(6),
+-            false,
++            crate::rm::PhysicalPages::Small4K,
+             KIND_GENERIC,
+         )
+         .unwrap();
+@@ -2636,7 +2664,7 @@ mod compression_tests {
+             1 << 24,
+             Some(1 << 34),
+             Some(8),
+-            true,
++            crate::rm::PhysicalPages::Big64K,
+             KIND_GENERIC
+         )
+         .is_err());
+diff --git a/nvidia-prolapse/driver-source/native/src/mesa.rs b/nvidia-prolapse/driver-source/native/src/mesa.rs
+index 66f1552..8983e69 100644
+--- a/nvidia-prolapse/driver-source/native/src/mesa.rs
++++ b/nvidia-prolapse/driver-source/native/src/mesa.rs
+@@ -1861,8 +1861,30 @@ pub unsafe extern "C" fn nv_rm_close(p: *mut Bridge) {
+         }
+     }
+ }
+-/// nv_rm.h NV_RM_PLACEMENT_VRAM_COMPRESSIBLE.
+-const PLACEMENT_VRAM_COMPRESSIBLE: u32 = 2;
++/// nv_rm.h NV_RM_PLACEMENT_*.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Placement {
++    /// NV_RM_PLACEMENT_VRAM
++    Vram,
++    /// NV_RM_PLACEMENT_GART
++    Gart,
++    /// NV_RM_PLACEMENT_VRAM_COMPRESSIBLE
++    VramCompressible,
++    /// NV_RM_PLACEMENT_VRAM_POOL_BLOCK
++    VramPoolBlock,
++}
++impl TryFrom<u32> for Placement {
++    type Error = Error;
++    fn try_from(v: u32) -> Result<Self> {
++        match v {
++            0 => Ok(Self::Vram),
++            1 => Ok(Self::Gart),
++            2 => Ok(Self::VramCompressible),
++            3 => Ok(Self::VramPoolBlock),
++            _ => Err(Error::Contract(format!("unknown memory placement {v}"))),
++        }
++    }
++}
+ #[no_mangle]
+ pub unsafe extern "C" fn nv_rm_alloc(
+     p: *mut Bridge,
+@@ -1884,12 +1906,16 @@ pub unsafe extern "C" fn nv_rm_alloc(
+             // no RM memory attribute: the block height travels in the DRM
+             // modifier. A kind is only meaningful for an uncompressed
+             // block-linear VRAM/GART allocation (Device::allocate_block_linear).
+-            if placement > PLACEMENT_VRAM_COMPRESSIBLE
+-                || tile != 0
+-                || (kind != 0 && placement == PLACEMENT_VRAM_COMPRESSIBLE)
++            let placement = Placement::try_from(placement)?;
++            if tile != 0
++                || (kind != 0
++                    && matches!(
++                        placement,
++                        Placement::VramCompressible | Placement::VramPoolBlock
++                    ))
+             {
+                 return Err(Error::Contract(
+-                    "unsupported memory placement/tiled allocation (tile mode, or a kind on compressible memory)".into(),
++                    "unsupported memory placement/tiled allocation (tile mode, or a kind on compressible or pool-block memory)".into(),
+                 ));
+             }
+             let mut guard = b.lock();
+@@ -1900,14 +1926,29 @@ pub unsafe extern "C" fn nv_rm_alloc(
+                 .map_err(|_| Error::Contract("memory size overflow".into()))?;
+             let alignment = usize::try_from(alignment.max(4096))
+                 .map_err(|_| Error::Contract("memory alignment overflow".into()))?;
+-            let memory = if placement == PLACEMENT_VRAM_COMPRESSIBLE {
+-                s.device.allocate_compressible(size, alignment)?
+-            } else if kind != 0 {
+-                s.device
+-                    .allocate_block_linear(size, alignment, placement == 1, kind)?
+-            } else {
+-                s.device
+-                    .allocate_aligned(size, alignment, false, placement == 1)?
++            let memory = match placement {
++                Placement::VramCompressible => s.device.allocate_compressible(size, alignment)?,
++                Placement::VramPoolBlock => {
++                    if size != crate::rm::POOL_BLOCK_SIZE {
++                        return Err(Error::Contract(format!(
++                            "a pool block is {:#x} bytes, not {size:#x}",
++                            crate::rm::POOL_BLOCK_SIZE
++                        )));
++                    }
++                    s.device.allocate_pool_block()?
++                }
++                Placement::Vram | Placement::Gart if kind != 0 => s.device.allocate_block_linear(
++                    size,
++                    alignment,
++                    placement == Placement::Gart,
++                    kind,
++                )?,
++                Placement::Vram | Placement::Gart => s.device.allocate_aligned(
++                    size,
++                    alignment,
++                    false,
++                    placement == Placement::Gart,
++                )?,
+             };
+             let id = next_id(s)?;
+             let a = Allocation {
+diff --git a/nvidia-prolapse/driver-source/native/src/rm.rs b/nvidia-prolapse/driver-source/native/src/rm.rs
+index 15d2fbf..d9d9101 100644
+--- a/nvidia-prolapse/driver-source/native/src/rm.rs
++++ b/nvidia-prolapse/driver-source/native/src/rm.rs
+@@ -563,6 +563,67 @@ impl Device {
+             None,
+         )
+     }
++    /// One GPU-internal pool block (see [`pool_block`]): 2 MiB of device
++    /// memory in one contiguous huge page, GPU-cached, uncompressed, never
++    /// CPU-mapped or exported. Fails when RM grants other page size,
++    /// location, physicality or compression than requested.
++    pub(crate) fn allocate_pool_block(self: &Rc<Self>) -> Result<Rc<Memory>> {
++        self.allocate_pool_block_granted().map(|(memory, _)| memory)
++    }
++    /// [`Self::allocate_pool_block`] plus what RM returned for it.
++    pub(crate) fn allocate_pool_block_granted(
++        self: &Rc<Self>,
++    ) -> Result<(Rc<Memory>, PoolBlockGrant)> {
++        let generic_kind = self.generic_kind()?;
++        let size = POOL_BLOCK_SIZE as u64;
++        let mut parameters = abi::MemoryAlloc {
++            owner: self.client.root,
++            memory_type: 0,
++            flags: pool_block::FLAGS,
++            attr: pool_block::ATTR,
++            attr2: pool_block::ATTR2,
++            format: generic_kind,
++            size,
++            alignment: 0,
++            limit: size - 1,
++            ..Default::default()
++        };
++        let handle = self.client.allocate(self.handle, 0x40, &mut parameters)?;
++        let granted = parameters.attr & pool_block::ATTR_CHECKED;
++        if granted != pool_block::ATTR & pool_block::ATTR_CHECKED || parameters.size != size {
++            let status = self.client.free(self.handle, handle);
++            return Err(Error::Contract(format!(
++                "RM granted pool block attr {:#010x} size {:#x} (requested attr {:#010x}: VIDMEM, \
++                 CONTIGUOUS, PAGE_SIZE HUGE, COMPR NONE, size {size:#x}){}",
++                parameters.attr,
++                parameters.size,
++                pool_block::ATTR,
++                match status {
++                    Ok(()) => String::new(),
++                    Err(e) => format!("; freeing it failed too: {e}"),
++                }
++            )));
++        }
++        let grant = PoolBlockGrant {
++            attr: parameters.attr,
++            attr2: parameters.attr2,
++            format: parameters.format,
++            size: parameters.size,
++        };
++        let memory = Rc::new(Memory {
++            device: Rc::clone(self),
++            handle,
++            parent: self.handle,
++            size: POOL_BLOCK_SIZE,
++            system: false,
++            owned: true,
++            charge_bar: false,
++            _mapping_owner: None,
++            compressed: false,
++            pages: PhysicalPages::Huge2M,
++        });
++        Ok((memory, grant))
++    }
+     fn allocate_placed(
+         self: &Rc<Self>,
+         requested_size: usize,
+@@ -655,12 +716,55 @@ impl Device {
+             charge_bar: !system,
+             _mapping_owner: None,
+             compressed: compressible && compression_granted(parameters.attr),
+-            big_pages: compressible,
++            pages: if compressible {
++                PhysicalPages::Big64K
++            } else {
++                PhysicalPages::Small4K
++            },
+         }))
+     }
+ }
+ /// RM big page size used for compressible memory and big-page mappings.
+ pub(crate) const BIG_PAGE: usize = 1 << 16;
++/// Page size of a physical allocation.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum PhysicalPages {
++    /// RM's default (4 KiB) pages.
++    Small4K,
++    /// 64 KiB big pages (compressible device-local memory).
++    Big64K,
++    /// 2 MiB huge pages, physically contiguous (a GPU-internal pool block).
++    Huge2M,
++}
++/// The NVOS32 fields RM returns for a pool-block request.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct PoolBlockGrant {
++    pub(crate) attr: u32,
++    pub(crate) attr2: u32,
++    pub(crate) format: u32,
++    pub(crate) size: u64,
++}
++/// Size of one GPU-internal pool block (one 2 MiB huge page).
++pub const POOL_BLOCK_SIZE: usize = 2 << 20;
++/// NVOS32 request of a GPU-internal pool block, field by field from public
++/// nvos.h; these are the values the proprietary driver (615.78.08) sends for
++/// the device memory that holds its command buffers' QMDs, kernel parameter
++/// blocks and launch counters (NV_ESC_RM_VID_HEAP_CONTROL ALLOC_SIZE: flags
++/// 0xc00d, attr 0x11800000, attr2 0x100005, format = the generic kind, size
++/// 2 MiB, alignment 0), which it maps once and never CPU-maps.
++pub(crate) mod pool_block {
++    /// IGNORE_BANK_PLACEMENT | FORCE_MEM_GROWS_DOWN | FORCE_ALIGN_HOST_PAGE |
++    /// MEMORY_HANDLE_PROVIDED | MAP_NOT_REQUIRED.
++    pub(crate) const FLAGS: u32 = 0x1 | 0x4 | 0x8 | 0x4000 | 0x8000;
++    /// PAGE_SIZE (24:23) HUGE, PHYSICALITY (28:27) CONTIGUOUS; LOCATION VIDMEM,
++    /// COHERENCY UNCACHED, COMPR NONE and FORMAT PITCH are the zero values.
++    pub(crate) const ATTR: u32 = (3 << 23) | (2 << 27);
++    /// ZBC (1:0) PREFER_NO_ZBC, GPU_CACHEABLE (3:2) YES, PAGE_SIZE_HUGE
++    /// (21:20) 2MB.
++    pub(crate) const ATTR2: u32 = 1 | (1 << 2) | (1 << 20);
++    /// The granted attr must keep these fields as requested.
++    pub(crate) const ATTR_CHECKED: u32 = (3 << 23) | (3 << 25) | (3 << 27) | (3 << 12);
++}
+ const NONCONTIG_FROM: usize = 16 << 20;
+ /// NVOS32 attr for a compressible device-local request (nvos.h fields:
+ /// COMPR 13:12 = ANY, PAGE_SIZE 24:23 = BIG, PHYSICALITY 28:27 = NONCONTIGUOUS
+@@ -714,7 +818,7 @@ impl Device {
+             charge_bar: false,
+             _mapping_owner: None,
+             compressed: false,
+-            big_pages: false,
++            pages: PhysicalPages::Small4K,
+         })
+         .map()
+     }
+@@ -740,7 +844,7 @@ impl Device {
+             charge_bar: true,
+             _mapping_owner: Some(owner),
+             compressed: false,
+-            big_pages: false,
++            pages: PhysicalPages::Small4K,
+         })
+         .map()
+     }
+@@ -770,8 +874,9 @@ pub struct Memory {
+     /// RM granted compression (NVOS32 attr COMPR != NONE on return) for an
+     /// allocation that asked for it; only then may a VA carry a compressible kind.
+     pub(crate) compressed: bool,
+-    /// Physical pages are big (64 KiB): aligned VA ranges may map with big PTEs.
+-    pub(crate) big_pages: bool,
++    /// Physical page size: with big (64 KiB) pages aligned VA ranges may map
++    /// with big PTEs; a huge-page pool block maps at RM's default page size.
++    pub(crate) pages: PhysicalPages,
+ }
+ impl Memory {
+     /// Adopt the owned handle returned by RM object import. Import duplicates
+@@ -793,10 +898,15 @@ impl Memory {
+             charge_bar: !system,
+             _mapping_owner: None,
+             compressed: false,
+-            big_pages: false,
++            pages: PhysicalPages::Small4K,
+         })
+     }
+     pub fn map(self: &Rc<Self>) -> Result<Mapping> {
++        if self.pages == PhysicalPages::Huge2M {
++            return Err(Error::Contract(
++                "a GPU-internal pool block is never CPU-mapped".into(),
++            ));
++        }
+         loop {
+             if self.device.cpu_mapping_failed() {
+                 return Err(Error::DeviceLost(
+@@ -1948,3 +2058,79 @@ GCC version: gcc 15.2.1"
+         assert_eq!(huge.used.get(), u64::MAX);
+     }
+ }
++
++#[cfg(test)]
++mod pool_block_tests {
++    use super::*;
++    fn field(v: u32, hi: u32, lo: u32) -> u32 {
++        (v >> lo) & (u32::MAX >> (31 - (hi - lo)))
++    }
++    #[test]
++    #[ignore = "local NVIDIA GPU: one GPU-internal pool block; RM grants the requested NVOS32 attributes"]
++    fn pool_block_has_the_requested_attributes() {
++        let client = Client::open().unwrap();
++        let card = client.cards().unwrap().into_iter().next().unwrap();
++        let device = client.device(card).unwrap();
++        let (memory, grant) = device.allocate_pool_block_granted().unwrap();
++        assert_eq!(grant.size, POOL_BLOCK_SIZE as u64);
++        assert_eq!(
++            field(grant.attr, 24, 23),
++            3,
++            "PAGE_SIZE HUGE: {:#010x}",
++            grant.attr
++        );
++        assert_eq!(
++            field(grant.attr, 26, 25),
++            0,
++            "LOCATION VIDMEM: {:#010x}",
++            grant.attr
++        );
++        assert_eq!(
++            field(grant.attr, 28, 27),
++            2,
++            "PHYSICALITY CONTIGUOUS: {:#010x}",
++            grant.attr
++        );
++        assert_eq!(
++            field(grant.attr, 13, 12),
++            0,
++            "COMPR NONE: {:#010x}",
++            grant.attr
++        );
++        assert_eq!(
++            field(grant.attr, 31, 29),
++            0,
++            "COHERENCY UNCACHED: {:#010x}",
++            grant.attr
++        );
++        assert_eq!(
++            field(grant.attr2, 3, 2),
++            1,
++            "GPU_CACHEABLE YES: {:#010x}",
++            grant.attr2
++        );
++        assert_eq!(
++            field(grant.attr2, 21, 20),
++            1,
++            "PAGE_SIZE_HUGE 2MB: {:#010x}",
++            grant.attr2
++        );
++        assert_eq!(
++            grant.format,
++            device.generic_kind().unwrap(),
++            "the generic kind"
++        );
++        eprintln!(
++            "pool block granted attr {:#010x} attr2 {:#010x} format {:#x} size {:#x}",
++            grant.attr, grant.attr2, grant.format, grant.size
++        );
++        assert!(memory.map().is_err(), "never CPU-mapped");
++        let space = crate::gpu::AddressSpace::new(&device).unwrap();
++        let gpu = space.map(&memory).unwrap();
++        assert_eq!(
++            gpu.address() % POOL_BLOCK_SIZE as u64,
++            0,
++            "mapped at a 2 MiB VA"
++        );
++    }
++}
+diff --git a/tools/native-vulkan-copy-indirect.c b/tools/native-vulkan-copy-indirect.c
+new file mode 100644
+index 0000000..4bf3d33
+--- /dev/null
++++ b/tools/native-vulkan-copy-indirect.c
+@@ -0,0 +1,300 @@
++/* Independent VK_KHR_copy_memory_indirect diagnostic on a compute-only queue family: each iteration records
++ * vkCmdCopyMemoryIndirectKHR (two commands, source -> destination), a pipeline barrier (transfer write ->
++ * shader read) and a compute dispatch that reads the copied words, then checks every output word. The
++ * dispatch consumes the destination on the GPU right after the barrier, without a host readback in
++ * between. No driver-private ABI. See native-vulkan-shaders/README.md for builds, invocation and scope.
++ *   copy-indirect --driver /absolute/libvulkan.so --transform transform.spv [--iterations N]
++ */
++#define _POSIX_C_SOURCE 200809L
++#define VK_NO_PROTOTYPES
++#include <vulkan/vulkan.h>
++#include <dlfcn.h>
++#include <inttypes.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define INSTANCE_FUNCTIONS(X) \
++ X(DestroyInstance) X(EnumeratePhysicalDevices) X(GetPhysicalDeviceProperties) \
++ X(GetPhysicalDeviceQueueFamilyProperties) X(GetPhysicalDeviceMemoryProperties) \
++ X(GetPhysicalDeviceFeatures2) X(CreateDevice) X(GetDeviceProcAddr)
++#define DEVICE_FUNCTIONS(X) \
++ X(DestroyDevice) X(GetDeviceQueue) X(CreateBuffer) X(DestroyBuffer) \
++ X(GetBufferMemoryRequirements) X(AllocateMemory) X(FreeMemory) X(BindBufferMemory) \
++ X(MapMemory) X(GetBufferDeviceAddress) X(CreateShaderModule) X(DestroyShaderModule) \
++ X(CreateDescriptorSetLayout) X(DestroyDescriptorSetLayout) \
++ X(CreatePipelineLayout) X(DestroyPipelineLayout) X(CreateComputePipelines) X(DestroyPipeline) \
++ X(CreateDescriptorPool) X(DestroyDescriptorPool) X(AllocateDescriptorSets) X(UpdateDescriptorSets) \
++ X(CreateCommandPool) X(DestroyCommandPool) X(AllocateCommandBuffers) X(ResetCommandBuffer) \
++ X(BeginCommandBuffer) X(EndCommandBuffer) X(CmdBindPipeline) X(CmdBindDescriptorSets) \
++ X(CmdPushConstants) X(CmdDispatch) X(CmdPipelineBarrier) X(CmdCopyMemoryIndirectKHR) \
++ X(CreateFence) X(DestroyFence) X(WaitForFences) X(ResetFences) X(QueueSubmit) X(DeviceWaitIdle)
++#define DECLARE(name) static PFN_vk##name p##name;
++INSTANCE_FUNCTIONS(DECLARE)
++DEVICE_FUNCTIONS(DECLARE)
++#undef DECLARE
++
++#define WORDS 4096u
++static void die(const char *message) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
++static void check_result(VkResult result, const char *operation, int line) {
++    if (result != VK_SUCCESS) {
++        fprintf(stderr, "FAIL: line %d %s returned %d\n", line, operation, result);
++        exit(1);
++    }
++}
++#define VK_CHECK(call) check_result((call), #call, __LINE__)
++static VkDevice device;
++static VkPhysicalDeviceMemoryProperties memory_properties;
++
++struct Buffer { VkBuffer buffer; VkDeviceMemory memory; uint32_t *mapped; VkDeviceAddress address; };
++static struct Buffer create_buffer(VkDeviceSize size) {
++    struct Buffer b = {0};
++    VkBufferCreateInfo info = {
++        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
++        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
++                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++    };
++    VK_CHECK(pCreateBuffer(device, &info, NULL, &b.buffer));
++    VkMemoryRequirements requirements;
++    pGetBufferMemoryRequirements(device, b.buffer, &requirements);
++    uint32_t type = UINT32_MAX;
++    const VkMemoryPropertyFlags needed = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++)
++        if ((requirements.memoryTypeBits & (1u << i)) &&
++            (memory_properties.memoryTypes[i].propertyFlags & needed) == needed) { type = i; break; }
++    if (type == UINT32_MAX) die("no HOST_VISIBLE | HOST_COHERENT memory type");
++    VkMemoryAllocateFlagsInfo flags = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
++                                       .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
++    VkMemoryAllocateInfo allocation = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &flags,
++                                       .allocationSize = requirements.size, .memoryTypeIndex = type};
++    VK_CHECK(pAllocateMemory(device, &allocation, NULL, &b.memory));
++    VK_CHECK(pBindBufferMemory(device, b.buffer, b.memory, 0));
++    void *mapped = NULL;
++    VK_CHECK(pMapMemory(device, b.memory, 0, size, 0, &mapped));
++    b.mapped = mapped;
++    VkBufferDeviceAddressInfo address = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b.buffer};
++    b.address = pGetBufferDeviceAddress(device, &address);
++    if (!b.address) die("vkGetBufferDeviceAddress returned 0");
++    return b;
++}
++static void destroy_buffer(struct Buffer *b) {
++    pDestroyBuffer(device, b->buffer, NULL);
++    pFreeMemory(device, b->memory, NULL);
++}
++static VkShaderModule load_shader(const char *path) {
++    FILE *file = fopen(path, "rb");
++    if (!file) { perror(path); exit(1); }
++    if (fseek(file, 0, SEEK_END) != 0) die("seek shader");
++    long length = ftell(file);
++    if (length < 20 || length > 16 * 1024 * 1024 || length % 4) die("invalid SPIR-V file length");
++    rewind(file);
++    uint32_t *code = malloc((size_t)length);
++    if (!code) die("allocate shader input");
++    if (fread(code, 1, (size_t)length, file) != (size_t)length) die("read shader");
++    if (fclose(file)) die("close shader");
++    VkShaderModuleCreateInfo info = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
++                                     .codeSize = (size_t)length, .pCode = code};
++    VkShaderModule shader = VK_NULL_HANDLE;
++    VK_CHECK(pCreateShaderModule(device, &info, NULL, &shader));
++    free(code);
++    return shader;
++}
++struct Parameters { uint32_t count, multiplier, addend, xor_mask; };
++
++int main(int argc, char **argv) {
++    const char *driver = NULL, *transform_path = NULL;
++    uint32_t iterations = 1000;
++    for (int i = 1; i < argc; i++) {
++        if (i + 1 < argc && !strcmp(argv[i], "--driver")) driver = argv[++i];
++        else if (i + 1 < argc && !strcmp(argv[i], "--transform")) transform_path = argv[++i];
++        else if (i + 1 < argc && !strcmp(argv[i], "--iterations")) iterations = (uint32_t)strtoul(argv[++i], NULL, 0);
++        else die("usage: copy-indirect --driver /absolute/library.so --transform transform.spv [--iterations N]");
++    }
++    if (!driver || driver[0] != '/' || !transform_path || !iterations) die("provide an absolute --driver and --transform");
++    void *library = dlopen(driver, RTLD_NOW | RTLD_LOCAL);
++    if (!library) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
++    PFN_vkGetInstanceProcAddr get_instance = (PFN_vkGetInstanceProcAddr)dlsym(library, "vk_icdGetInstanceProcAddr");
++    if (!get_instance) die("library lacks vk_icdGetInstanceProcAddr");
++    PFN_vkCreateInstance create_instance = (PFN_vkCreateInstance)get_instance(VK_NULL_HANDLE, "vkCreateInstance");
++    if (!create_instance) die("cannot resolve vkCreateInstance");
++    VkApplicationInfo application = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
++        .pApplicationName = "copy-memory-indirect consumer probe", .apiVersion = VK_API_VERSION_1_3};
++    VkInstanceCreateInfo instance_info = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &application};
++    VkInstance instance = VK_NULL_HANDLE;
++    VK_CHECK(create_instance(&instance_info, NULL, &instance));
++#define LOAD_INSTANCE(name) p##name = (PFN_vk##name)get_instance(instance, "vk" #name); if (!p##name) die("missing vk" #name);
++    INSTANCE_FUNCTIONS(LOAD_INSTANCE)
++#undef LOAD_INSTANCE
++    uint32_t device_count = 0;
++    VK_CHECK(pEnumeratePhysicalDevices(instance, &device_count, NULL));
++    if (!device_count || device_count > 64) die("invalid physical device count");
++    VkPhysicalDevice physical_devices[64], physical = VK_NULL_HANDLE;
++    VK_CHECK(pEnumeratePhysicalDevices(instance, &device_count, physical_devices));
++    VkPhysicalDeviceProperties properties;
++    for (uint32_t i = 0; i < device_count; i++) {
++        pGetPhysicalDeviceProperties(physical_devices[i], &properties);
++        if (properties.vendorID == 0x10de) { physical = physical_devices[i]; break; }
++    }
++    if (physical == VK_NULL_HANDLE) die("no NVIDIA physical device (vendor 0x10de)");
++    printf("device: %.256s\n", properties.deviceName);
++    pGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
++    uint32_t family_count = 0;
++    pGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, NULL);
++    if (!family_count || family_count > 64) die("invalid queue family count");
++    VkQueueFamilyProperties families[64];
++    pGetPhysicalDeviceQueueFamilyProperties(physical, &family_count, families);
++    uint32_t family = UINT32_MAX;
++    for (uint32_t i = 0; i < family_count; i++)
++        if (families[i].queueCount && (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
++            !(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { family = i; break; }
++    if (family == UINT32_MAX) {
++        puts("SKIP: no compute-only queue family");
++        return 77;
++    }
++    VkPhysicalDeviceCopyMemoryIndirectFeaturesKHR copy_features = {
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_KHR};
++    VkPhysicalDeviceVulkan12Features features12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
++                                                   .pNext = &copy_features};
++    VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &features12};
++    pGetPhysicalDeviceFeatures2(physical, &features);
++    if (!copy_features.indirectMemoryCopy || !features12.bufferDeviceAddress)
++        die("indirectMemoryCopy or bufferDeviceAddress unsupported");
++    VkPhysicalDeviceCopyMemoryIndirectFeaturesKHR enable_copy = {
++        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_KHR, .indirectMemoryCopy = VK_TRUE};
++    VkPhysicalDeviceVulkan12Features enable12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
++                                                 .pNext = &enable_copy, .bufferDeviceAddress = VK_TRUE};
++    float priority = 1.0f;
++    VkDeviceQueueCreateInfo queue_info = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
++        .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority};
++    const char *extension = "VK_KHR_copy_memory_indirect";
++    VkDeviceCreateInfo device_info = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &enable12,
++        .queueCreateInfoCount = 1, .pQueueCreateInfos = &queue_info,
++        .enabledExtensionCount = 1, .ppEnabledExtensionNames = &extension};
++    VK_CHECK(pCreateDevice(physical, &device_info, NULL, &device));
++#define LOAD_DEVICE(name) p##name = (PFN_vk##name)pGetDeviceProcAddr(device, "vk" #name); if (!p##name) die("missing vk" #name);
++    DEVICE_FUNCTIONS(LOAD_DEVICE)
++#undef LOAD_DEVICE
++    VkQueue queue;
++    pGetDeviceQueue(device, family, 0, &queue);
++
++    struct Buffer source = create_buffer(WORDS * 4), copied = create_buffer(WORDS * 4),
++                  output = create_buffer(WORDS * 4), commands = create_buffer(4096);
++    VkShaderModule shader = load_shader(transform_path);
++    VkDescriptorSetLayoutBinding bindings[2] = {
++        {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
++         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
++        {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
++         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT}};
++    VkDescriptorSetLayoutCreateInfo set_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
++                                                .bindingCount = 2, .pBindings = bindings};
++    VkDescriptorSetLayout set_layout;
++    VK_CHECK(pCreateDescriptorSetLayout(device, &set_info, NULL, &set_layout));
++    VkPushConstantRange range = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .size = sizeof(struct Parameters)};
++    VkPipelineLayoutCreateInfo layout_info = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
++        .setLayoutCount = 1, .pSetLayouts = &set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &range};
++    VkPipelineLayout layout;
++    VK_CHECK(pCreatePipelineLayout(device, &layout_info, NULL, &layout));
++    VkComputePipelineCreateInfo pipeline_info = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
++        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
++        .layout = layout};
++    VkPipeline pipeline;
++    VK_CHECK(pCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &pipeline));
++    VkDescriptorPoolSize pool_size = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2};
++    VkDescriptorPoolCreateInfo pool_info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
++                                            .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &pool_size};
++    VkDescriptorPool descriptor_pool;
++    VK_CHECK(pCreateDescriptorPool(device, &pool_info, NULL, &descriptor_pool));
++    VkDescriptorSetAllocateInfo set_alloc = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
++        .descriptorPool = descriptor_pool, .descriptorSetCount = 1, .pSetLayouts = &set_layout};
++    VkDescriptorSet set;
++    VK_CHECK(pAllocateDescriptorSets(device, &set_alloc, &set));
++    VkDescriptorBufferInfo infos[2] = {{copied.buffer, 0, WORDS * 4}, {output.buffer, 0, WORDS * 4}};
++    VkWriteDescriptorSet writes[2] = {
++        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0, .descriptorCount = 1,
++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &infos[0]},
++        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1, .descriptorCount = 1,
++         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &infos[1]}};
++    pUpdateDescriptorSets(device, 2, writes, 0, NULL);
++
++    /* Two commands: the lower and the upper half of the buffer */
++    VkCopyMemoryIndirectCommandKHR *c = (VkCopyMemoryIndirectCommandKHR *)commands.mapped;
++    for (uint32_t i = 0; i < 2; i++) {
++        c[i].srcAddress = source.address + i * (WORDS / 2) * 4;
++        c[i].dstAddress = copied.address + i * (WORDS / 2) * 4;
++        c[i].size = (WORDS / 2) * 4;
++    }
++    VkCommandPoolCreateInfo command_pool_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
++        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = family};
++    VkCommandPool command_pool;
++    VK_CHECK(pCreateCommandPool(device, &command_pool_info, NULL, &command_pool));
++    VkCommandBufferAllocateInfo command_alloc = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++        .commandPool = command_pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
++    VkCommandBuffer command;
++    VK_CHECK(pAllocateCommandBuffers(device, &command_alloc, &command));
++    VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++    VkFence fence;
++    VK_CHECK(pCreateFence(device, &fence_info, NULL, &fence));
++
++    for (uint32_t it = 0; it < iterations; it++) {
++        for (uint32_t i = 0; i < WORDS; i++) {
++            source.mapped[i] = i * 2654435761u + it;
++            copied.mapped[i] = 0xdeadbeef;
++            output.mapped[i] = 0xcafef00d;
++        }
++        const struct Parameters parameters = {WORDS, 3 + it % 7, it, 0x5a5a0000u ^ it};
++        VK_CHECK(pResetCommandBuffer(command, 0));
++        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                          .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
++        VK_CHECK(pBeginCommandBuffer(command, &begin));
++        VkCopyMemoryIndirectInfoKHR copy = {.sType = VK_STRUCTURE_TYPE_COPY_MEMORY_INDIRECT_INFO_KHR,
++            .copyCount = 2,
++            .copyAddressRange = {commands.address, 2 * sizeof(*c), sizeof(*c)}};
++        pCmdCopyMemoryIndirectKHR(command, &copy);
++        VkMemoryBarrier memory_barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
++        pCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
++                            1, &memory_barrier, 0, NULL, 0, NULL);
++        pCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
++        pCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
++        pCmdPushConstants(command, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(parameters), &parameters);
++        pCmdDispatch(command, WORDS / 64, 1, 1);
++        VkMemoryBarrier host_barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
++        pCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
++                            1, &host_barrier, 0, NULL, 0, NULL);
++        VK_CHECK(pEndCommandBuffer(command));
++        VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
++                               .pCommandBuffers = &command};
++        VK_CHECK(pQueueSubmit(queue, 1, &submit, fence));
++        VK_CHECK(pWaitForFences(device, 1, &fence, VK_TRUE, UINT64_C(10000000000)));
++        VK_CHECK(pResetFences(device, 1, &fence));
++        for (uint32_t i = 0; i < WORDS; i++) {
++            const uint32_t wanted = (source.mapped[i] ^ parameters.xor_mask) + i * parameters.multiplier + parameters.addend;
++            if (output.mapped[i] != wanted || copied.mapped[i] != source.mapped[i]) {
++                fprintf(stderr, "FAIL: iteration %" PRIu32 " word %" PRIu32 ": output %08x != %08x, copied %08x != %08x\n",
++                        it, i, output.mapped[i], wanted, copied.mapped[i], source.mapped[i]);
++                return 1;
++            }
++        }
++    }
++    printf("copy-indirect: %" PRIu32 " iterations of copy (2 commands) -> barrier -> dispatch reading the copy: all %u words correct\n",
++           iterations, WORDS);
++    VK_CHECK(pDeviceWaitIdle(device));
++    pDestroyFence(device, fence, NULL);
++    pDestroyCommandPool(device, command_pool, NULL);
++    pDestroyDescriptorPool(device, descriptor_pool, NULL);
++    pDestroyPipeline(device, pipeline, NULL);
++    pDestroyPipelineLayout(device, layout, NULL);
++    pDestroyDescriptorSetLayout(device, set_layout, NULL);
++    pDestroyShaderModule(device, shader, NULL);
++    destroy_buffer(&source);
++    destroy_buffer(&copied);
++    destroy_buffer(&output);
++    destroy_buffer(&commands);
++    pDestroyDevice(device, NULL);
++    pDestroyInstance(instance, NULL);
++    return 0;
++}
+diff --git a/tools/native-vulkan-regression.py b/tools/native-vulkan-regression.py
+index 7e2e0f5..696aeaf 100644
+--- a/tools/native-vulkan-regression.py
++++ b/tools/native-vulkan-regression.py
+@@ -35,6 +35,9 @@ def cases(target, suite):
+                           graphics / "vertex.spv", graphics / "fragment.spv"]),
+             ("interop", [core / f"interop-{target}", "--driver", icd]),
+         ]
++        if target == "host":  # host only: the NDK r29 Vulkan headers predate VK_KHR_copy_memory_indirect
++            result.append(("copy-indirect", [core / "copy-indirect-host", "--driver", icd,
++                                             "--transform", core / "transform.spv"]))
+     if suite in ("hal", "all"):
+         tests = ROOT / "nvidia-prolapse/hal/out/host" if target == "host" else integration
+         # The strict default requires an actually pending release fd. Never
+diff --git a/tools/native-vulkan-shaders/README.md b/tools/native-vulkan-shaders/README.md
+index abf68a4..3a264c9 100644
+--- a/tools/native-vulkan-shaders/README.md
++++ b/tools/native-vulkan-shaders/README.md
+@@ -14,6 +14,8 @@ cc -std=c11 -Wall -Wextra -Werror tools/native-vulkan-probe.c -ldl \
+ build/hwcomposer-work/ndk/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android33-clang \
+   -std=c11 -Wall -Wextra -Werror tools/native-vulkan-probe.c -ldl \
+   -o build/native-vulkan-probe/probe-android
++cc -std=c11 -Wall -Wextra -Werror tools/native-vulkan-copy-indirect.c -ldl \
++  -o build/native-vulkan-probe/copy-indirect-host
+ glslangValidator -V --target-env vulkan1.0 tools/native-vulkan-shaders/generate.comp \
+   -o build/native-vulkan-probe/generate.spv
+ glslangValidator -V --target-env vulkan1.0 tools/native-vulkan-shaders/transform.comp \
+@@ -62,9 +64,21 @@ with `VK_ERROR_EXTENSION_NOT_PRESENT`, then requests one core feature the driver
+ reported unsupported and expects `VK_ERROR_FEATURE_NOT_PRESENT`. The feature
+ check is reported as not applicable if every core feature is advertised.
+ 
++`../native-vulkan-copy-indirect.c` (host only: the NDK r29 Vulkan headers predate
++`VK_KHR_copy_memory_indirect`) records `vkCmdCopyMemoryIndirectKHR` on a
++compute-only queue family, a transfer-write to shader-read barrier, then a
++dispatch of `transform.spv` that reads the copied words; 1000 iterations, every
++output word checked. It exits 77 when the device has no compute-only family:
++
++```sh
++build/native-vulkan-probe/copy-indirect-host \
++  --driver /absolute/path/to/libvulkan_nouveau.so \
++  --transform build/native-vulkan-probe/transform.spv
++```
++
+ For Mesa ICDs exporting `vk_icdGetInstanceProcAddr`, add `--icd` to direct
+ invocations. `../native-vulkan-regression.py` prepares the current full-NVK
+-compute, graphics, interop, and HAL commands, and defaults to a dry run.
++compute, graphics, interop, host copy-indirect and HAL commands, and defaults to a dry run.
+ 
+ The probe selects a physical device by NVIDIA vendor ID and a queue by its
+ compute capability. It enables no extensions or optional features and requires
+-- 
+2.56.0
+

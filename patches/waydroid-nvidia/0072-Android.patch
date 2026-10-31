@@ -1,0 +1,244 @@
+From 7968c147810a55cfe71c95bff05ac10e80cc7297 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 17:33:30 +0800
+Subject: [PATCH 72/72] =?utf-8?q?=E6=B5=8B=E8=AF=95=EF=BC=9A=E9=AA=8C?=
+ =?utf-8?q?=E8=AF=81=E8=B7=A8=E6=97=8F=E7=8B=AC=E5=8D=A0=E8=B5=84=E6=BA=90?=
+ =?utf-8?q?=E4=BA=A4=E6=8E=A5=E5=B9=B6=E6=94=AF=E6=8C=81=20Android=20?=
+ =?utf-8?q?=E9=97=B4=E6=8E=A5=E6=8B=B7=E8=B4=9D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ tools/native-vulkan-copy-indirect.c   | 37 ++++++++++++++
+ tools/native-vulkan-multiqueue.c      | 72 ++++++++++++++++++++++++++-
+ tools/native-vulkan-regression.py     |  5 +-
+ tools/native-vulkan-shaders/README.md | 16 ++++--
+ 4 files changed, 122 insertions(+), 8 deletions(-)
+
+diff --git a/tools/native-vulkan-copy-indirect.c b/tools/native-vulkan-copy-indirect.c
+index 4bf3d33..ff4b52c 100644
+--- a/tools/native-vulkan-copy-indirect.c
++++ b/tools/native-vulkan-copy-indirect.c
+@@ -15,6 +15,43 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++/* NDK r29 predates this extension. These public Vulkan-Headers declarations
++ * keep the diagnostic buildable with its SDK; entry points are still resolved
++ * from the selected driver and the actual device feature must be advertised. */
++#ifndef VK_KHR_device_address_commands
++typedef struct VkStridedDeviceAddressRangeKHR {
++    VkDeviceAddress address;
++    VkDeviceSize size;
++    VkDeviceSize stride;
++} VkStridedDeviceAddressRangeKHR;
++#endif
++#ifndef VK_KHR_copy_memory_indirect
++#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_KHR ((VkStructureType)1000549000)
++#define VK_STRUCTURE_TYPE_COPY_MEMORY_INDIRECT_INFO_KHR ((VkStructureType)1000549002)
++typedef VkFlags VkAddressCopyFlagsKHR;
++typedef struct VkCopyMemoryIndirectCommandKHR {
++    VkDeviceAddress srcAddress;
++    VkDeviceAddress dstAddress;
++    VkDeviceSize size;
++} VkCopyMemoryIndirectCommandKHR;
++typedef struct VkCopyMemoryIndirectInfoKHR {
++    VkStructureType sType;
++    const void *pNext;
++    VkAddressCopyFlagsKHR srcCopyFlags;
++    VkAddressCopyFlagsKHR dstCopyFlags;
++    uint32_t copyCount;
++    VkStridedDeviceAddressRangeKHR copyAddressRange;
++} VkCopyMemoryIndirectInfoKHR;
++typedef struct VkPhysicalDeviceCopyMemoryIndirectFeaturesKHR {
++    VkStructureType sType;
++    void *pNext;
++    VkBool32 indirectMemoryCopy;
++    VkBool32 indirectMemoryToImageCopy;
++} VkPhysicalDeviceCopyMemoryIndirectFeaturesKHR;
++typedef void (VKAPI_PTR *PFN_vkCmdCopyMemoryIndirectKHR)(
++    VkCommandBuffer commandBuffer, const VkCopyMemoryIndirectInfoKHR *pCopyMemoryIndirectInfo);
++#endif
++
+ #define INSTANCE_FUNCTIONS(X) \
+  X(DestroyInstance) X(EnumeratePhysicalDevices) X(GetPhysicalDeviceProperties) \
+  X(GetPhysicalDeviceQueueFamilyProperties) X(GetPhysicalDeviceMemoryProperties) \
+diff --git a/tools/native-vulkan-multiqueue.c b/tools/native-vulkan-multiqueue.c
+index f59f0d0..d57f304 100644
+--- a/tools/native-vulkan-multiqueue.c
++++ b/tools/native-vulkan-multiqueue.c
+@@ -18,7 +18,7 @@
+  X(MapMemory) X(UnmapMemory) X(CreateCommandPool) X(DestroyCommandPool) \
+  X(AllocateCommandBuffers) X(ResetCommandPool) X(BeginCommandBuffer) X(EndCommandBuffer) \
+  X(CmdFillBuffer) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(ResetFences) \
+- X(QueueSubmit) X(WaitForFences)
++ X(QueueSubmit) X(WaitForFences) X(CmdCopyBuffer) X(CreateSemaphore) X(DestroySemaphore)
+ struct Api {
+ #define DECL(n) PFN_vk##n n;
+  FUNCTIONS(DECL)
+@@ -62,6 +62,71 @@ static void *run(void *data) {
+  }
+  return NULL;
+ }
++
++/* The graphics producer owns the exclusive buffer initially. Compute copies
++ * its first half to the second, then graphics copies that half to readback.
++ * Distinct initial halves make a missing compute copy observable. */
++static void ownership_roundtrip(struct Worker *graphics, struct Worker *compute,
++                                struct Worker *readback, uint32_t gf, uint32_t cf,
++                                uint32_t pattern) {
++ struct Api *a = graphics->api;
++ VkDevice device = graphics->device;
++ VkSemaphore sem[2];
++ VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
++ for (unsigned i = 0; i < 2; i++) CHECK(a->CreateSemaphore(device, &sci, NULL, &sem[i]));
++ struct Worker *recorders[3] = {graphics, compute, readback};
++ VkBufferMemoryBarrier release = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
++  .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .srcQueueFamilyIndex = gf,
++  .dstQueueFamilyIndex = cf, .buffer = graphics->buffer, .offset = 0, .size = 8192};
++ VkBufferCopy copy = {.srcOffset = 0, .dstOffset = 4096, .size = 4096};
++ VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++ for (unsigned phase = 0; phase < 3; phase++) {
++  struct Worker *w = recorders[phase];
++  CHECK(a->ResetCommandPool(device, w->pool, 0));
++  VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++  CHECK(a->BeginCommandBuffer(w->command, &begin));
++  if (phase == 0) {
++   a->CmdFillBuffer(w->command, graphics->buffer, 0, 4096, pattern);
++   a->CmdFillBuffer(w->command, graphics->buffer, 4096, 4096, ~pattern);
++   a->CmdPipelineBarrier(w->command, VK_PIPELINE_STAGE_TRANSFER_BIT,
++    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 1, &release, 0, NULL);
++  } else {
++   VkBufferMemoryBarrier acquire = release;
++   acquire.srcAccessMask = 0;
++   acquire.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++   a->CmdPipelineBarrier(w->command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &acquire, 0, NULL);
++   if (phase == 1) {
++    a->CmdCopyBuffer(w->command, graphics->buffer, graphics->buffer, 1, &copy);
++    release.srcQueueFamilyIndex = cf;
++    release.dstQueueFamilyIndex = gf;
++    release.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++    a->CmdPipelineBarrier(w->command, VK_PIPELINE_STAGE_TRANSFER_BIT,
++     VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 1, &release, 0, NULL);
++   } else {
++    copy.srcOffset = 4096;
++    copy.dstOffset = 0;
++    a->CmdCopyBuffer(w->command, graphics->buffer, readback->buffer, 1, &copy);
++    VkMemoryBarrier host = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++     .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
++    a->CmdPipelineBarrier(w->command, VK_PIPELINE_STAGE_TRANSFER_BIT,
++     VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, NULL, 0, NULL);
++   }
++  }
++  CHECK(a->EndCommandBuffer(w->command));
++  VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++   .waitSemaphoreCount = phase != 0, .pWaitSemaphores = phase ? &sem[phase - 1] : NULL,
++   .pWaitDstStageMask = &wait_stage, .commandBufferCount = 1, .pCommandBuffers = &w->command,
++   .signalSemaphoreCount = phase != 2, .pSignalSemaphores = phase < 2 ? &sem[phase] : NULL};
++  CHECK(a->QueueSubmit(phase == 1 ? compute->queue : graphics->queue, 1, &submit,
++   phase == 2 ? readback->fence : VK_NULL_HANDLE));
++ }
++ CHECK(a->WaitForFences(device, 1, &readback->fence, VK_TRUE, 10000000000ull));
++ for (unsigned i = 0; i < 1024; i++) REQUIRE(readback->mapped[i] == pattern);
++ CHECK(a->ResetFences(device, 1, &readback->fence));
++ for (unsigned i = 0; i < 2; i++) a->DestroySemaphore(device, sem[i], NULL);
++ printf("ownership_roundtrip=%u->%u->%u PASS\n", gf, cf, gf);
++}
+ int main(int argc, char **argv) {
+  REQUIRE(argc == 2 && argv[1][0] == '/');
+  void *lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+@@ -155,7 +220,8 @@ int main(int argc, char **argv) {
+   REQUIRE(w->queue);
+   for (unsigned j = 0; j < i; j++) REQUIRE(w->queue != workers[j].queue);
+   VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+-   .size = 4096, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
++   .size = 8192, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++   .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+   CHECK(api.CreateBuffer(device, &bci, NULL, &w->buffer));
+   VkMemoryRequirements req;
+   api.GetBufferMemoryRequirements(device, w->buffer, &req);
+@@ -179,6 +245,8 @@ int main(int argc, char **argv) {
+  }
+  for (unsigned i = 0; i < total; i++) REQUIRE(!pthread_create(&threads[i], NULL, run, &workers[i]));
+  for (unsigned i = 0; i < total; i++) REQUIRE(!pthread_join(threads[i], NULL));
++ if (ng == 2 && nc) ownership_roundtrip(&workers[0], &workers[ng], &workers[1],
++  family, compute, 0x17a00000u | (repeat << 8) | c);
+  for (unsigned i = 0; i < total; i++) {
+   struct Worker *w = &workers[i];
+   api.DestroyFence(device, w->fence, NULL);
+diff --git a/tools/native-vulkan-regression.py b/tools/native-vulkan-regression.py
+index 696aeaf..0582b3b 100644
+--- a/tools/native-vulkan-regression.py
++++ b/tools/native-vulkan-regression.py
+@@ -35,9 +35,8 @@ def cases(target, suite):
+                           graphics / "vertex.spv", graphics / "fragment.spv"]),
+             ("interop", [core / f"interop-{target}", "--driver", icd]),
+         ]
+-        if target == "host":  # host only: the NDK r29 Vulkan headers predate VK_KHR_copy_memory_indirect
+-            result.append(("copy-indirect", [core / "copy-indirect-host", "--driver", icd,
+-                                             "--transform", core / "transform.spv"]))
++        result.append(("copy-indirect", [core / f"copy-indirect-{target}", "--driver", icd,
++                                         "--transform", core / "transform.spv"]))
+     if suite in ("hal", "all"):
+         tests = ROOT / "nvidia-prolapse/hal/out/host" if target == "host" else integration
+         # The strict default requires an actually pending release fd. Never
+diff --git a/tools/native-vulkan-shaders/README.md b/tools/native-vulkan-shaders/README.md
+index 392c603..da2d068 100644
+--- a/tools/native-vulkan-shaders/README.md
++++ b/tools/native-vulkan-shaders/README.md
+@@ -16,6 +16,9 @@ build/hwcomposer-work/ndk/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/
+   -o build/native-vulkan-probe/probe-android
+ cc -std=c11 -Wall -Wextra -Werror tools/native-vulkan-copy-indirect.c -ldl \
+   -o build/native-vulkan-probe/copy-indirect-host
++build/hwcomposer-work/ndk/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android33-clang \
++  -std=c11 -Wall -Wextra -Werror tools/native-vulkan-copy-indirect.c -ldl \
++  -o build/native-vulkan-probe/copy-indirect-android
+ glslangValidator -V --target-env vulkan1.0 tools/native-vulkan-shaders/generate.comp \
+   -o build/native-vulkan-probe/generate.spv
+ glslangValidator -V --target-env vulkan1.0 tools/native-vulkan-shaders/transform.comp \
+@@ -64,8 +67,8 @@ with `VK_ERROR_EXTENSION_NOT_PRESENT`, then requests one core feature the driver
+ reported unsupported and expects `VK_ERROR_FEATURE_NOT_PRESENT`. The feature
+ check is reported as not applicable if every core feature is advertised.
+ 
+-`../native-vulkan-copy-indirect.c` (host only: the NDK r29 Vulkan headers predate
+-`VK_KHR_copy_memory_indirect`) records `vkCmdCopyMemoryIndirectKHR` on a
++`../native-vulkan-copy-indirect.c` builds for host and Android (it supplies the
++public extension declarations when the SDK predates them) and records `vkCmdCopyMemoryIndirectKHR` on a
+ compute-only queue family, a transfer-write to shader-read barrier, then a
+ dispatch of `transform.spv` that reads the copied words; 1000 iterations, every
+ output word checked. It exits 77 when the device has no compute-only family:
+@@ -74,6 +77,9 @@ output word checked. It exits 77 when the device has no compute-only family:
+ build/native-vulkan-probe/copy-indirect-host \
+   --driver /absolute/path/to/libvulkan_nouveau.so \
+   --transform build/native-vulkan-probe/transform.spv
++# On Android, after staging the probe, transform.spv and matching libraries:
++/data/local/tmp/copy-indirect-android \
++  --driver /vendor_extra/lib64/libvulkan_nouveau.so --transform /data/local/tmp/transform.spv
+ ```
+ 
+ `../native-vulkan-multiqueue.c` requires graphics family 0 with exactly two
+@@ -82,6 +88,10 @@ configurations: two graphics, two graphics plus compute, compute create-info
+ first, compute-only, two graphics plus two compute, and two compute-only queues.
+ Each configuration is created and destroyed eight times; every queue races
+ 256 fill/barrier/fence submissions and checks all 1024 output words each time.
++The mixed configurations also move an exclusive buffer graphics→compute→graphics
++with matching release/acquire buffer barriers and binary semaphore dependencies.
++Compute copies the graphics-written first half to a differently initialized second
++half; the final graphics queue copies it to host readback and checks every word.
+ This directly loads the ICD; Android system-loader/HAL coverage is separate.
+ 
+ ```sh
+@@ -96,7 +106,7 @@ build/native-vulkan-probe/multiqueue-host /absolute/path/to/libvulkan_nouveau.so
+ 
+ For Mesa ICDs exporting `vk_icdGetInstanceProcAddr`, add `--icd` to direct
+ invocations. `../native-vulkan-regression.py` prepares the current full-NVK
+-compute, graphics, interop, host copy-indirect and HAL commands, and defaults to a dry run.
++compute, graphics, interop, copy-indirect and HAL commands for both ABIs, and defaults to a dry run.
+ 
+ The probe selects a physical device by NVIDIA vendor ID and a queue by its
+ compute capability. It enables no extensions or optional features and requires
+-- 
+2.56.0
+

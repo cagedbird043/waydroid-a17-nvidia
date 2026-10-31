@@ -1,0 +1,2350 @@
+From 3d2311bf400fe91333fb0c4ad56c54a779040a95 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 17:23:32 +0800
+Subject: [PATCH 66/72] =?utf-8?q?NVK=EF=BC=9A=E5=B0=86=E8=AE=A1=E7=AE=97?=
+ =?utf-8?q?=E9=98=9F=E5=88=97=E6=97=8F=E6=89=A9=E5=B1=95=E5=88=B0=20Volta?=
+ =?utf-8?q?=20=E5=8F=8A=E6=9B=B4=E6=96=B0=E6=9E=B6=E6=9E=84?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit f44f4d758ee164e970bbf71e00bd038ec3972a98)
+---
+ .../driver-source/native/mesa/abi-check.c     |   8 +-
+ .../driver-source/native/mesa/build.py        |   9 +-
+ .../native/mesa/nak-qmd-launch-fields.patch   | 217 ++++
+ .../driver-source/native/mesa/nv_rm.h         |  10 +
+ .../mesa/nvk-compute-queue-cond-render.patch  | 121 +++
+ .../mesa/nvk-compute-queue-family.patch       |  25 +-
+ .../mesa/nvk-compute-queue-no-mme.patch       | 951 ++++++++++++++++++
+ .../native/mesa/nvk-compute-scg-init.patch    | 181 ++++
+ .../native/mesa/nvk-stock-compute-init.patch  |  33 +-
+ .../mesa/nvk-turing-sked-qmd-invalidate.patch | 408 ++++++++
+ .../driver-source/native/mesa/nvkmd_rm.c      |  10 +-
+ .../driver-source/native/src/gpu.rs           |  34 +-
+ .../driver-source/native/src/mesa.rs          |  47 +-
+ 13 files changed, 2005 insertions(+), 49 deletions(-)
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nak-qmd-launch-fields.patch
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-cond-render.patch
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-no-mme.patch
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nvk-compute-scg-init.patch
+ create mode 100644 nvidia-prolapse/driver-source/native/mesa/nvk-turing-sked-qmd-invalidate.patch
+
+diff --git a/nvidia-prolapse/driver-source/native/mesa/abi-check.c b/nvidia-prolapse/driver-source/native/mesa/abi-check.c
+index afdcc34..ba8c933 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/abi-check.c
++++ b/nvidia-prolapse/driver-source/native/mesa/abi-check.c
+@@ -1,11 +1,14 @@
+ /* SPDX-License-Identifier: MIT */
+ #include "nv_rm.h"
+ #include <stdio.h>
+-_Static_assert(sizeof(struct NvRmInfo) == 208, "Rust Info size");
++_Static_assert(sizeof(struct NvRmInfo) == 224, "Rust Info size");
++_Static_assert(offsetof(struct NvRmInfo, max_shared_ctx) == 216, "Rust Info shared context offset");
+ _Static_assert(offsetof(struct NvRmInfo, zcull) == 152, "Rust Info ZCULL offset");
+ _Static_assert(offsetof(struct NvRmInfo, zcull_ctxsw_size) == 192, "Rust Info ZCULL ctxsw offset");
+ _Static_assert(offsetof(struct NvRmInfo, has_zcull_info) == 200, "Rust Info ZCULL flag offset");
+ _Static_assert(offsetof(struct NvRmInfo, sm_isa) == 204, "Rust Info SM ISA offset");
++_Static_assert(offsetof(struct NvRmInfo, shader_pipe_count) == 208, "Rust Info shader pipe offset");
++_Static_assert(offsetof(struct NvRmInfo, shader_pipe_sub_count) == 212, "Rust Info shader pipe sub offset");
+ _Static_assert(offsetof(struct NvRmInfo, generic_kind) == 68, "Rust Info kind offset");
+ _Static_assert(offsetof(struct NvRmInfo, vram_size) == 72, "Rust Info VRAM offset");
+ _Static_assert(offsetof(struct NvRmInfo, bar_size) == 80, "Rust Info BAR offset");
+@@ -23,6 +26,9 @@ int main(void) {
+    OFFSET(NvRmInfo, zcull_ctxsw_size);
+    OFFSET(NvRmInfo, has_zcull_info);
+    OFFSET(NvRmInfo, sm_isa);
++   OFFSET(NvRmInfo, shader_pipe_count);
++   OFFSET(NvRmInfo, shader_pipe_sub_count);
++   OFFSET(NvRmInfo, max_shared_ctx);
+    SIZE(NvRmAllocation);
+    OFFSET(NvRmAllocation, id);
+    OFFSET(NvRmAllocation, size);
+diff --git a/nvidia-prolapse/driver-source/native/mesa/build.py b/nvidia-prolapse/driver-source/native/mesa/build.py
+index 0e25928..6a55de5 100755
+--- a/nvidia-prolapse/driver-source/native/mesa/build.py
++++ b/nvidia-prolapse/driver-source/native/mesa/build.py
+@@ -213,7 +213,7 @@ NVK_PATCH_LIST = [
+     HERE / "nak-qmd-dependency.patch",
+     HERE / "nvk-cs-join-qmd.patch",
+     # A compute-only queue family whose queues run on their own
+-    # subcontext in graphics queue 0's channel group (BLACKWELL_COMPUTE_B,
++    # subcontext in graphics queue 0's channel group (Volta and newer,
+     # backends with shared contexts), as the proprietary driver exposes
+     # and places its compute queues; its transfers and clears run as
+     # compute work there.
+@@ -223,9 +223,16 @@ NVK_PATCH_LIST = [
+     # cache sequence with IGNORE_VEID, CWD slot count on GB20x); SKED
+     # cache invalidates then happen only in that WFI-ALL form.
+     HERE / "nvk-stock-compute-init.patch",
++    # Occupancy/launch-group fields and compute-class SCG initialisation.
++    HERE / "nak-qmd-launch-fields.patch",
++    HERE / "nvk-compute-scg-init.patch",
++    HERE / "nvk-compute-queue-cond-render.patch",
+     # Hoist convergent loop invariants and sync only real continue edges.
+     HERE / "nak-licm-convergent.patch",
+     HERE / "nak-loop-continue-sync.patch",
++    # Shared SKED cache invalidation and compute classes without MME.
++    HERE / "nvk-turing-sked-qmd-invalidate.patch",
++    HERE / "nvk-compute-queue-no-mme.patch",
+ ]
+ 
+ def prepared_stamp(source, inputs):
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nak-qmd-launch-fields.patch b/nvidia-prolapse/driver-source/native/mesa/nak-qmd-launch-fields.patch
+new file mode 100644
+index 0000000..1c03ffc
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nak-qmd-launch-fields.patch
+@@ -0,0 +1,217 @@
++nak/nvk: dispatch QMD occupancy (Ampere B to Hopper) and launch queue by queue family
++
++NVIDIA's driver (libnvidia-eglcore.so.615.78.08) writes the QMD occupancy
++limits on every dispatch for the AMPERE_COMPUTE_B, Ada and Hopper QMD layouts
++too (setters ELF 0xaa1700 / 0xaa17e0; values threshold shared memory 0,
++registers 0x40, warps 0x10, maxima 0xff), and per recording queue family
++CTA_LAUNCH_QUEUE (0 graphics / 1 compute, from AMPERE_COMPUTE_B on) and
++QMD_GROUP_ID (0x1f graphics / 0x20 compute, from Turing on) at ELF 0xc5aed0.
++A compute-only channel has no 3D class: the indirect dispatch sizes the MME
++data FIFO through the compute class there (clc7c0.h..clcbc0.h 0x0574).
++
++--- a/src/nouveau/compiler/nak.h
+++++ b/src/nouveau/compiler/nak.h
++@@ -334,6 +334,11 @@
++ struct nak_qmd_cbuf_desc_layout
++ nak_get_qmd_cbuf_desc_layout(const struct nv_device_info *dev, uint8_t idx);
++ 
+++/* CTA_LAUNCH_QUEUE / QMD_GROUP_ID by the recording queue family. */
+++void nak_qmd_set_launch_queue(const struct nv_device_info *dev,
+++                              void *qmd, size_t qmd_size,
+++                              bool compute_family);
+++
++ /* QMD dependency fields (Blackwell B compute only; other classes abort). */
++ void nak_qmd_set_empty_grid(const struct nv_device_info *dev,
++                             void *qmd, size_t qmd_size);
++--- a/src/nouveau/compiler/nak/qmd.rs
+++++ b/src/nouveau/compiler/nak/qmd.rs
++@@ -8,7 +8,7 @@
++ use compiler::bindings::*;
++ use nak_bindings::*;
++ use nvidia_headers::classes::{
++-    cla0c0, clc0c0, clc3c0, clc6c0, clcbc0, clcdc0, clcec0,
+++    cla0c0, clc0c0, clc3c0, clc5c0, clc6c0, clc7c0, clcbc0, clcdc0, clcec0,
++ };
++ 
++ use bitview::*;
++@@ -512,6 +512,7 @@
++ mod qmd_3_0 {
++     use crate::qmd::*;
++     use nvidia_headers::classes::clc6c0::qmd as clc6c0;
+++    use nvidia_headers::classes::clc7c0::qmd as clc7c0;
++ 
++     #[repr(transparent)]
++     pub struct Qmd3_0 {
++@@ -539,6 +540,26 @@
++         qmd_impl_set_smem_size_bounded!(clc6c0, QMDV03_00);
++         qmd_impl_set_slm_size!(clc6c0, QMDV03_00, NONE);
++     }
+++
+++    impl Qmd3_0 {
+++        /// Occupancy limits of the grid in the AMPERE_COMPUTE_B+ QMD V03_00
+++        /// layout (clc7c0qmd.h / clc9c0qmd.h; the AMPERE_COMPUTE_A layout in
+++        /// clc6c0qmd.h has no such fields).  NVIDIA's driver
+++        /// (libnvidia-eglcore.so.615.78.08, setters at ELF 0xaa1700 /
+++        /// 0xaa17e0, their 0xc7c0 / 0xc9c0 arms) writes these values on every
+++        /// dispatch; with them left 0 a grid that fills the GPU and graphics
+++        /// work of another subcontext in the same channel group time-slice
+++        /// instead of running together.
+++        pub fn set_occupancy(&mut self) {
+++            let mut bv = QMDBitView::new(&mut self.qmd);
+++            set_field!(bv, clc7c0, QMDV03_00, OCCUPANCY_THRESHOLD_SHARED_MEM, 0_u32);
+++            set_field!(bv, clc7c0, QMDV03_00, OCCUPANCY_MAX_SHARED_MEM, 0xff_u32);
+++            set_field!(bv, clc7c0, QMDV03_00, OCCUPANCY_THRESHOLD_WARP, 0x10_u32);
+++            set_field!(bv, clc7c0, QMDV03_00, OCCUPANCY_MAX_WARP, 0xff_u32);
+++            set_field!(bv, clc7c0, QMDV03_00, OCCUPANCY_THRESHOLD_REGISTER, 0x40_u32);
+++            set_field!(bv, clc7c0, QMDV03_00, OCCUPANCY_MAX_REGISTER, 0xff_u32);
+++        }
+++    }
++ }
++ use qmd_3_0::Qmd3_0;
++ 
++@@ -579,6 +600,21 @@
++         qmd_impl_set_smem_size_bounded!(clcbc0, QMDV04_00);
++         qmd_impl_set_slm_size!(clcbc0, QMDV04_00, NONE);
++     }
+++
+++    impl Qmd4_0 {
+++        /// Occupancy limits of the grid (clcbc0qmd.h QMDV04_00), the values
+++        /// NVIDIA's driver writes on every dispatch (setters at ELF 0xaa1700 /
+++        /// 0xaa17e0 of libnvidia-eglcore.so.615.78.08, their 0xcbc0 arm).
+++        pub fn set_occupancy(&mut self) {
+++            let mut bv = QMDBitView::new(&mut self.qmd);
+++            set_field!(bv, clcbc0, QMDV04_00, OCCUPANCY_THRESHOLD_SHARED_MEM, 0_u32);
+++            set_field!(bv, clcbc0, QMDV04_00, OCCUPANCY_MAX_SHARED_MEM, 0xff_u32);
+++            set_field!(bv, clcbc0, QMDV04_00, OCCUPANCY_THRESHOLD_WARP, 0x10_u32);
+++            set_field!(bv, clcbc0, QMDV04_00, OCCUPANCY_MAX_WARP, 0xff_u32);
+++            set_field!(bv, clcbc0, QMDV04_00, OCCUPANCY_THRESHOLD_REGISTER, 0x40_u32);
+++            set_field!(bv, clcbc0, QMDV04_00, OCCUPANCY_MAX_REGISTER, 0xff_u32);
+++        }
+++    }
++ }
++ use qmd_4_0::Qmd4_0;
++ 
++@@ -810,11 +846,17 @@
++         } else if dev.cls_compute >= clcbc0::HOPPER_COMPUTE_A {
++             let qmd_out = qmd_out as *mut Qmd4_0;
++             assert!(qmd_size == size_of_val(&*qmd_out));
++-            qmd_out.write(fill_qmd(dev, info, qmd_info));
+++            let mut qmd: Qmd4_0 = fill_qmd(dev, info, qmd_info);
+++            qmd.set_occupancy();
+++            qmd_out.write(qmd);
++         } else if dev.cls_compute >= clc6c0::AMPERE_COMPUTE_A {
++             let qmd_out = qmd_out as *mut Qmd3_0;
++             assert!(qmd_size == size_of_val(&*qmd_out));
++-            qmd_out.write(fill_qmd(dev, info, qmd_info));
+++            let mut qmd: Qmd3_0 = fill_qmd(dev, info, qmd_info);
+++            if dev.cls_compute >= clc7c0::AMPERE_COMPUTE_B {
+++                qmd.set_occupancy();
+++            }
+++            qmd_out.write(qmd);
++         } else if dev.cls_compute >= clc3c0::VOLTA_COMPUTE_A {
++             let qmd_out = qmd_out as *mut Qmd2_2;
++             assert!(qmd_size == size_of_val(&*qmd_out));
++@@ -876,6 +918,52 @@
++     }
++ }
++ 
+++/// CTA_LAUNCH_QUEUE and QMD_GROUP_ID of a dispatch QMD by the queue family
+++/// that records it, as NVIDIA's driver sets them (libnvidia-eglcore.so
+++/// 615.78.08, dispatch launch fields at ELF 0xc5aed0: launch set by family at
+++/// ELF 0xc5a4c0, CTA_LAUNCH_QUEUE = its bit 0, defaults 0 for the graphics
+++/// family and 1 for the compute family (settings read at ELF 0xa39385);
+++/// QMD group by family at ELF 0xc98910, defaults 0x1f and 0x20 (ELF
+++/// 0x56bd1c / 0x56bc06)).  The driver writes the group in every QMD layout
+++/// from Turing on and CTA_LAUNCH_QUEUE from the AMPERE_COMPUTE_B layout on
+++/// (its layouts for TURING_COMPUTE_A and AMPERE_COMPUTE_A have none).
+++/// Volta and older are not handled by that driver: their QMDs keep NAK's
+++/// defaults.
+++#[no_mangle]
+++pub extern "C" fn nak_qmd_set_launch_queue(
+++    dev: &nv_device_info,
+++    qmd: *mut ::std::os::raw::c_void,
+++    qmd_size: usize,
+++    compute_family: bool,
+++) {
+++    assert!(!qmd.is_null());
+++    assert!(qmd_size == nak_qmd_size_B(dev) as usize);
+++    let words =
+++        unsafe { std::slice::from_raw_parts_mut(qmd as *mut u32, qmd_size / 4) };
+++    use nvidia_headers::classes::clc3c0::qmd as q_c3c0;
+++    use nvidia_headers::classes::clc6c0::qmd as q_c6c0;
+++    use nvidia_headers::classes::clc7c0::qmd as q_c7c0;
+++    use nvidia_headers::classes::clcbc0::qmd as q_cbc0;
+++    use nvidia_headers::classes::clcdc0::qmd as q_cdc0;
+++    let mut bv = QMDBitView::new(words);
+++    let group: u32 = if compute_family { 0x20 } else { 0x1f };
+++    let queue: u32 = if compute_family { 1 } else { 0 };
+++    if dev.cls_compute >= clcdc0::BLACKWELL_COMPUTE_A {
+++        set_field!(bv, q_cdc0, QMDV05_00, CTA_LAUNCH_QUEUE, queue);
+++        set_field!(bv, q_cdc0, QMDV05_00, QMD_GROUP_ID, group);
+++    } else if dev.cls_compute >= clcbc0::HOPPER_COMPUTE_A {
+++        set_field!(bv, q_cbc0, QMDV04_00, CTA_LAUNCH_QUEUE, queue);
+++        set_field!(bv, q_cbc0, QMDV04_00, QMD_GROUP_ID, group);
+++    } else if dev.cls_compute >= clc7c0::AMPERE_COMPUTE_B {
+++        set_field!(bv, q_c7c0, QMDV03_00, CTA_LAUNCH_QUEUE, queue);
+++        set_field!(bv, q_c7c0, QMDV03_00, QMD_GROUP_ID, group);
+++    } else if dev.cls_compute >= clc6c0::AMPERE_COMPUTE_A {
+++        set_field!(bv, q_c6c0, QMDV03_00, QMD_GROUP_ID, group);
+++    } else if dev.cls_compute >= clc5c0::TURING_COMPUTE_A {
+++        set_field!(bv, q_c3c0, QMDV02_02, QMD_GROUP_ID, group);
+++    }
+++}
+++
++ /// The QMD words of `qmd` for a class with QMD dependency support (only
++ /// Blackwell B for now: the only class whose dependency layout has been
++ /// measured on hardware).
++--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++@@ -8,6 +8,7 @@
++ #include "nvk_entrypoints.h"
++ #include "nvk_mme.h"
++ #include "nvk_physical_device.h"
+++#include "nvk_queue.h"
++ #include "nvk_shader.h"
++ 
++ #include "vk_synchronization.h"
++@@ -728,6 +729,14 @@
++       assert(qmd_size_B <= sizeof(qmd));
++       nak_fill_qmd(&pdev->info, &shader->info, &qmd_info, qmd, qmd_size_B);
++ 
+++      /* Grids recorded for the compute-only family launch from their own
+++       * CTA launch queue and QMD group, apart from the graphics queue's (as
+++       * the proprietary driver sets both by queue family).
+++       */
+++      nak_qmd_set_launch_queue(&pdev->info, qmd, qmd_size_B,
+++                               !(nvk_cmd_buffer_queue_flags(cmd) &
+++                                 VK_QUEUE_GRAPHICS_BIT));
+++
++       void *qmd_map;
++       result = nvk_cmd_buffer_alloc_qmd(cmd, qmd_size_B, 0x100,
++                                         &qmd_addr, &qmd_map);
++@@ -1114,8 +1123,24 @@
++    struct nv_push *p;
++    if (nvk_cmd_buffer_compute_cls(cmd) >= TURING_COMPUTE_A) {
++       p = nvk_cmd_buffer_push(cmd, 14);
++-      if (nvk_cmd_buffer_compute_cls(cmd) < BLACKWELL_COMPUTE_A) {
+++      if (nvk_cmd_buffer_compute_cls(cmd) < BLACKWELL_COMPUTE_A &&
+++          (nvk_queue_engines_from_queue_flags(nvk_cmd_buffer_queue_flags(cmd)) &
+++           NVKMD_ENGINE_3D)) {
++          P_IMMD(p, NVC597, SET_MME_DATA_FIFO_CONFIG, FIFO_SIZE_SIZE_4KB);
+++      } else if (nvk_cmd_buffer_compute_cls(cmd) < BLACKWELL_COMPUTE_A) {
+++         /* A channel without the 3D class (compute-only family) sizes the
+++          * data FIFO the macro's MME_DMA_READ_FIFOED fills through the
+++          * compute class, which has the same method from AMPERE_COMPUTE_B
+++          * to Hopper (clc7c0.h..clcbc0.h SET_MME_DATA_FIFO_CONFIG 0x0574).
+++          * No subchannel switch happens there, so stall the command
+++          * streamer explicitly as on Blackwell below.
+++          */
+++         assert(nvk_cmd_buffer_compute_cls(cmd) >= AMPERE_COMPUTE_B);
+++         if (nvk_cmd_buffer_compute_cls(cmd) >= HOPPER_COMPUTE_A)
+++            __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NVC86F_WFI, 0);
+++         else
+++            __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NV906F_SET_REFERENCE, 0);
+++         P_IMMD(p, NVC7C0, SET_MME_DATA_FIFO_CONFIG, FIFO_SIZE_SIZE_4KB);
++       } else {
++          /* The line in the other side of the if causes an implicit wfi
++           * due to the subc switch which we apparently rely on for
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nv_rm.h b/nvidia-prolapse/driver-source/native/mesa/nv_rm.h
+index 6378ee6..e39de65 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nv_rm.h
++++ b/nvidia-prolapse/driver-source/native/mesa/nv_rm.h
+@@ -43,6 +43,16 @@ struct NvRmInfo {
+    /* RM's SM ISA code (NV2080_CTRL_GR_INFO_INDEX_SM_VERSION, e.g. 0xa04 on
+     * GB20x); `sm` is the shader model decimal derived from it. */
+    uint32_t sm_isa;
++   /* NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_COUNT and _SHADER_PIPE_SUB_COUNT
++    * (the TPC count): inputs of the compute contexts' SET_SCG_CONTROL. */
++   uint32_t shader_pipe_count, shader_pipe_sub_count;
++   /* Contexts that can join another context's channel group
++    * (nv_rm_context_create_shared): from Volta on RM's subcontext count
++    * (GR info MAX_SUBCONTEXT_COUNT) less VEID 0; before Volta, where joining
++    * channels share the group's single GR context, the group's 32 channels
++    * less one (gm107 dev_ram.h NV_RAMRL_ENTRY_TSG_LENGTH_MAX). */
++   uint32_t max_shared_ctx;
++   uint32_t reserved;
+ };
+ struct NvRmAllocation {
+    uint64_t id, size;
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-cond-render.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-cond-render.patch
+new file mode 100644
+index 0000000..e82f346
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-cond-render.patch
+@@ -0,0 +1,121 @@
++--- a/src/nouveau/vulkan/nvk_cmd_draw.c
+++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
++@@ -6016,8 +6016,12 @@
++ 
++    struct mme_value64 cond_render_addr = mme_load_addr64(b);
++ 
+++   /* Address bit 0: inverted; bit 1: the queue has no 3D class (the
+++    * condition address is 4-byte aligned, VUID-VkConditionalRenderingBeginInfoEXT-offset-01984).
+++    */
++    struct mme_value inverted = mme_merge(b, mme_zero(), cond_render_addr.lo, 0, 1, 0);
++-   mme_merge_to(b, cond_render_addr.lo, mme_zero(), cond_render_addr.lo, 1, 31, 1);
+++   struct mme_value compute_only = mme_merge(b, mme_zero(), cond_render_addr.lo, 0, 1, 1);
+++   mme_merge_to(b, cond_render_addr.lo, mme_zero(), cond_render_addr.lo, 2, 30, 2);
++ 
++    mme_tu104_read_fifoed(b, cond_render_addr, mme_imm(1));
++    struct mme_value read_value = mme_load(b);
++@@ -6035,7 +6039,22 @@
++       mme_emit(b, mme_zero());
++       mme_emit(b, mme_zero());
++       mme_emit(b, mme_imm(NV9097_SET_GLOBAL_RENDER_ENABLE_C_MODE_FALSE));
+++
+++      /* On a channel without the 3D class the global render enable does
+++       * not stop compute launches; the compute class's own render enable
+++       * does.  The proprietary driver's compute-queue conditional-rendering
+++       * macro writes SET_RENDER_ENABLE_C of the compute class
+++       * (libnvidia-eglcore.so 615.78.08, macro 110 of its compute-queue
+++       * channel, method 0x1558).
+++       */
+++      mme_if(b, ine, compute_only, mme_zero()) {
+++         mme_mthd(b, NV90C0_SET_RENDER_ENABLE_A);
+++         mme_emit(b, mme_zero());
+++         mme_emit(b, mme_zero());
+++         mme_emit(b, mme_imm(NV90C0_SET_RENDER_ENABLE_C_MODE_FALSE));
+++      }
++    }
+++   mme_free_reg(b, compute_only);
++ }
++ 
++ static void
++@@ -6052,10 +6071,20 @@
++    if (inverted)
++       addr |= 1;
++ 
+++   /* A queue without the 3D class (compute-only family) calls the macro
+++    * it loaded through the compute class (nvk_queue_init_context_state),
+++    * and the macro also sets the compute class's render enable.
+++    */
+++   const bool compute_only =
+++      !(nvk_queue_engines_from_queue_flags(nvk_cmd_buffer_queue_flags(cmd)) &
+++        NVKMD_ENGINE_3D);
+++   if (compute_only)
+++      addr |= 2;
+++
++    struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
++ 
++    if (pdev->info.cls_compute >= AMPERE_COMPUTE_B &&
++-       nvk_cmd_buffer_last_subchannel(cmd) != SUBC_NV9097)
+++       (compute_only || nvk_cmd_buffer_last_subchannel(cmd) != SUBC_NV9097))
++       P_1INC(p, NV90C0, CALL_MME_MACRO(NVK_MME_BEGIN_COND_RENDER));
++    else
++       P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_BEGIN_COND_RENDER));
++@@ -6092,7 +6121,17 @@
++ 
++    cmd->cs_join_cond_render = false;
++ 
++-   struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
+++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
+++   if (!(nvk_queue_engines_from_queue_flags(nvk_cmd_buffer_queue_flags(cmd)) &
+++         NVKMD_ENGINE_3D)) {
+++      /* The compute class's own render enable, set by
+++       * nvk_mme_begin_cond_render() on this queue.
+++       */
+++      P_MTHD(p, NV90C0, SET_RENDER_ENABLE_A);
+++      P_NV90C0_SET_RENDER_ENABLE_A(p, 0);
+++      P_NV90C0_SET_RENDER_ENABLE_B(p, 0);
+++      P_NV90C0_SET_RENDER_ENABLE_C(p, MODE_TRUE);
+++   }
++    if (nvk_cmd_buffer_last_subchannel(cmd) == SUBC_NV9097) {
++       /* The GLOBAL variant sets render enable across both 3d and compute */
++       P_MTHD(p, NV9097, SET_GLOBAL_RENDER_ENABLE_A);
++--- a/src/nouveau/vulkan/nvk_queue.c
+++++ b/src/nouveau/vulkan/nvk_queue.c
++@@ -19,6 +19,7 @@
++ #include "cla1c0.h"
++ #include "nv_push_clc3c0.h"
++ #include "nv_push_clc397.h"
+++#include "clcdc0.h"
++ #include "nv_push_clc7c0.h"
++ #include "nvk_mme.h"
++ 
++@@ -437,6 +438,13 @@
++          NVK_MME_DISPATCH_INDIRECT,
++          NVK_MME_ADD_CS_INVOCATIONS,
++          NVK_MME_WRITE_CS_INVOCATIONS,
+++         /* vkCmdBeginConditionalRenderingEXT on this queue
+++          * (nvk_cmd_begin_cond_render_mme).  The proprietary driver's
+++          * compute-queue channel also carries its conditional-rendering
+++          * macro and calls it through the compute class (615.78.08, macro
+++          * slot 110 in the load list above).
+++          */
+++         NVK_MME_BEGIN_COND_RENDER,
++       };
++       assert(pdev->info.cls_compute >= AMPERE_COMPUTE_B);
++       uint32_t mme_pos = 0;
++@@ -462,6 +470,16 @@
++ 
++          free(dw);
++       }
+++
+++      /* The macros' MME_DMA_READ_FIFOED fills the data FIFO sized by the
+++       * compute class here, as the 3D class's is at 3D init
+++       * (nvk_push_draw_state_init, Turing..Hopper): AMPERE_COMPUTE_B to
+++       * Hopper have the method (clc7c0.h..clcbc0.h
+++       * SET_MME_DATA_FIFO_CONFIG 0x0574), Blackwell's compute class has
+++       * none.
+++       */
+++      if (pdev->info.cls_compute < BLACKWELL_COMPUTE_A)
+++         P_IMMD(p, NVC7C0, SET_MME_DATA_FIFO_CONFIG, FIFO_SIZE_SIZE_4KB);
++    }
++ 
++    return nvk_queue_push(queue, &push);
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-family.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-family.patch
+index 7ddfebe..d6553ef 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-family.patch
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-family.patch
+@@ -1492,15 +1492,15 @@
+           p_format = util_format_stencil_only(nil_image.format.p_format);
+ --- a/src/nouveau/vulkan/nvk_physical_device.c
+ +++ b/src/nouveau/vulkan/nvk_physical_device.c
+-@@ -57,6 +57,7 @@
++@@ -54,6 +54,7 @@
++ #include "clc5c0.h"
++ #include "clc797.h"
++ #include "clc6c0.h"
+++#include "clc7c0.h"
+  #include "clc997.h"
+  #include "clcdc0.h"
+  #include "clce97.h"
+-+#include "clcec0.h"
+- 
+- static uint32_t
+- nvk_get_vk_version(const struct nv_device_info *info)
+-@@ -1766,6 +1767,39 @@
++@@ -1766,6 +1767,30 @@
+           .queue_count = 2,
+        };
+     }
+@@ -1516,20 +1516,11 @@
+ +    * MME macros for indirect dispatch and compute-invocation queries, and the
+ +    * compute class calls them only from AMPERE_COMPUTE_B on
+ +    * (nvk_cmd_dispatch.c, CALL_MME_MACRO on NVC7C0); before that they run on
+-+    * the 3D class, so earlier GPUs cannot have the family. Transfer commands
+++    * the 3D class, so earlier GPUs do not get the family. Transfer commands
+ +    * on it run as compute meta (nvk_cmd_meta.c).
+-+    *
+-+    * It is exposed only with BLACKWELL_COMPUTE_B (GB20x), the class it has
+-+    * been verified on. With AMPERE_COMPUTE_B and ADA_COMPUTE_A it does not
+-+    * work yet: its dispatches do not run concurrently with the graphics
+-+    * queue's work, and CmdDispatchIndirect on it pushes to a subchannel the
+-+    * context has no object bound on (nv_push subc_mask assert).
+-+    * HOPPER_COMPUTE_A and BLACKWELL_COMPUTE_A were never run with it. No
+-+    * queue is redirected: those GPUs keep the graphics and transfer
+-+    * families only.
+ +    */
+ +   if (nvkmd->kmd_info.max_shared_ctx > 0 &&
+-+       pdev->info.cls_compute >= BLACKWELL_COMPUTE_B) {
+++       pdev->info.cls_compute >= AMPERE_COMPUTE_B) {
+ +      pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
+ +         .queue_flags = VK_QUEUE_COMPUTE_BIT |
+ +                        VK_QUEUE_TRANSFER_BIT |
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-no-mme.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-no-mme.patch
+new file mode 100644
+index 0000000..3e5871d
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-queue-no-mme.patch
+@@ -0,0 +1,951 @@
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
++@@ -138,6 +138,7 @@
++    cmd->cs_join_covered = false;
++    cmd->sked.counter_addr = 0;
++    cmd->sked.launches = 0;
+++   memset(&cmd->cs_inv, 0, sizeof(cmd->cs_inv));
++    cmd->sked.wfi_drain = false;
++    cmd->sked.render_override = false;
++    util_dynarray_clear(&cmd->sked.qmds);
++@@ -487,6 +488,9 @@
++       util_dynarray_append_dynarray(&cmd->pushes, &other->pushes);
++ 
++       cmd->prev_subc = nvk_cmd_buffer_last_subchannel(other);
+++
+++      if (nvk_cmd_cs_invocations_execute(cmd, other))
+++         nvk_cmd_buffer_flush_push(cmd, false);
++    }
++ 
++    /* From the Vulkan 1.3.275 spec:
++@@ -1065,7 +1069,12 @@
++       } else {
++          __push_immd(p, nvk_cmd_buffer_host_subc(cmd), NV906F_SET_REFERENCE, 0);
++ 
++-         if (pdev->info.cls_eng3d >= TURING_A) {
+++         /* A compute-only queue before AMPERE_COMPUTE_B runs no MME
+++          * (nvk_cmd_buffer_compute_has_mme), and its compute class has no
+++          * MME_DMA_SYSMEMBAR (clc7c0.h on).
+++          */
+++         if (pdev->info.cls_eng3d >= TURING_A &&
+++             nvk_cmd_buffer_compute_has_mme(cmd)) {
++             if (engines & NVKMD_ENGINE_3D)
++                P_IMMD(p, NVC597, MME_DMA_SYSMEMBAR, 0);
++             else
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
++@@ -299,6 +299,17 @@
++       struct util_dynarray qmds;
++    } sked;
++ 
+++   /* Compute-shader-invocation statistics on a compute class without MME
+++    * (nvk_cmd_buffer_compute_has_mme): direct dispatches are counted here on
+++    * the CPU, indirect ones on the GPU into the 64-bit accumulator at
+++    * `acc_addr` (`gpu` once one was).  The end of the query writes their sum.
+++    */
+++   struct {
+++      uint64_t cpu;
+++      uint64_t acc_addr;
+++      bool gpu;
+++   } cs_inv;
+++
++    struct nvk_cmd_state {
++       uint64_t descriptor_buffers[NVK_MAX_SETS];
++       struct nvk_graphics_state gfx;
++@@ -386,6 +397,20 @@
++ bool nvk_cmd_sked_qmds_tracked(const struct nvk_physical_device *pdev);
++ VkResult nvk_cmd_sked_counter(struct nvk_cmd_buffer *cmd, uint64_t *addr_out);
++ void nvk_cmd_sked_end(struct nvk_cmd_buffer *cmd);
+++bool nvk_cmd_buffer_compute_has_mme(struct nvk_cmd_buffer *cmd);
+++uint64_t nvk_cmd_cs_invocations_gpu_acc(struct nvk_cmd_buffer *cmd);
+++void nvk_cmd_cs_invocations_zero(struct nvk_cmd_buffer *cmd, uint64_t addr);
+++/* Adds the 64-bit count at `count_addr` to the active query's invocations. */
+++void nvk_cmd_cs_invocations_add(struct nvk_cmd_buffer *cmd,
+++                                uint64_t count_addr);
+++void nvk_cmd_cs_invocations_indirect(struct nvk_cmd_buffer *cmd,
+++                                     uint64_t indirect_addr,
+++                                     uint32_t local_size);
+++/* True when it recorded commands, which must reach the push list before
+++ * the next secondary's.
+++ */
+++bool nvk_cmd_cs_invocations_execute(struct nvk_cmd_buffer *cmd,
+++                                    struct nvk_cmd_buffer *secondary);
++ void nvk_cmd_invalidate_sked_caches(struct nvk_cmd_buffer *cmd);
++ 
++ void nvk_cmd_buffer_begin_compute(struct nvk_cmd_buffer *cmd,
++--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++@@ -317,6 +317,21 @@
++    return pdev->info.cls_compute;
++ }
++ 
+++/* Whether NVK's MME macros can run for this command buffer's compute work:
+++ * through the 3D class, or through the compute class, which has
+++ * CALL_MME_MACRO only from AMPERE_COMPUTE_B on (clc7c0.h).  A compute-only
+++ * queue before that has neither.
+++ */
+++bool
+++nvk_cmd_buffer_compute_has_mme(struct nvk_cmd_buffer *cmd)
+++{
+++   if (nvk_queue_engines_from_queue_flags(nvk_cmd_buffer_queue_flags(cmd)) &
+++       NVKMD_ENGINE_3D)
+++      return true;
+++
+++   return nvk_cmd_buffer_compute_cls(cmd) >= AMPERE_COMPUTE_B;
+++}
+++
++ void
++ nvk_cmd_buffer_begin_compute(struct nvk_cmd_buffer *cmd,
++                              const VkCommandBufferBeginInfo *pBeginInfo)
++@@ -908,7 +923,8 @@
++                    bool join,
++                    enum nvk_qmd_launch launch,
++                    uint64_t *qmd_addr_out,
++-                   uint64_t *root_desc_addr_out)
+++                   uint64_t *root_desc_addr_out,
+++                   uint32_t *qmd_out)
++ {
++    struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
++    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++@@ -1016,6 +1032,8 @@
++       }
++ 
++       memcpy(qmd_map, qmd, qmd_size_B);
+++      if (qmd_out != NULL)
+++         memcpy(qmd_out, qmd, qmd_size_B);
++    }
++ 
++    *qmd_addr_out = qmd_addr;
++@@ -1039,7 +1057,7 @@
++    return nvk_cmd_upload_qmd(cmd, state->cs.shader, desc,
++                              desc->root, sizeof(desc->root),
++                              global_size, false, launch,
++-                             qmd_addr_out, root_desc_addr_out);
+++                             qmd_addr_out, root_desc_addr_out, NULL);
++ }
++ 
++ static void
++@@ -1094,7 +1112,7 @@
++                                         desc->root, sizeof(desc->root),
++                                         global_size, join,
++                                         nvk_cmd_qmd_launch(cmd),
++-                                        &qmd_addr, NULL);
+++                                        &qmd_addr, NULL, NULL);
++    if (result != VK_SUCCESS) {
++       vk_command_buffer_set_error(&cmd->vk, result);
++       return;
++@@ -1109,13 +1127,17 @@
++          (uint64_t)local_size * (uint64_t)groupCountX *
++          (uint64_t)groupCountY * (uint64_t)groupCountZ;
++ 
++-      struct nv_push *p = nvk_cmd_buffer_push(cmd, 3);
++-      if (nvk_cmd_buffer_compute_cls(cmd) >= AMPERE_COMPUTE_B)
++-         P_1INC(p, NVC7C0, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS));
++-      else
++-         P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS));
++-      P_INLINE_DATA(p, cs_invocations >> 32);
++-      P_INLINE_DATA(p, cs_invocations);
+++      if (!nvk_cmd_buffer_compute_has_mme(cmd)) {
+++         cmd->cs_inv.cpu += cs_invocations;
+++      } else {
+++         struct nv_push *p = nvk_cmd_buffer_push(cmd, 3);
+++         if (nvk_cmd_buffer_compute_cls(cmd) >= AMPERE_COMPUTE_B)
+++            P_1INC(p, NVC7C0, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS));
+++         else
+++            P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS));
+++         P_INLINE_DATA(p, cs_invocations >> 32);
+++         P_INLINE_DATA(p, cs_invocations);
+++      }
++    }
++ 
++    struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
++@@ -1158,7 +1180,7 @@
++                                         root, root_size,
++                                         group_count, false,
++                                         NVK_QMD_LAUNCH_ONCE,
++-                                        &qmd_addr, NULL);
+++                                        &qmd_addr, NULL, NULL);
++    if (result != VK_SUCCESS) {
++       vk_command_buffer_set_error(&cmd->vk, result);
++       return;
++@@ -1363,6 +1385,96 @@
++    }
++ }
++ 
+++/* Indirect dispatch on a compute-only queue without MME
+++ * (nvk_cmd_buffer_compute_has_mme): the dispatch size reaches the root
+++ * descriptor table and the QMD straight from the indirect buffer, fetched by
+++ * the host as push-buffer data.  This is how the proprietary driver launches
+++ * indirect dispatches on its Turing and Volta compute queues
+++ * (libnvidia-eglcore.so 615.71.09 on TU102, 580.178.04 on GV100, push-buffer
+++ * capture): an inline-to-memory write of the group count whose three data
+++ * words are a GPFIFO segment over the VkDispatchIndirectCommand, then the
+++ * QMD loaded inline (SET_INLINE_QMD_ADDRESS + LOAD_INLINE_QMD_DATA), its
+++ * CTA_RASTER_WIDTH/HEIGHT/DEPTH words taken from the same segment.
+++ */
+++static void
+++nvk_cmd_dispatch_indirect_inline_qmd(struct nvk_cmd_buffer *cmd,
+++                                     uint64_t dispatch_addr)
+++{
+++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+++   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+++   const uint32_t qmd_dw = nak_qmd_size_B(&pdev->info) / 4;
+++   const uint32_t size_dw = sizeof(VkDispatchIndirectCommand) / 4;
+++
+++   /* QMD V02_x: CTA_RASTER_WIDTH 415:384, HEIGHT 431:416, DEPTH 463:448,
+++    * each in a word of its own (clc3c0qmd.h..clc6c0qmd.h); the indirect
+++    * command's 16-bit-bounded y and z leave the reserved upper halves 0.
+++    */
+++   const struct nak_qmd_dispatch_size_layout qmd_size_layout =
+++      nak_get_qmd_dispatch_size_layout(&pdev->info);
+++   assert(qmd_size_layout.x_start % 32 == 0 &&
+++          qmd_size_layout.y_start == qmd_size_layout.x_start + 32 &&
+++          qmd_size_layout.z_start == qmd_size_layout.y_start + 32);
+++   const uint32_t size_at_dw = qmd_size_layout.x_start / 32;
+++   assert(size_at_dw + size_dw <= qmd_dw);
+++
+++   uint32_t global_size[3] = { 0, 0, 0 };
+++   uint32_t qmd[NAK_MAX_QMD_DWORDS];
+++   uint64_t qmd_addr = 0, root_desc_addr = 0;
+++   const struct nvk_descriptor_state *desc = &cmd->state.cs.descriptors;
+++   VkResult result = nvk_cmd_upload_qmd(cmd, cmd->state.cs.shader, desc,
+++                                        desc->root, sizeof(desc->root),
+++                                        global_size, false,
+++                                        nvk_cmd_qmd_launch(cmd),
+++                                        &qmd_addr, &root_desc_addr, qmd);
+++   if (result != VK_SUCCESS) {
+++      vk_command_buffer_set_error(&cmd->vk, result);
+++      return;
+++   }
+++
+++   const uint64_t group_count_addr = root_desc_addr +
+++      offsetof(struct nvk_root_descriptor_table, cs.group_count);
+++
+++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
+++   P_MTHD(p, NVA0C0, LINE_LENGTH_IN);
+++   P_NVA0C0_LINE_LENGTH_IN(p, sizeof(VkDispatchIndirectCommand));
+++   P_NVA0C0_LINE_COUNT(p, 1);
+++   P_NVA0C0_OFFSET_OUT_UPPER(p, group_count_addr >> 32);
+++   P_NVA0C0_OFFSET_OUT(p, group_count_addr);
+++   P_IMMD(p, NVA0C0, LAUNCH_DMA, {
+++      .dst_memory_layout = DST_MEMORY_LAYOUT_PITCH,
+++      .sysmembar_disable = SYSMEMBAR_DISABLE_TRUE,
+++   });
+++   P_0INC(p, NVA0C0, LOAD_INLINE_DATA);
+++   nv_push_update_count(p, size_dw);
+++   nvk_cmd_buffer_push_indirect(cmd, dispatch_addr,
+++                                sizeof(VkDispatchIndirectCommand));
+++
+++   p = nvk_cmd_buffer_push(cmd, 4 + size_at_dw);
+++   P_MTHD(p, NVC3C0, SET_INLINE_QMD_ADDRESS_A);
+++   P_NVC3C0_SET_INLINE_QMD_ADDRESS_A(p, qmd_addr >> 40);
+++   P_NVC3C0_SET_INLINE_QMD_ADDRESS_B(p, qmd_addr >> 8);
+++   P_MTHD(p, NVC3C0, LOAD_INLINE_QMD_DATA(0));
+++   P_INLINE_ARRAY(p, qmd, size_at_dw);
+++   /* The method's other words: the dispatch size from the indirect buffer,
+++    * then the rest of the QMD.
+++    */
+++   nv_push_update_count(p, qmd_dw - size_at_dw);
+++   nvk_cmd_buffer_push_indirect(cmd, dispatch_addr,
+++                                sizeof(VkDispatchIndirectCommand));
+++
+++   const uint32_t tail_dw = qmd_dw - size_at_dw - size_dw;
+++   p = nvk_cmd_buffer_push(cmd, tail_dw);
+++   memcpy(p->end, &qmd[size_at_dw + size_dw], tail_dw * 4);
+++   p->end += tail_dw;
+++
+++   if (cmd->state.cs.active_compute_invocations_query ||
+++       cmd->state.inherited_pipeline_statistics &
+++          VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT) {
+++      nvk_cmd_cs_invocations_indirect(cmd, dispatch_addr,
+++                                      nvk_compute_local_size(cmd));
+++   }
+++}
+++
++ VKAPI_ATTR void VKAPI_CALL
++ nvk_CmdDispatchIndirect2KHR(VkCommandBuffer commandBuffer,
++                             const VkDispatchIndirect2InfoKHR* pInfo)
++@@ -1382,6 +1494,11 @@
++    uint32_t global_size[3] = { 0, 0, 0 };
++    nvk_flush_compute_state(cmd, base_workgroup, global_size);
++ 
+++   if (!nvk_cmd_buffer_compute_has_mme(cmd)) {
+++      nvk_cmd_dispatch_indirect_inline_qmd(cmd, dispatch_addr);
+++      return;
+++   }
+++
++    uint64_t qmd_addr = 0, root_desc_addr = 0;
++    VkResult result = nvk_cmd_flush_cs_qmd(cmd, &cmd->state, global_size,
++                                           nvk_cmd_qmd_launch(cmd),
++--- a/src/nouveau/vulkan/nvk_cmd_draw.c
+++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
++@@ -24,6 +24,7 @@
++ #include "nv_push_cl9297.h"
++ #include "nv_push_cl90b5.h"
++ #include "nv_push_cl90c0.h"
+++#include "nv_push_cla0c0.h"
++ #include "nv_push_cla097.h"
++ #include "nv_push_clb097.h"
++ #include "nv_push_clb197.h"
++@@ -6057,6 +6058,65 @@
++    mme_free_reg(b, compute_only);
++ }
++ 
+++/* A compute-only queue without MME (nvk_cmd_buffer_compute_has_mme) and
+++ * without a copy engine: the 32-bit condition reaches operand A through an
+++ * inline-to-memory write whose data word the host fetches from the condition
+++ * buffer as a one-word GPFIFO segment, the way the proprietary driver feeds
+++ * indirect-dispatch sizes on its Turing and Volta compute queues
+++ * (libnvidia-eglcore.so 615.71.09 / 580.178.04, push-buffer capture).  The
+++ * compute class's own render enable then compares the operands; the global
+++ * render enable does not stop launches on a channel without 3D.
+++ */
+++static void
+++nvk_cmd_begin_cond_render_inline_to_memory(struct nvk_cmd_buffer *cmd,
+++                                           const VkConditionalRenderingBeginInfo2EXT *pConditionalRenderingBegin)
+++{
+++   const uint64_t addr = pConditionalRenderingBegin->addressRange.address;
+++   bool inverted = pConditionalRenderingBegin->flags &
+++      VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
+++
+++   /* Same operand layout as nvk_cmd_begin_cond_render_copy_engine(): only
+++    * the low word of operand A is ever written.
+++    */
+++   if (cmd->cond_render_mem == NULL) {
+++      VkResult result = nvk_cmd_buffer_alloc_mem(cmd, false,
+++                                                 &cmd->cond_render_mem);
+++      if (result != VK_SUCCESS) {
+++         vk_command_buffer_set_error(&cmd->vk, result);
+++         return;
+++      }
+++      assert(cmd->cond_render_mem->mem->size_B > 32);
+++      memset(cmd->cond_render_mem->mem->map, 0x00, 32);
+++   }
+++   const uint64_t tmp_addr = cmd->cond_render_mem->mem->va->addr;
+++
+++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 8);
+++   P_MTHD(p, NVA0C0, LINE_LENGTH_IN);
+++   P_NVA0C0_LINE_LENGTH_IN(p, 4);
+++   P_NVA0C0_LINE_COUNT(p, 1);
+++   P_NVA0C0_OFFSET_OUT_UPPER(p, tmp_addr >> 32);
+++   P_NVA0C0_OFFSET_OUT(p, tmp_addr);
+++   P_IMMD(p, NVA0C0, LAUNCH_DMA, {
+++      .dst_memory_layout = DST_MEMORY_LAYOUT_PITCH,
+++      .sysmembar_disable = SYSMEMBAR_DISABLE_TRUE,
+++   });
+++   P_0INC(p, NVA0C0, LOAD_INLINE_DATA);
+++   nv_push_update_count(p, 1);
+++   nvk_cmd_buffer_push_indirect(cmd, addr, 4);
+++
+++   /* The proprietary driver's internal-launch form waits for its operand
+++    * (host ACQ_CIRC_GEQ on the launch counter) before SET_RENDER_ENABLE_C;
+++    * the write above is waited for the same way here.
+++    */
+++   p = nvk_cmd_buffer_push(cmd, 6);
+++   P_IMMD(p, NVA0C0, WAIT_FOR_IDLE, 0);
+++   P_MTHD(p, NVA0C0, SET_RENDER_ENABLE_A);
+++   P_NVA0C0_SET_RENDER_ENABLE_A(p, tmp_addr >> 32);
+++   P_NVA0C0_SET_RENDER_ENABLE_B(p, tmp_addr);
+++   P_NVA0C0_SET_RENDER_ENABLE_C(p, inverted ? MODE_RENDER_IF_EQUAL
+++                                            : MODE_RENDER_IF_NOT_EQUAL);
+++}
+++
++ static void
++ nvk_cmd_begin_cond_render_mme(struct nvk_cmd_buffer *cmd,
++                               const VkConditionalRenderingBeginInfo2EXT *pConditionalRenderingBegin)
++@@ -6107,7 +6167,9 @@
++    nvk_cmd_cs_join_close(cmd);
++    cmd->cs_join_cond_render = true;
++ 
++-   if (pdev->info.cls_eng3d >= TURING_A) {
+++   if (!nvk_cmd_buffer_compute_has_mme(cmd)) {
+++      nvk_cmd_begin_cond_render_inline_to_memory(cmd, pConditionalRenderingBegin);
+++   } else if (pdev->info.cls_eng3d >= TURING_A) {
++       nvk_cmd_begin_cond_render_mme(cmd, pConditionalRenderingBegin);
++    } else {
++       nvk_cmd_begin_cond_render_copy_engine(cmd, pConditionalRenderingBegin);
++--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
+++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
++@@ -55,6 +55,9 @@
++     uint32_t ies_stride;
++     uint64_t ies_addr;
++     uint64_t root_addr;
+++    uint32_t no_mme;
+++    uint32_t pad;
+++    uint64_t cs_acc_addr;
++ };
++ 
++ struct process_cmd_in {
++@@ -66,6 +69,8 @@
++     nir_def *ies_stride;
++     nir_def *ies_addr;
++     nir_def *root_addr;
+++    nir_def *no_mme;
+++    nir_def *cs_acc_addr;
++ };
++ 
++ static nir_def *
++@@ -88,6 +93,8 @@
++       { .type = glsl_uint_type(),     .name = "ies_stride",    .offset = 0x24 },
++       { .type = glsl_uint64_t_type(), .name = "ies_addr",      .offset = 0x28 },
++       { .type = glsl_uint64_t_type(), .name = "root_addr",     .offset = 0x30 },
+++      { .type = glsl_uint_type(),     .name = "no_mme",        .offset = 0x38 },
+++      { .type = glsl_uint64_t_type(), .name = "cs_acc_addr",   .offset = 0x40 },
++    };
++    const struct glsl_type *push_iface_type =
++       glsl_interface_type(push_fields, ARRAY_SIZE(push_fields),
++@@ -105,6 +112,8 @@
++       .ies_stride    = load_struct_var(b, push, 5),
++       .ies_addr      = load_struct_var(b, push, 6),
++       .root_addr     = load_struct_var(b, push, 7),
+++      .no_mme        = load_struct_var(b, push, 8),
+++      .cs_acc_addr   = load_struct_var(b, push, 9),
++    };
++ }
++ 
++@@ -434,12 +443,32 @@
++             invoc = nir_imul(b, invoc, nir_u2u64(b, local_size));
++ 
++             /* Now emit commands */
++-            if (pdev->info.cls_compute >= AMPERE_COMPUTE_B)
+++            if (pdev->info.cls_compute >= AMPERE_COMPUTE_B) {
++                nvk_nir_P_1INC(b, p, NVC7C0, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS), 2);
++-            else
++-               nvk_nir_P_1INC(b, p, NV9097, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS), 2);
++-            nvk_nir_push_dw(b, p, nir_unpack_64_2x32_split_y(b, invoc));
++-            nvk_nir_push_dw(b, p, nir_unpack_64_2x32_split_x(b, invoc));
+++               nvk_nir_push_dw(b, p, nir_unpack_64_2x32_split_y(b, invoc));
+++               nvk_nir_push_dw(b, p, nir_unpack_64_2x32_split_x(b, invoc));
+++            } else {
+++               /* A compute-only queue has no MME before AMPERE_COMPUTE_B
+++                * (nvk_cmd_buffer_compute_has_mme): count into the command
+++                * buffer's accumulator here instead.
+++                */
+++               nir_push_if(b, nir_ieq_imm(b, in->no_mme, 0));
+++               {
+++                  nvk_nir_P_1INC(b, p, NV9097, CALL_MME_MACRO(NVK_MME_ADD_CS_INVOCATIONS), 2);
+++                  nvk_nir_push_dw(b, p, nir_unpack_64_2x32_split_y(b, invoc));
+++                  nvk_nir_push_dw(b, p, nir_unpack_64_2x32_split_x(b, invoc));
+++               }
+++               nir_push_else(b, NULL);
+++               {
+++                  nir_push_if(b, nir_ine_imm(b, in->cs_acc_addr, 0));
+++                  {
+++                     nir_global_atomic(b, 64, in->cs_acc_addr, invoc,
+++                                       .atomic_op = nir_atomic_op_iadd);
+++                  }
+++                  nir_pop_if(b, NULL);
+++               }
+++               nir_pop_if(b, NULL);
+++            }
++ 
++             nvk_nir_P_1INC(b, p, NVA0C0, SEND_PCAS_A, 1);
++             nvk_nir_push_dw(b, p, nir_u2u32(b, nir_ushr_imm(b, qmd_addr, 8)));
++@@ -1030,6 +1059,32 @@
++    nvk_indirect_commands_layout_destroy(dev, layout, pAllocator);
++ }
++ 
+++/* Compute layouts on a device whose compute class has no MME (before
+++ * AMPERE_COMPUTE_B) end the preprocess buffer with a 64-bit total of the
+++ * compute-shader invocations the process shader generated: a compute-only
+++ * queue there counts them without NVK's macros (nvk_cmd_buffer_compute_has_mme).
+++ */
+++static bool
+++nvk_dgc_has_cs_inv_total(const struct nvk_physical_device *pdev,
+++                         const struct nvk_indirect_commands_layout *layout)
+++{
+++   return pdev->info.cls_compute < AMPERE_COMPUTE_B &&
+++          (layout->stages & VK_SHADER_STAGE_COMPUTE_BIT);
+++}
+++
+++static uint64_t
+++nvk_dgc_preprocess_size_B(const struct nvk_indirect_commands_layout *layout,
+++                          uint32_t max_seq_count)
+++{
+++   uint64_t size = layout->cmd_seq_stride_B * (uint64_t)max_seq_count;
+++   if (layout->qmd_size_per_seq_B > 0) {
+++      size = align64(size, NAK_QMD_ALIGN_B);
+++      size += QMD_ALLOC_CHUNK_SIZE_B; /* One for the allocator */
+++      size += layout->qmd_size_per_seq_B * max_seq_count;
+++   }
+++   return size;
+++}
+++
++ VKAPI_ATTR void VKAPI_CALL
++ nvk_GetGeneratedCommandsMemoryRequirementsEXT(
++     VkDevice _device,
++@@ -1041,12 +1096,12 @@
++                   pInfo->indirectCommandsLayout);
++    const struct nvk_physical_device *pdev = nvk_device_physical(dev);
++ 
++-   uint64_t size = layout->cmd_seq_stride_B * (uint64_t)pInfo->maxSequenceCount;
++-   if (layout->qmd_size_per_seq_B > 0) {
++-      size = align64(size, NAK_QMD_ALIGN_B);
++-      size += QMD_ALLOC_CHUNK_SIZE_B; /* One for the allocator */
++-      size += layout->qmd_size_per_seq_B * pInfo->maxSequenceCount;
++-   }
+++   uint64_t size = nvk_dgc_preprocess_size_B(layout, pInfo->maxSequenceCount);
+++   /* Keep the size a multiple of the alignment: applications place
+++    * preprocess buffers back to back.
+++    */
+++   if (nvk_dgc_has_cs_inv_total(pdev, layout))
+++      size = align64(align64(size, 8) + 8, NAK_QMD_ALIGN_B);
++ 
++    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
++       .size = size,
++@@ -1055,14 +1110,28 @@
++    };
++ }
++ 
+++static uint64_t
+++nvk_dgc_cs_inv_total_addr(const struct nvk_indirect_commands_layout *layout,
+++                          const VkGeneratedCommandsInfoEXT *info)
+++{
+++   return info->preprocessAddress +
+++          align64(nvk_dgc_preprocess_size_B(layout, info->maxSequenceCount), 8);
+++}
+++
+++/* `exec_cmd` is the command buffer whose queue runs the generated commands
+++ * (the state command buffer when preprocessed separately).
+++ */
++ static void
++ nvk_cmd_process_cmds(struct nvk_cmd_buffer *cmd,
+++                     struct nvk_cmd_buffer *exec_cmd,
++                      const VkGeneratedCommandsInfoEXT *info,
++                      const struct nvk_cmd_state *state)
++ {
++    VK_FROM_HANDLE(nvk_indirect_execution_set, ies, info->indirectExecutionSet);
++    VK_FROM_HANDLE(nvk_indirect_commands_layout, layout,
++                   info->indirectCommandsLayout);
+++   const struct nvk_physical_device *pdev =
+++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
++ 
++    struct process_cmd_push push = {
++       .in_addr       = info->indirectAddress,
++@@ -1071,6 +1140,18 @@
++       .max_seq_count = info->maxSequenceCount,
++    };
++ 
+++   /* The generated commands call no MME on a queue without it; the
+++    * process shader totals their invocations instead and the executing
+++    * command buffer adds the total to its query
+++    * (nvk_CmdExecuteGeneratedCommandsEXT).
+++    */
+++   if (!nvk_cmd_buffer_compute_has_mme(exec_cmd) &&
+++       nvk_dgc_has_cs_inv_total(pdev, layout)) {
+++      push.no_mme = 1;
+++      push.cs_acc_addr = nvk_dgc_cs_inv_total_addr(layout, info);
+++      nvk_cmd_cs_invocations_zero(cmd, push.cs_acc_addr);
+++   }
+++
++    uint64_t qmd_addr = 0;
++    if (layout->stages & VK_SHADER_STAGE_COMPUTE_BIT) {
++       uint32_t global_size[3] = { 0, 0, 0 };
++@@ -1134,7 +1215,7 @@
++    cmd->cs_join_covered = false;
++ 
++    nvk_cmd_flush_process_state(state_cmd, info);
++-   nvk_cmd_process_cmds(cmd, info, &state_cmd->state);
+++   nvk_cmd_process_cmds(cmd, state_cmd, info, &state_cmd->state);
++ }
++ 
++ VKAPI_ATTR void VKAPI_CALL
++@@ -1156,7 +1237,7 @@
++ 
++    if (!isPreprocessed) {
++       nvk_cmd_flush_process_state(cmd, info);
++-      nvk_cmd_process_cmds(cmd, info, &cmd->state);
+++      nvk_cmd_process_cmds(cmd, cmd, info, &cmd->state);
++ 
++       struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
++       P_IMMD(p, NVA0C0, INVALIDATE_SHADER_CACHES, {
++@@ -1175,6 +1256,13 @@
++ 
++    if (layout->stages & VK_SHADER_STAGE_COMPUTE_BIT) {
++       assert(info->shaderStages == VK_SHADER_STAGE_COMPUTE_BIT);
+++      if (!nvk_cmd_buffer_compute_has_mme(cmd) &&
+++          (cmd->state.cs.active_compute_invocations_query ||
+++           cmd->state.inherited_pipeline_statistics &
+++              VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)) {
+++         assert(nvk_dgc_has_cs_inv_total(pdev, layout));
+++         nvk_cmd_cs_invocations_add(cmd, nvk_dgc_cs_inv_total_addr(layout, info));
+++      }
++       nvk_cmd_buffer_flush_push_descriptors(cmd, &cmd->state.cs.descriptors);
++    } else if (layout->stages & NVK_SHADER_STAGE_GRAPHICS_BITS) {
++       assert(!(layout->stages & ~NVK_SHADER_STAGE_GRAPHICS_BITS));
++--- a/src/nouveau/vulkan/nvk_device.c
+++++ b/src/nouveau/vulkan/nvk_device.c
++@@ -496,6 +496,8 @@
++ 
++    if (dev->copy_queries)
++       vk_shader_destroy(&dev->vk, &dev->copy_queries->vk, &dev->vk.alloc);
+++   if (dev->cs_invocations)
+++      vk_shader_destroy(&dev->vk, &dev->cs_invocations->vk, &dev->vk.alloc);
++ 
++    if (dev->nvkmd)
++       nvk_device_finish_meta(dev);
++--- a/src/nouveau/vulkan/nvk_device.h
+++++ b/src/nouveau/vulkan/nvk_device.h
++@@ -73,6 +73,7 @@
++    struct vk_meta_device meta;
++ 
++    struct nvk_shader *copy_queries;
+++   struct nvk_shader *cs_invocations;
++    struct nvk_shader *copy_indirect;
++ };
++ 
++--- a/src/nouveau/vulkan/nvk_physical_device.c
+++++ b/src/nouveau/vulkan/nvk_physical_device.c
++@@ -1774,16 +1774,23 @@
++     * so its work runs on the GR engine next to the graphics queue's.
++     *
++     * Such a context carries only the compute class: the 3D class runs only
++-    * on subcontext 0 and the KMD puts no copy engine there (the proprietary
++-    * driver's compute-queue channel has one compute object only). NVK needs
++-    * MME macros for indirect dispatch and compute-invocation queries, and the
++-    * compute class calls them only from AMPERE_COMPUTE_B on
++-    * (nvk_cmd_dispatch.c, CALL_MME_MACRO on NVC7C0); before that they run on
++-    * the 3D class, so earlier GPUs do not get the family. Transfer commands
++-    * on it run as compute meta (nvk_cmd_meta.c).
+++    * on subcontext 0 and the KMD puts no copy engine there. Subcontexts
+++    * exist from Volta on, and the proprietary driver offers the family on
+++    * every class with them (615.78.08 builds it without a class check;
+++    * 580.178.04 on GV100 and 615.71.09 on TU102 expose it). 580.178.04
+++    * also offers it on GP10x, where the channel joins the group's single GR
+++    * context, so the compute-class state of both queues is one: on a GP104
+++    * a graphics-queue dispatch submitted while the compute queue waits on
+++    * an event inside conditional rendering is discarded here and never
+++    * completes with the proprietary driver.  The family therefore starts at
+++    * Volta.  Before
+++    * AMPERE_COMPUTE_B the compute class has no MME, so command buffers on
+++    * this queue do without NVK's macros there
+++    * (nvk_cmd_buffer_compute_has_mme). Transfer commands on it run as
+++    * compute meta (nvk_cmd_meta.c).
++     */
++    if (nvkmd->kmd_info.max_shared_ctx > 0 &&
++-       pdev->info.cls_compute >= AMPERE_COMPUTE_B) {
+++       pdev->info.cls_compute >= VOLTA_COMPUTE_A) {
++       pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
++          .queue_flags = VK_QUEUE_COMPUTE_BIT |
++                         VK_QUEUE_TRANSFER_BIT |
++--- a/src/nouveau/vulkan/nvk_query_pool.c
+++++ b/src/nouveau/vulkan/nvk_query_pool.c
++@@ -294,6 +294,20 @@
++    }
++ }
++ 
+++enum nvk_cs_inv_op {
+++   /* dst += src[0] * src[1] * src[2] * add (src: VkDispatchIndirectCommand) */
+++   NVK_CS_INV_OP_INDIRECT = 0,
+++   /* dst += *src + add */
+++   NVK_CS_INV_OP_ADD = 1,
+++   /* dst = *src + add */
+++   NVK_CS_INV_OP_STORE = 2,
+++};
+++
+++static void nvk_cmd_cs_inv_dispatch(struct nvk_cmd_buffer *cmd, uint64_t dst,
+++                                    uint64_t src, uint64_t add,
+++                                    enum nvk_cs_inv_op op);
+++static uint64_t nvk_cmd_cs_inv_reset_acc(struct nvk_cmd_buffer *cmd);
+++
++ static void
++ nvk_sync_queries_to_gpu(struct nvk_query_pool *pool,
++                         uint32_t first_query, uint32_t count)
++@@ -660,7 +674,11 @@
++          assert(!(stats_left & (sq->flag - 1)));
++ 
++          if (sq->flag == VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT) {
++-            if (pdev->info.cls_compute >= AMPERE_COMPUTE_B) {
+++            if (!nvk_cmd_buffer_compute_has_mme(cmd)) {
+++               cmd->cs_inv.cpu = 0;
+++               nvk_cmd_cs_inv_reset_acc(cmd);
+++               p = nvk_cmd_buffer_push(cmd, (stat_count - 1) * 2);
+++            } else if (pdev->info.cls_compute >= AMPERE_COMPUTE_B) {
++                P_IMMD_WORD(p, NVC7C0, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_CS_INVOCATIONS_HI), 0);
++                P_IMMD_WORD(p, NVC7C0, SET_MME_SHADOW_SCRATCH(NVK_MME_SCRATCH_CS_INVOCATIONS_LO), 0);
++             }
++@@ -804,12 +822,26 @@
++          assert(!(stats_left & (sq->flag - 1)));
++ 
++          if (sq->flag == VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT) {
++-            if (pdev->info.cls_compute >= AMPERE_COMPUTE_B)
++-               P_1INC(p, NVC7C0, CALL_MME_MACRO(NVK_MME_WRITE_CS_INVOCATIONS));
++-            else
++-               P_1INC(p, NVC597, CALL_MME_MACRO(NVK_MME_WRITE_CS_INVOCATIONS));
++-            P_INLINE_DATA(p, report_addr >> 32);
++-            P_INLINE_DATA(p, report_addr);
+++            if (!nvk_cmd_buffer_compute_has_mme(cmd)) {
+++               if (cmd->cs_inv.gpu) {
+++                  nvk_cmd_cs_inv_dispatch(cmd, report_addr,
+++                                          cmd->cs_inv.acc_addr,
+++                                          cmd->cs_inv.cpu,
+++                                          NVK_CS_INV_OP_STORE);
+++               } else {
+++                  nvk_cmd_release_word(cmd, report_addr, cmd->cs_inv.cpu);
+++                  nvk_cmd_release_word(cmd, report_addr + 4,
+++                                       cmd->cs_inv.cpu >> 32);
+++               }
+++               p = nvk_cmd_buffer_push(cmd, (stat_count - 1) * 5);
+++            } else {
+++               if (pdev->info.cls_compute >= AMPERE_COMPUTE_B)
+++                  P_1INC(p, NVC7C0, CALL_MME_MACRO(NVK_MME_WRITE_CS_INVOCATIONS));
+++               else
+++                  P_1INC(p, NVC597, CALL_MME_MACRO(NVK_MME_WRITE_CS_INVOCATIONS));
+++               P_INLINE_DATA(p, report_addr >> 32);
+++               P_INLINE_DATA(p, report_addr);
+++            }
++          } else {
++             P_MTHD(p, NV9097, SET_REPORT_SEMAPHORE_A);
++             P_NV9097_SET_REPORT_SEMAPHORE_A(p, report_addr >> 32);
++@@ -1114,6 +1146,225 @@
++    return VK_SUCCESS;
++ }
++ 
+++/* Compute-shader invocations on a compute class without MME.
+++ *
+++ * The proprietary driver counts them the same way on its Turing and Volta
+++ * compute queues (libnvidia-eglcore.so 615.71.09 / 580.178.04, push-buffer
+++ * capture): vkCmdBeginQuery zeroes the query and a 64-bit accumulator of the
+++ * command buffer, every indirect dispatch launches a one-thread internal
+++ * program with (indirect address, accumulator, local size) and
+++ * vkCmdEndQuery one with (query, accumulator, invocations counted on the
+++ * CPU).  Here the end waits for the indirect contributions first.
+++ */
+++
+++struct nvk_cs_inv_push {
+++   uint64_t dst;
+++   uint64_t src;
+++   uint64_t add;
+++   uint32_t op;
+++   uint32_t pad;
+++};
+++
+++static nir_shader *
+++build_cs_invocations_shader(void)
+++{
+++   nir_builder build =
+++      nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL,
+++                                     "nvk-meta-cs-invocations");
+++   nir_builder *b = &build;
+++
+++   struct glsl_struct_field push_fields[] = {
+++      { .type = glsl_uint64_t_type(), .name = "dst", .offset = 0 },
+++      { .type = glsl_uint64_t_type(), .name = "src", .offset = 8 },
+++      { .type = glsl_uint64_t_type(), .name = "add", .offset = 16 },
+++      { .type = glsl_uint_type(), .name = "op", .offset = 24 },
+++   };
+++   const struct glsl_type *push_iface_type =
+++      glsl_interface_type(push_fields, ARRAY_SIZE(push_fields),
+++                          GLSL_INTERFACE_PACKING_STD140,
+++                          false /* row_major */, "push");
+++   nir_variable *push = nir_variable_create(b->shader, nir_var_mem_push_const,
+++                                            push_iface_type, "push");
+++
+++   b->shader->info.workgroup_size[0] = 1;
+++
+++   nir_def *dst = load_struct_var(b, push, 0);
+++   nir_def *src = load_struct_var(b, push, 1);
+++   nir_def *add = load_struct_var(b, push, 2);
+++   nir_def *op = load_struct_var(b, push, 3);
+++
+++   /* Written by earlier work on any SM: read around the L1. */
+++   nir_push_if(b, nir_ieq_imm(b, op, NVK_CS_INV_OP_INDIRECT));
+++   {
+++      nir_def *size = nir_load_global(b, 3, 32, src, .align_mul = 4,
+++                                      .access = ACCESS_COHERENT);
+++      nir_def *count = nir_imul_2x32_64(b, nir_channel(b, size, 0),
+++                                        nir_channel(b, size, 1));
+++      count = nir_imul(b, count, nir_u2u64(b, nir_channel(b, size, 2)));
+++      count = nir_imul(b, count, add);
+++      nir_global_atomic(b, 64, dst, count, .atomic_op = nir_atomic_op_iadd);
+++   }
+++   nir_push_else(b, NULL);
+++   {
+++      nir_def *sum = nir_iadd(b, nir_load_global(b, 1, 64, src,
+++                                                  .align_mul = 8,
+++                                                  .access = ACCESS_COHERENT),
+++                              add);
+++      nir_push_if(b, nir_ieq_imm(b, op, NVK_CS_INV_OP_ADD));
+++      {
+++         nir_global_atomic(b, 64, dst, sum, .atomic_op = nir_atomic_op_iadd);
+++      }
+++      nir_push_else(b, NULL);
+++      {
+++         nir_store_global(b, sum, dst, .align_mul = 8,
+++                          .access = ACCESS_COHERENT);
+++      }
+++      nir_pop_if(b, NULL);
+++   }
+++   nir_pop_if(b, NULL);
+++
+++   return build.shader;
+++}
+++
+++static VkResult
+++get_cs_invocations_shader(struct nvk_device *dev,
+++                          struct nvk_shader **shader_out)
+++{
+++   struct nvk_shader *shader = p_atomic_read(&dev->cs_invocations);
+++   if (shader != NULL) {
+++      *shader_out = shader;
+++      return VK_SUCCESS;
+++   }
+++
+++   nir_shader *nir = build_cs_invocations_shader();
+++   VkResult result = nvk_compile_nir_shader(dev, nir, &dev->vk.alloc, &shader);
+++   if (result != VK_SUCCESS)
+++      return result;
+++
+++   *shader_out = atomic_set_or_destroy_shader(dev, &dev->cs_invocations,
+++                                              shader, &dev->vk.alloc);
+++
+++   return VK_SUCCESS;
+++}
+++
+++static void
+++nvk_cmd_cs_inv_dispatch(struct nvk_cmd_buffer *cmd, uint64_t dst,
+++                        uint64_t src, uint64_t add, enum nvk_cs_inv_op op)
+++{
+++   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+++
+++   struct nvk_shader *shader;
+++   VkResult result = get_cs_invocations_shader(dev, &shader);
+++   if (result != VK_SUCCESS) {
+++      vk_command_buffer_set_error(&cmd->vk, result);
+++      return;
+++   }
+++
+++   /* The operands come from earlier internal launches and dispatches. */
+++   if (op != NVK_CS_INV_OP_INDIRECT) {
+++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+++      P_IMMD(p, NVA0C0, WAIT_FOR_IDLE, 0);
+++   }
+++
+++   const struct nvk_cs_inv_push push = {
+++      .dst = dst,
+++      .src = src,
+++      .add = add,
+++      .op = op,
+++   };
+++   nvk_cmd_dispatch_shader(cmd, shader, &push, sizeof(push), 1, 1, 1);
+++}
+++
+++/* The command buffer's accumulator, zeroed at this point of its stream. */
+++static uint64_t
+++nvk_cmd_cs_inv_reset_acc(struct nvk_cmd_buffer *cmd)
+++{
+++   if (cmd->cs_inv.acc_addr == 0) {
+++      void *map;
+++      VkResult result = nvk_cmd_buffer_upload_alloc(cmd, 8, 8,
+++                                                    &cmd->cs_inv.acc_addr,
+++                                                    &map);
+++      if (result != VK_SUCCESS) {
+++         vk_command_buffer_set_error(&cmd->vk, result);
+++         return 0;
+++      }
+++   }
+++   nvk_cmd_cs_invocations_zero(cmd, cmd->cs_inv.acc_addr);
+++   cmd->cs_inv.gpu = false;
+++   return cmd->cs_inv.acc_addr;
+++}
+++
+++uint64_t
+++nvk_cmd_cs_invocations_gpu_acc(struct nvk_cmd_buffer *cmd)
+++{
+++   assert(!nvk_cmd_buffer_compute_has_mme(cmd));
+++
+++   /* A secondary counts into its own accumulator, which the primary adds
+++    * up when it executes it (nvk_cmd_cs_invocations_execute).
+++    */
+++   if (cmd->cs_inv.acc_addr == 0 || (!cmd->cs_inv.gpu &&
+++       cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY)) {
+++      if (nvk_cmd_cs_inv_reset_acc(cmd) == 0)
+++         return 0;
+++   }
+++
+++   cmd->cs_inv.gpu = true;
+++   return cmd->cs_inv.acc_addr;
+++}
+++
+++void
+++nvk_cmd_cs_invocations_zero(struct nvk_cmd_buffer *cmd, uint64_t addr)
+++{
+++   nvk_cmd_release_word(cmd, addr, 0);
+++   nvk_cmd_release_word(cmd, addr + 4, 0);
+++}
+++
+++void
+++nvk_cmd_cs_invocations_add(struct nvk_cmd_buffer *cmd, uint64_t count_addr)
+++{
+++   const uint64_t acc_addr = nvk_cmd_cs_invocations_gpu_acc(cmd);
+++   if (acc_addr == 0)
+++      return;
+++
+++   nvk_cmd_cs_inv_dispatch(cmd, acc_addr, count_addr, 0, NVK_CS_INV_OP_ADD);
+++}
+++
+++void
+++nvk_cmd_cs_invocations_indirect(struct nvk_cmd_buffer *cmd,
+++                                uint64_t indirect_addr, uint32_t local_size)
+++{
+++   const uint64_t acc_addr = nvk_cmd_cs_invocations_gpu_acc(cmd);
+++   if (acc_addr == 0)
+++      return;
+++
+++   nvk_cmd_cs_inv_dispatch(cmd, acc_addr, indirect_addr, local_size,
+++                           NVK_CS_INV_OP_INDIRECT);
+++}
+++
+++bool
+++nvk_cmd_cs_invocations_execute(struct nvk_cmd_buffer *cmd,
+++                               struct nvk_cmd_buffer *secondary)
+++{
+++   if (nvk_cmd_buffer_compute_has_mme(cmd) ||
+++       !cmd->state.cs.active_compute_invocations_query ||
+++       !(secondary->state.inherited_pipeline_statistics &
+++         VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT))
+++      return false;
+++
+++   cmd->cs_inv.cpu += secondary->cs_inv.cpu;
+++   if (secondary->cs_inv.gpu) {
+++      /* Right after the secondary: executing it again re-zeroes its
+++       * accumulator.
+++       */
+++      nvk_cmd_cs_inv_dispatch(cmd, cmd->cs_inv.acc_addr,
+++                              secondary->cs_inv.acc_addr, 0,
+++                              NVK_CS_INV_OP_ADD);
+++      cmd->cs_inv.gpu = true;
+++      return true;
+++   }
+++   return false;
+++}
+++
++ static void
++ nvk_meta_copy_query_pool_results(struct nvk_cmd_buffer *cmd,
++                                  struct nvk_query_pool *pool,
++--- a/src/nouveau/vulkan/nvk_queue.c
+++++ b/src/nouveau/vulkan/nvk_queue.c
++@@ -431,9 +431,14 @@
++     * 0 in a group with a 3D context gets Xid 13 ILLEGAL_MME_METHOD while
++     * loading all of NVK's 32 macros (2700 words); subcontext 0 of a group of
++     * its own loads them all.  So only these are loaded.
+++    *
+++    * Earlier compute classes have no MME (CALL_MME_MACRO from clc7c0.h on);
+++    * command buffers on such a queue do without it
+++    * (nvk_cmd_buffer_compute_has_mme).
++     */
++    if ((queue->engines & NVKMD_ENGINE_COMPUTE) &&
++-       !(queue->engines & NVKMD_ENGINE_3D)) {
+++       !(queue->engines & NVKMD_ENGINE_3D) &&
+++       pdev->info.cls_compute >= AMPERE_COMPUTE_B) {
++       static const enum nvk_mme compute_mmes[] = {
++          NVK_MME_DISPATCH_INDIRECT,
++          NVK_MME_ADD_CS_INVOCATIONS,
++@@ -446,7 +451,6 @@
++           */
++          NVK_MME_BEGIN_COND_RENDER,
++       };
++-      assert(pdev->info.cls_compute >= AMPERE_COMPUTE_B);
++       uint32_t mme_pos = 0;
++       for (uint32_t i = 0; i < ARRAY_SIZE(compute_mmes); i++) {
++          const enum nvk_mme mme = compute_mmes[i];
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-compute-scg-init.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-scg-init.patch
+new file mode 100644
+index 0000000..4a7458e
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-compute-scg-init.patch
+@@ -0,0 +1,181 @@
++--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++@@ -17,7 +17,14 @@
++ #include "cla0b5.h"
++ #include "cla1c0.h"
++ #include "clc0c0.h"
+++#include "clc597.h"
++ #include "clc5c0.h"
+++#include "clc697.h"
+++#include "clc797.h"
+++#include "clc997.h"
+++#include "clcb97.h"
+++#include "clcd97.h"
+++#include "clce97.h"
++ #include "clcbc0.h"
++ #include "clcdc0.h"
++ #include "clcec0.h"
++@@ -73,6 +80,88 @@
++           pdev->nvkmd->kmd_info.sm_isa_version != 0;
++ }
++ 
+++/* SCG (compute-in-graphics) setup of the proprietary driver's compute-context
+++ * initialiser (libnvidia-eglcore.so.615.78.08 E 0x56f1c0), selected by the
+++ * per-3D-class flag word its device setup stores (table E 0xfaf160, lookup
+++ * E 0x4e3cf0; tests E 0x56f6e9 & 0x8011e0, E 0x56f731 & 0x1200000, and the
+++ * defaults of E 0x569190: & 0x68031e0, & 0x1040).
+++ *
+++ *   scg_control   SET_SCG_CONTROL and the SM SCG control sequence are sent
+++ *                 (Turing..Ada; Hopper and Blackwell set a bit of 0x8011e0)
+++ *   falcon10      Turing carries the SM SCG control value in SET_FALCON10
+++ *                 (method 0x0528) instead of SET_SM_SCG_CONTROL (0x01e8)
+++ *   compute_in_graphics  the SM SCG control value (E 0x569190: flag word &
+++ *                 0x68031e0 != 0, i.e. GA10x and AD10x)
+++ *   sched0        byte 0 of SET_SCG_COMPUTE_SCHEDULING_PARAMETERS: 6, or 0
+++ *                 on Blackwell B (E 0x569190 stores 0x0080801f there for
+++ *                 flag word & 0x1040)
+++ *
+++ * Classes without a row (Volta and older, and any class newer than the
+++ * table) are not described here and get none of these methods.
+++ */
+++struct nvk_stock_scg {
+++   bool known, scg_control, falcon10, compute_in_graphics;
+++   uint8_t sched0;
+++};
+++
+++static struct nvk_stock_scg
+++nvk_stock_scg(uint16_t cls_eng3d)
+++{
+++   switch (cls_eng3d) {
+++   case TURING_A:    return (struct nvk_stock_scg) { true, true, true, false, 6 };
+++   case AMPERE_A:    return (struct nvk_stock_scg) { true, true, false, false, 6 };
+++   case AMPERE_B:    return (struct nvk_stock_scg) { true, true, false, true, 6 };
+++   case ADA_A:       return (struct nvk_stock_scg) { true, true, false, true, 6 };
+++   case HOPPER_A:    return (struct nvk_stock_scg) { true, false, false, false, 6 };
+++   case BLACKWELL_A: return (struct nvk_stock_scg) { true, false, false, false, 6 };
+++   case BLACKWELL_B: return (struct nvk_stock_scg) { true, false, false, false, 0 };
+++   default:          return (struct nvk_stock_scg) { false };
+++   }
+++}
+++
+++/* SET_SCG_CONTROL of the proprietary driver's compute-context initialiser
+++ * (615.78.08 E 0x56f326..E 0x56f4b6, one word per subdevice): with
+++ * tpcs = SHADER_PIPE_SUB_COUNT and pipes = SHADER_PIPE_COUNT, and its default
+++ * weights 0x67/256 (maximum) and 0/256 (minimum) of the TPCs per pipe
+++ * (E 0x56bbc2, E 0x56bd15):
+++ *   COMPUTE1_MAX_SM_COUNT = max(1, min(tpcs - pipes,
+++ *                                      round(tpcs / pipes * 0x67 / 256) * pipes))
+++ *   COMPUTE1_MIN_SM_COUNT = min(max, round(tpcs / pipes * 0 / 256) * pipes)
+++ *   DISABLE_COMPUTE1_LIMIT_IN_ALL_COMPUTE = 1
+++ * (tpcs < pipes takes 1 for both when the rounded maximum is non-zero.)
+++ * Each product saturates at 0xffffffff as in stock.
+++ */
+++static uint32_t
+++nvk_stock_scg_control(uint32_t tpcs, uint32_t pipes)
+++{
+++   const uint64_t w_max = 0x67, w_min = 0;
+++   const uint32_t q = tpcs / pipes;
+++   uint64_t t = MIN2((uint64_t)q * w_max + 0x80, 0xffffffffull);
+++   const uint64_t prod = (uint64_t)((uint32_t)t >> 8) * pipes;
+++   const uint32_t r11 = MIN2(prod, 0xffffffffull);
+++   uint32_t max, sel;
+++   if (tpcs < pipes) {
+++      if (prod != 0) {
+++         max = 1;
+++         sel = 1;
+++      } else {
+++         sel = r11 == 0 ? 1 : r11;
+++         max = sel & 0x1ff;
+++      }
+++   } else {
+++      sel = MIN2(tpcs - pipes, r11);
+++      if (sel == 0)
+++         sel = 1;
+++      max = sel & 0x1ff;
+++   }
+++   t = MIN2((uint64_t)q * w_min + 0x80, 0xffffffffull);
+++   const uint64_t lim = MIN2((uint64_t)((uint32_t)t >> 8) * pipes,
+++                             0xffffffffull);
+++   if (sel >= lim)
+++      sel = lim;
+++   return max | ((sel << 12) & 0x1ff000) | (1u << 24);
+++}
+++
++ VkResult
++ nvk_push_dispatch_state_init(struct nvk_queue *queue, struct nv_push *p)
++ {
++@@ -92,11 +181,10 @@
++     * E 0x56f1c0; on GB202 the stream of every compute channel it creates,
++     * graphics queue and compute queue alike) is followed where its methods
++     * are public and Volta+ (clc3c0.h onwards): SPA/QMD version here, the
++-    * SKED cache sequence and CWD slot count after the memory windows.  NVK
++-    * keeps its own shared/local memory windows.  Not sent: the methods
++-    * 0x0da0..0x0db0 (no public meaning; stock fills them from a per-chip
++-    * scheduling word) and the MME program loader tail (0x39c0..0x39cc) and
++-    * SET_MME_SWITCH_STATE, which name stock's own macro slots.
+++    * SCG setup, SKED cache sequence and CWD slot count after the memory
+++    * windows.  NVK keeps its own shared/local memory windows.  Not sent: the
+++    * MME program loader tail (0x39c0..0x39cc) and SET_MME_SWITCH_STATE,
+++    * which name stock's own macro slots.
++     */
++    const uint32_t sm_isa = dev->nvkmd->pdev->kmd_info.sm_isa_version;
++    const bool stock_init = nvk_compute_sked_cache_shared(pdev);
++@@ -151,6 +239,44 @@
++       P_NVA0C0_SET_SHADER_SHARED_MEMORY_WINDOW(p, 0xfe << 24);
++    }
++ 
+++   const struct nvk_stock_scg scg = nvk_stock_scg(pdev->info.cls_eng3d);
+++   if (stock_init && scg.known) {
+++      if (scg.scg_control) {
+++         const uint32_t tpcs = pdev->nvkmd->kmd_info.shader_pipe_sub_count;
+++         const uint32_t pipes = pdev->nvkmd->kmd_info.shader_pipe_count;
+++         if (pipes == 0) {
+++            return vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
+++                             "compute context SCG setup: the KMD reports no "
+++                             "GR shader pipe count");
+++         }
+++         P_MTHD(p, NVC3C0, SET_SCG_CONTROL);
+++         P_INLINE_DATA(p, nvk_stock_scg_control(tpcs, pipes));
+++
+++         /* E 0x56f6fa..E 0x56f77b: an FE atomic sequence holding a WFI of
+++          * every SCG type, the SM SCG control value and a WFI of the
+++          * current SCG type.
+++          */
+++         P_IMMD(p, NVC3C0, FE_ATOMIC_SEQUENCE_BEGIN, 0);
+++         __push_immd(p, SUBC_NV90C0, NVC86F_WFI, NVC86F_WFI_SCOPE_ALL);
+++         __push_immd(p, SUBC_NV90C0,
+++                     scg.falcon10 ? NVC5C0_SET_FALCON10 : NVC5C0_SET_SM_SCG_CONTROL,
+++                     scg.compute_in_graphics);
+++         __push_immd(p, SUBC_NV90C0, NVC86F_WFI,
+++                     NVC86F_WFI_SCOPE_CURRENT_SCG_TYPE);
+++         P_IMMD(p, NVC3C0, FE_ATOMIC_SEQUENCE_END, 0);
+++      }
+++
+++      /* E 0x56f790..E 0x56f825, every class: the scheduling word
+++       * 0x0680801f (0x0080801f on Blackwell B) one byte per parameter from
+++       * the top, then 1 (E 0x56bbeb).
+++       */
+++      const uint8_t sched[5] = { scg.sched0, 0x80, 0x80, 0x1f, 1 };
+++      for (uint32_t i = 0; i < ARRAY_SIZE(sched); i++) {
+++         __push_immd(p, SUBC_NV90C0,
+++                     NVC5C0_SET_SCG_COMPUTE_SCHEDULING_PARAMETERS(i), sched[i]);
+++      }
+++   }
+++
++    if (stock_init) {
++       /* E 0x56f868..0x56f8bb, unconditional in stock: an FE atomic
++        * sequence holding a host WFI of every SCG type, a SKED cache
++--- a/src/nouveau/vulkan/nvkmd/nvkmd.h
+++++ b/src/nouveau/vulkan/nvkmd/nvkmd.h
++@@ -133,6 +133,11 @@
++    /* The KMD's SM ISA code (RM NV2080_CTRL_GR_INFO_INDEX_SM_VERSION, e.g.
++     * 0xa04 on GB20x); 0 when the KMD does not report one. */
++    uint32_t sm_isa_version;
+++   /* RM NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_COUNT and
+++    * _SHADER_PIPE_SUB_COUNT (the TPC count, OGKM nv_gpu_ops.c); 0 when the
+++    * KMD does not report them. */
+++   uint32_t shader_pipe_count;
+++   uint32_t shader_pipe_sub_count;
++ };
++ 
++ struct nvkmd_pdev_ops {
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-stock-compute-init.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-stock-compute-init.patch
+index 650e6b4..bde4ac5 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nvk-stock-compute-init.patch
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-stock-compute-init.patch
+@@ -26,16 +26,17 @@
+  
+ --- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+ +++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
+-@@ -32,6 +32,46 @@
++@@ -32,6 +32,49 @@
+  #include "nv_push_clc86f.h"
+  #include "nv_push_clcec0.h"
+  
+ +/* SET_SPA_VERSION and SET_QMD_VERSION words of the proprietary driver's
+ + * compute-context initialiser (libnvidia-eglcore.so.615.78.08 E 0x56f1c0),
+ + * selected by the SM ISA code: one SET_SPA_VERSION per code, plus
+-+ * SET_QMD_VERSION from 0x900 on.  Codes the initialiser does not list take
+-+ * its default arm (E 0x56fa60, SPA 0x500), which is not reproduced: what the
+-+ * selector holds for codes outside this table is not established.
+++ * SET_QMD_VERSION from 0x900 on.  Its selector equals RM's SM version
+++ * code on the chips captured (SPA 0x705 on TU106, 0xa04 on GB202), and
+++ * every code it does not list takes the default arm (E 0x56fa60):
+++ * SET_SPA_VERSION 0x500 and no SET_QMD_VERSION.
+ + */
+ +static bool
+ +nvk_stock_spa_qmd_version(uint32_t sm_isa, uint32_t *spa, uint32_t *qmd)
+@@ -56,6 +57,8 @@
+ +         return true;
+ +      }
+ +   }
+++   *spa = 0x500;
+++   *qmd = 0;
+ +   return false;
+ +}
+ +
+@@ -73,7 +76,7 @@
+  VkResult
+  nvk_push_dispatch_state_init(struct nvk_queue *queue, struct nv_push *p)
+  {
+-@@ -47,6 +87,27 @@
++@@ -47,6 +90,31 @@
+     if (pdev->info.cls_compute == MAXWELL_COMPUTE_A)
+        P_IMMD(p, NVB0C0, SET_SELECT_MAXWELL_TEXTURE_HEADERS, V_TRUE);
+  
+@@ -90,7 +93,11 @@
+ +   const uint32_t sm_isa = dev->nvkmd->pdev->kmd_info.sm_isa_version;
+ +   const bool stock_init = nvk_compute_sked_cache_shared(pdev);
+ +   uint32_t spa, qmd;
+-+   if (stock_init && nvk_stock_spa_qmd_version(sm_isa, &spa, &qmd)) {
+++   if (stock_init) {
+++      if (!nvk_stock_spa_qmd_version(sm_isa, &spa, &qmd))
+++         mesa_logw("NVK: SM ISA code 0x%x is not in the proprietary driver's "
+++                   "compute-init table; using its default arm (SPA 0x500)",
+++                   sm_isa);
+ +      __push_immd(p, SUBC_NV90C0, NVC3C0_SET_SPA_VERSION, spa);
+ +      if (qmd != 0) {
+ +         P_MTHD(p, NVC3C0, SET_QMD_VERSION);
+@@ -101,7 +108,7 @@
+     if (pdev->info.cls_compute < VOLTA_COMPUTE_A) {
+        uint64_t shader_base_addr =
+           nvk_heap_contiguous_base_address(&dev->shader_heap);
+-@@ -89,6 +150,35 @@
++@@ -89,6 +157,37 @@
+        P_NVA0C0_SET_SHADER_SHARED_MEMORY_WINDOW(p, 0xfe << 24);
+     }
+  
+@@ -127,17 +134,19 @@
+ +      P_IMMD(p, NVC3C0, FE_ATOMIC_SEQUENCE_END, 0);
+ +
+ +      /* E 0x56f91f: SET_CWD_SLOT_COUNT 0x40 when the chip-family word has
+-+       * a bit of 0x6c031e0, as on GB202 (0x40011e0).  That word is known
+-+       * only for GB202 here, so the slot count is sent for SM ISA 0xa04.
+++       * a bit of 0x6c031e0.  The word comes from the per-3D-class table
+++       * E 0xfaf160 (lookup E 0x4e3cf0): AMPERE_A and every later 3D class
+++       * have such a bit, TURING_A does not (GB202 measured: 0x1000).
+++       * VOLTA_A is not in that driver's table.
+ +       */
+-+      if (sm_isa == 0xa04)
+++      if (pdev->info.cls_eng3d >= AMPERE_A)
+ +         P_IMMD(p, NVC3C0, SET_CWD_SLOT_COUNT, 0x40);
+ +   }
+ +
+     return VK_SUCCESS;
+  }
+  
+-@@ -106,7 +196,13 @@
++@@ -106,7 +205,13 @@
+  {
+     if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+        struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
+@@ -152,7 +161,7 @@
+           P_IMMD(p, NVB1C0, INVALIDATE_SKED_CACHES, 0);
+        }
+        P_IMMD(p, NVA0C0, INVALIDATE_SAMPLER_CACHE_NO_WFI, {
+-@@ -137,6 +233,31 @@
++@@ -137,6 +242,31 @@
+     }
+  }
+  
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-turing-sked-qmd-invalidate.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-turing-sked-qmd-invalidate.patch
+new file mode 100644
+index 0000000..e9a609b
+--- /dev/null
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-turing-sked-qmd-invalidate.patch
+@@ -0,0 +1,408 @@
++--- a/src/nouveau/compiler/nak.h
+++++ b/src/nouveau/compiler/nak.h
++@@ -356,6 +356,11 @@
++                              bool texture_data, bool shader_data,
++                              bool shader_constant);
++ 
+++/* QMD V02_02 (Volta, Turing): RELEASE0 as a one-word reduction ADD. */
+++void nak_qmd_set_release0_add(const struct nv_device_info *dev,
+++                              void *qmd, size_t qmd_size,
+++                              uint64_t addr, uint32_t payload);
+++
++ #ifdef __cplusplus
++ }
++ #endif
++--- a/src/nouveau/compiler/nak/qmd.rs
+++++ b/src/nouveau/compiler/nak/qmd.rs
++@@ -1057,3 +1057,40 @@
++         shader_constant,
++     );
++ }
+++
+++/// RELEASE0 of a Volta/Turing (QMD V02_02) dispatch: a one-word semaphore
+++/// reduction ADD of `payload` (unsigned 32-bit) to `addr` when the grid
+++/// completes.  The proprietary driver gives every dispatch QMD this release
+++/// to a per-command-buffer launch counter, payload 1
+++/// (libnvidia-eglcore.so.615.78.08 ELF 0xaee500, called for each dispatch
+++/// at ELF 0xbdffd6; its V02 arm sets SEMAPHORE_RELEASE_ENABLE0, the address,
+++/// payload 1, REDUCTION_ENABLE and STRUCTURE_SIZE ONE_WORD with RED_ADD /
+++/// UNSIGNED_32).  Other QMD layouts are not handled here.
+++#[no_mangle]
+++pub extern "C" fn nak_qmd_set_release0_add(
+++    dev: &nv_device_info,
+++    qmd: *mut ::std::os::raw::c_void,
+++    qmd_size: usize,
+++    addr: u64,
+++    payload: u32,
+++) {
+++    assert!(
+++        dev.cls_compute >= clc3c0::VOLTA_COMPUTE_A
+++            && dev.cls_compute < clc6c0::AMPERE_COMPUTE_A,
+++        "QMD RELEASE0 is only set in the QMD V02_02 layout (Volta, Turing)"
+++    );
+++    assert!(!qmd.is_null());
+++    assert!(qmd_size == size_of::<Qmd2_2>());
+++    let words =
+++        unsafe { std::slice::from_raw_parts_mut(qmd as *mut u32, qmd_size / 4) };
+++    use nvidia_headers::classes::clc3c0::qmd as q;
+++    let mut bv = QMDBitView::new(words);
+++    set_enum!(bv, q, QMDV02_02, SEMAPHORE_RELEASE_ENABLE0, TRUE);
+++    set_field!(bv, q, QMDV02_02, RELEASE0_ADDRESS_LOWER, addr as u32);
+++    set_field!(bv, q, QMDV02_02, RELEASE0_ADDRESS_UPPER, (addr >> 32) as u32);
+++    set_enum!(bv, q, QMDV02_02, RELEASE0_REDUCTION_OP, RED_ADD);
+++    set_enum!(bv, q, QMDV02_02, RELEASE0_REDUCTION_FORMAT, UNSIGNED_32);
+++    set_enum!(bv, q, QMDV02_02, RELEASE0_REDUCTION_ENABLE, TRUE);
+++    set_enum!(bv, q, QMDV02_02, RELEASE0_STRUCTURE_SIZE, ONE_WORD);
+++    set_field!(bv, q, QMDV02_02, RELEASE0_PAYLOAD, payload);
+++}
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
++@@ -67,6 +67,7 @@
++    nvk_cmd_pool_free_qmd_list(pool, &cmd->owned_qmd);
++    util_dynarray_fini(&cmd->pushes);
++    util_dynarray_fini(&cmd->copy_memory_indirect_temps);
+++   util_dynarray_fini(&cmd->sked.qmds);
++    vk_command_buffer_finish(&cmd->vk);
++    vk_free(&pool->vk.alloc, cmd);
++ }
++@@ -102,6 +103,7 @@
++    list_inithead(&cmd->owned_qmd);
++    cmd->pushes = UTIL_DYNARRAY_INIT;
++    cmd->copy_memory_indirect_temps = UTIL_DYNARRAY_INIT;
+++   cmd->sked.qmds = UTIL_DYNARRAY_INIT;
++ 
++    cmd->prev_subc = ffs(nvk_cmd_buffer_subchannel_mask(cmd)) - 1;
++ 
++@@ -134,6 +136,11 @@
++    memset(&cmd->cs_join, 0, sizeof(cmd->cs_join));
++    cmd->cs_join_cond_render = false;
++    cmd->cs_join_covered = false;
+++   cmd->sked.counter_addr = 0;
+++   cmd->sked.launches = 0;
+++   cmd->sked.wfi_drain = false;
+++   cmd->sked.render_override = false;
+++   util_dynarray_clear(&cmd->sked.qmds);
++ 
++    util_dynarray_clear(&cmd->pushes);
++    util_dynarray_clear(&cmd->copy_memory_indirect_temps);
++@@ -329,8 +336,19 @@
++    /* On Maxwell B and later, we have INVALIDATE_SKED_CACHES so we can just
++     * allocate from wherever we want (the upload stream in this case).
++     */
++-   if (pdev->info.cls_compute >= MAXWELL_COMPUTE_B)
++-      return nvk_cmd_buffer_upload_alloc(cmd, size, alignment, addr, ptr);
+++   if (pdev->info.cls_compute >= MAXWELL_COMPUTE_B) {
+++      VkResult result =
+++         nvk_cmd_buffer_upload_alloc(cmd, size, alignment, addr, ptr);
+++      if (result == VK_SUCCESS && nvk_cmd_sked_qmds_tracked(pdev)) {
+++         /* Recorded for the SKED cache invalidate at the end of the command
+++          * buffer (the proprietary driver's QMD memory allocator,
+++          * libnvidia-eglcore.so.615.78.08 ELF 0xc5cc50 -> ELF 0xc5cac0 with
+++          * its list flag set, appends every QMD it hands out).
+++          */
+++         util_dynarray_append(&cmd->sked.qmds, *addr);
+++      }
+++      return result;
+++   }
++ 
++    /* The GPU compute scheduler (SKED) has a cache.  Maxwell B added the
++     * INVALIDATE_SKED_CACHES instruction to manage the SKED cache.  We call
++@@ -382,6 +400,10 @@
++                               COMMAND_BUFFER_INHERITANCE_CONDITIONAL_RENDERING_INFO_EXT);
++       cmd->cs_join_cond_render = cond != NULL &&
++                                  cond->conditionalRenderingEnable;
+++      /* The inherited condition may be false at the end of this command
+++       * buffer: its SKED cache invalidates must not be skipped.
+++       */
+++      cmd->sked.render_override = cmd->cs_join_cond_render;
++    }
++ 
++    /* Start with a nop so we have at least something to submit.  The
++@@ -419,6 +441,7 @@
++    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++ 
++    nvk_cmd_cs_join_close(cmd);
+++   nvk_cmd_sked_end(cmd);
++    nvk_cmd_buffer_flush_push(cmd, false);
++ 
++    /* We only need to flush the memory objects we own because, if there are
++--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
+++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
++@@ -283,6 +283,22 @@
++     */
++    bool cs_join_covered;
++ 
+++   /* Volta/Turing (nvk_cmd_sked_qmds_tracked): every QMD this command
+++    * buffer allocates is dropped from the SKED cache with a PCAS INVALIDATE
+++    * at its end, once the dispatches have completed.  Each counted dispatch
+++    * releases a reduction ADD of 1 to `counter_addr`; the end waits for the
+++    * counter to reach `launches`, or idles the compute engine when a
+++    * dispatch may have been skipped by conditional rendering (`wfi_drain`).
+++    */
+++   struct {
+++      uint64_t counter_addr;
+++      uint32_t launches;
+++      bool wfi_drain;
+++      bool render_override;
+++      /** Array of uint64_t QMD addresses */
+++      struct util_dynarray qmds;
+++   } sked;
+++
++    struct nvk_cmd_state {
++       uint64_t descriptor_buffers[NVK_MAX_SETS];
++       struct nvk_graphics_state gfx;
++@@ -367,6 +383,9 @@
++ void nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
++                                    const VkCommandBufferBeginInfo *pBeginInfo);
++ bool nvk_compute_sked_cache_shared(const struct nvk_physical_device *pdev);
+++bool nvk_cmd_sked_qmds_tracked(const struct nvk_physical_device *pdev);
+++VkResult nvk_cmd_sked_counter(struct nvk_cmd_buffer *cmd, uint64_t *addr_out);
+++void nvk_cmd_sked_end(struct nvk_cmd_buffer *cmd);
++ void nvk_cmd_invalidate_sked_caches(struct nvk_cmd_buffer *cmd);
++ 
++ void nvk_cmd_buffer_begin_compute(struct nvk_cmd_buffer *cmd,
++@@ -490,9 +509,27 @@
++                                         const struct nvk_descriptor_state *desc,
++                                         const struct nvk_cbuf *cbuf);
++ 
+++/* How the host launches a QMD (nvk_cmd_sked_qmds_tracked). */
+++enum nvk_qmd_launch {
+++   /* Launched once by this command buffer, whatever the render enable */
+++   NVK_QMD_LAUNCH_ONCE,
+++   /* Launched once, but conditional rendering may skip it */
+++   NVK_QMD_LAUNCH_CONDITIONAL,
+++   /* Never launched itself (copied by the GPU) */
+++   NVK_QMD_TEMPLATE,
+++};
+++
+++static inline enum nvk_qmd_launch
+++nvk_cmd_qmd_launch(const struct nvk_cmd_buffer *cmd)
+++{
+++   return cmd->cs_join_cond_render ? NVK_QMD_LAUNCH_CONDITIONAL
+++                                   : NVK_QMD_LAUNCH_ONCE;
+++}
+++
++ VkResult nvk_cmd_flush_cs_qmd(struct nvk_cmd_buffer *cmd,
++                               const struct nvk_cmd_state *state,
++                               uint32_t global_size[3],
+++                              enum nvk_qmd_launch launch,
++                               uint64_t *qmd_addr_out,
++                               uint64_t *root_desc_addr_out);
++ 
++--- a/src/nouveau/vulkan/nvk_cmd_dispatch.c
+++++ b/src/nouveau/vulkan/nvk_cmd_dispatch.c
++@@ -385,6 +385,126 @@
++    }
++ }
++ 
+++/* Volta and Turing compute (no PCAS2 actions; the SKED QMD cache shared by
+++ * the channel group's subcontexts): the proprietary driver drops every QMD
+++ * a command buffer allocated from the SKED cache at the end of that command
+++ * buffer, once its dispatches have completed (libnvidia-eglcore.so.615.78.08
+++ * command-buffer end ELF 0xc5c980 -> ELF 0xc5c500 -> ELF 0xc5ba90).  Its
+++ * mode word selecting this (ELF 0x568e20) is 1 when the chip-family word
+++ * has no bit of 0x6c031e0, i.e. below AMPERE_A, and 2 (no invalidates)
+++ * from AMPERE_A on.  QMDs left in the cache would otherwise point at
+++ * command-buffer memory that is reused or freed later.
+++ */
+++bool
+++nvk_cmd_sked_qmds_tracked(const struct nvk_physical_device *pdev)
+++{
+++   return nvk_compute_sked_cache_shared(pdev) &&
+++          pdev->info.cls_compute < AMPERE_COMPUTE_A;
+++}
+++
+++/* The command buffer's launch counter, created at the first QMD: the
+++ * proprietary driver resets it in the push buffer with a host semaphore
+++ * release of 0 followed by an acquire of 0 (ELF 0xc5b300, called when the
+++ * command buffer allocates its first QMD, ELF 0xc5cac0 -> ELF 0xc5b500).
+++ */
+++VkResult
+++nvk_cmd_sked_counter(struct nvk_cmd_buffer *cmd, uint64_t *addr_out)
+++{
+++   if (cmd->sked.counter_addr == 0) {
+++      void *map;
+++      uint64_t addr;
+++      VkResult result = nvk_cmd_buffer_upload_alloc(cmd, 4, 16, &addr, &map);
+++      if (unlikely(result != VK_SUCCESS))
+++         return result;
+++
+++      const uint8_t host = nvk_cmd_buffer_host_subc(cmd);
+++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 12);
+++      __push_mthd(p, host, NVC86F_SEM_ADDR_LO);
+++      P_NVC86F_SEM_ADDR_LO(p, (uint32_t)addr >> 2);
+++      P_NVC86F_SEM_ADDR_HI(p, addr >> 32);
+++      P_NVC86F_SEM_PAYLOAD_LO(p, 0);
+++      P_NVC86F_SEM_PAYLOAD_HI(p, 0);
+++      P_NVC86F_SEM_EXECUTE(p, {
+++         .operation = OPERATION_RELEASE,
+++         .payload_size = PAYLOAD_SIZE_32BIT,
+++      });
+++      __push_mthd(p, host, NVC86F_SEM_ADDR_LO);
+++      P_NVC86F_SEM_ADDR_LO(p, (uint32_t)addr >> 2);
+++      P_NVC86F_SEM_ADDR_HI(p, addr >> 32);
+++      P_NVC86F_SEM_PAYLOAD_LO(p, 0);
+++      P_NVC86F_SEM_PAYLOAD_HI(p, 0);
+++      P_NVC86F_SEM_EXECUTE(p, {
+++         .operation = OPERATION_ACQUIRE,
+++         .payload_size = PAYLOAD_SIZE_32BIT,
+++      });
+++      cmd->sked.counter_addr = addr;
+++   }
+++   *addr_out = cmd->sked.counter_addr;
+++   return VK_SUCCESS;
+++}
+++
+++/* End of a command buffer (ELF 0xc5c500): wait until its dispatches have
+++ * completed, then SEND_PCAS_A + SEND_SIGNALING_PCAS_B INVALIDATE (no
+++ * SCHEDULE) for each QMD it allocated (ELF 0xc5ba90).  The wait is the
+++ * proprietary driver's compute drain (ELF 0xc5a530): a host ACQ_CIRC_GEQ of
+++ * the launch counter against the number of dispatches, then a compute
+++ * NO_OPERATION.  A command buffer with a dispatch that conditional
+++ * rendering may have skipped cannot count on the counter; it idles the
+++ * compute engine first, as that driver's QMD ring does before it
+++ * invalidates (compute WAIT_FOR_IDLE, ELF 0xabf68a).  Where the inherited
+++ * condition may be false the invalidates are made unconditional with
+++ * SET_RENDER_ENABLE_OVERRIDE, as the same ring does (ELF 0xabf6c8 /
+++ * ELF 0xabf74c).
+++ */
+++void
+++nvk_cmd_sked_end(struct nvk_cmd_buffer *cmd)
+++{
+++   const struct nvk_physical_device *pdev =
+++      nvk_device_physical(nvk_cmd_buffer_device(cmd));
+++   const uint32_t count =
+++      util_dynarray_num_elements(&cmd->sked.qmds, uint64_t);
+++
+++   if (!nvk_cmd_sked_qmds_tracked(pdev) || count == 0)
+++      return;
+++
+++   struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
+++   if (cmd->sked.wfi_drain) {
+++      P_IMMD(p, NVA0C0, WAIT_FOR_IDLE, 0);
+++   } else if (cmd->sked.launches > 0) {
+++      const uint64_t addr = cmd->sked.counter_addr;
+++      __push_mthd(p, nvk_cmd_buffer_host_subc(cmd), NVC86F_SEM_ADDR_LO);
+++      P_NVC86F_SEM_ADDR_LO(p, (uint32_t)addr >> 2);
+++      P_NVC86F_SEM_ADDR_HI(p, addr >> 32);
+++      P_NVC86F_SEM_PAYLOAD_LO(p, cmd->sked.launches);
+++      P_NVC86F_SEM_PAYLOAD_HI(p, 0);
+++      P_NVC86F_SEM_EXECUTE(p, {
+++         .operation = OPERATION_ACQ_CIRC_GEQ,
+++         .payload_size = PAYLOAD_SIZE_32BIT,
+++      });
+++      P_IMMD(p, NVA0C0, NO_OPERATION, 0);
+++   }
+++
+++   if (cmd->sked.render_override) {
+++      p = nvk_cmd_buffer_push(cmd, 2);
+++      P_IMMD(p, NVA0C0, SET_RENDER_ENABLE_OVERRIDE, MODE_ALWAYS_RENDER);
+++   }
+++
+++   util_dynarray_foreach(&cmd->sked.qmds, uint64_t, qmd_addr) {
+++      p = nvk_cmd_buffer_push(cmd, 4);
+++      P_MTHD(p, NVA0C0, SEND_PCAS_A);
+++      P_NVA0C0_SEND_PCAS_A(p, *qmd_addr >> 8);
+++      P_IMMD(p, NVA0C0, SEND_SIGNALING_PCAS_B, {
+++         .invalidate = INVALIDATE_TRUE,
+++         .schedule = SCHEDULE_FALSE,
+++      });
+++   }
+++
+++   if (cmd->sked.render_override) {
+++      p = nvk_cmd_buffer_push(cmd, 2);
+++      P_IMMD(p, NVA0C0, SET_RENDER_ENABLE_OVERRIDE, MODE_USE_RENDER_ENABLE);
+++   }
+++}
+++
++ void
++ nvk_cmd_invalidate_compute_state(struct nvk_cmd_buffer *cmd)
++ {
++@@ -786,6 +906,7 @@
++                    size_t root_size,
++                    uint32_t global_size[3],
++                    bool join,
+++                   enum nvk_qmd_launch launch,
++                    uint64_t *qmd_addr_out,
++                    uint64_t *root_desc_addr_out)
++ {
++@@ -863,6 +984,25 @@
++                                !(nvk_cmd_buffer_queue_flags(cmd) &
++                                  VK_QUEUE_GRAPHICS_BIT));
++ 
+++      /* Volta/Turing: each dispatch the host launches once releases the
+++       * command buffer's launch counter (proprietary driver: RELEASE0 of
+++       * every dispatch QMD, ELF 0xaee500 at ELF 0xbdffd6), so the end of
+++       * the command buffer can wait for it before invalidating its QMDs.
+++       */
+++      if (nvk_cmd_sked_qmds_tracked(pdev)) {
+++         if (launch == NVK_QMD_LAUNCH_ONCE) {
+++            uint64_t counter_addr;
+++            result = nvk_cmd_sked_counter(cmd, &counter_addr);
+++            if (unlikely(result != VK_SUCCESS))
+++               return result;
+++            nak_qmd_set_release0_add(&pdev->info, qmd, qmd_size_B,
+++                                     counter_addr, 1);
+++            cmd->sked.launches++;
+++         } else if (launch == NVK_QMD_LAUNCH_CONDITIONAL) {
+++            cmd->sked.wfi_drain = true;
+++         }
+++      }
+++
++       void *qmd_map;
++       result = nvk_cmd_buffer_alloc_qmd(cmd, qmd_size_B, 0x100,
++                                         &qmd_addr, &qmd_map);
++@@ -889,6 +1029,7 @@
++ nvk_cmd_flush_cs_qmd(struct nvk_cmd_buffer *cmd,
++                      const struct nvk_cmd_state *state,
++                      uint32_t global_size[3],
+++                     enum nvk_qmd_launch launch,
++                      uint64_t *qmd_addr_out,
++                      uint64_t *root_desc_addr_out)
++ {
++@@ -897,7 +1038,7 @@
++ 
++    return nvk_cmd_upload_qmd(cmd, state->cs.shader, desc,
++                              desc->root, sizeof(desc->root),
++-                             global_size, false,
+++                             global_size, false, launch,
++                              qmd_addr_out, root_desc_addr_out);
++ }
++ 
++@@ -951,7 +1092,9 @@
++    const struct nvk_descriptor_state *desc = &cmd->state.cs.descriptors;
++    VkResult result = nvk_cmd_upload_qmd(cmd, cmd->state.cs.shader, desc,
++                                         desc->root, sizeof(desc->root),
++-                                        global_size, join, &qmd_addr, NULL);
+++                                        global_size, join,
+++                                        nvk_cmd_qmd_launch(cmd),
+++                                        &qmd_addr, NULL);
++    if (result != VK_SUCCESS) {
++       vk_command_buffer_set_error(&cmd->vk, result);
++       return;
++@@ -1014,6 +1157,7 @@
++    VkResult result = nvk_cmd_upload_qmd(cmd, shader, NULL,
++                                         root, root_size,
++                                         group_count, false,
+++                                        NVK_QMD_LAUNCH_ONCE,
++                                         &qmd_addr, NULL);
++    if (result != VK_SUCCESS) {
++       vk_command_buffer_set_error(&cmd->vk, result);
++@@ -1240,6 +1384,7 @@
++ 
++    uint64_t qmd_addr = 0, root_desc_addr = 0;
++    VkResult result = nvk_cmd_flush_cs_qmd(cmd, &cmd->state, global_size,
+++                                          nvk_cmd_qmd_launch(cmd),
++                                           &qmd_addr, &root_desc_addr);
++    if (result != VK_SUCCESS) {
++       vk_command_buffer_set_error(&cmd->vk, result);
++--- a/src/nouveau/vulkan/nvk_cmd_indirect.c
+++++ b/src/nouveau/vulkan/nvk_cmd_indirect.c
++@@ -1075,6 +1075,7 @@
++    if (layout->stages & VK_SHADER_STAGE_COMPUTE_BIT) {
++       uint32_t global_size[3] = { 0, 0, 0 };
++       VkResult result = nvk_cmd_flush_cs_qmd(cmd, state, global_size,
+++                                             NVK_QMD_TEMPLATE,
++                                              &qmd_addr, &push.root_addr);
++       if (unlikely(result != VK_SUCCESS)) {
++          vk_command_buffer_set_error(&cmd->vk, result);
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c b/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c
+index 63cc35c..0af610d 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c
++++ b/nvidia-prolapse/driver-source/native/mesa/nvkmd_rm.c
+@@ -533,11 +533,13 @@ nvkmd_rm_try_create_pdev(struct _drmDevice* drm,
+        * Turing+ generic compressible kind. NVK's dedicated-allocation
+        * compression (has_compression) stays off. */
+       .has_rm_compression = info->generic_kind == 0x06,
+-      /* Subcontexts exist from Volta (VOLTA_COMPUTE_A 0xc3c0): a channel group
+-       * has 64 VEIDs, VEID 0 belongs to the group's first context, so up to
+-       * 63 contexts can join it (nv_rm_context_create_shared). */
+-      .max_shared_ctx = pdev->base.dev_info.cls_compute >= 0xc3c0 ? 63 : 0,
++      /* Contexts that can join another context's channel group
++       * (nv_rm_context_create_shared), as RM reports the group's bounds:
++       * subcontexts from Volta on, channels per group before (nv_rm.h). */
++      .max_shared_ctx = info->max_shared_ctx,
+       .sm_isa_version = info->sm_isa,
++      .shader_pipe_count = info->shader_pipe_count,
++      .shader_pipe_sub_count = info->shader_pipe_sub_count,
+    };
+    pdev->base.drm.render_dev = st.st_rdev;
+    pdev->fd = fd;
+diff --git a/nvidia-prolapse/driver-source/native/src/gpu.rs b/nvidia-prolapse/driver-source/native/src/gpu.rs
+index 25831dd..13ae327 100644
+--- a/nvidia-prolapse/driver-source/native/src/gpu.rs
++++ b/nvidia-prolapse/driver-source/native/src/gpu.rs
+@@ -1021,6 +1021,12 @@ impl Subcontext {
+         tsg.free_veids.set(rest);
+         Ok(Self { veid, tsg })
+     }
++    /// Before Volta a channel group has no subcontexts: every channel of the
++    /// group runs in the group's single GR context. Such a member holds the
++    /// group without a VEID (0, never returned to the free set).
++    fn legacy(tsg: Rc<Tsg>) -> Self {
++        Self { veid: 0, tsg }
++    }
+ }
+ /// Lowest free VEID of `free` and the set without it; `None` when empty.
+ fn lowest_free_veid(free: u64) -> Option<(u32, u64)> {
+@@ -1496,23 +1502,23 @@ impl Queue {
+         let caps = crate::capabilities::query(device)?;
+         let modern = caps.usermode.is_some();
+         if let Some(share) = share {
+-            if !modern {
+-                return Err(Error::Contract(
+-                    "a context sharing another context's TSG needs subcontexts (Volta+ context-share objects); this GPU has none".into(),
+-                ));
+-            }
+             // Stock's subcontext channels carry only the compute class (its
+             // async-compute and compute-queue channels get one 0xcec0 object
+             // on GB202, no 3D, 2D or copy object); 3D runs only on VEID 0.
++            // Before Volta the joining channel shares the group's GR context
++            // with the graphics channel, and it too carries the compute class
++            // only (stock 580.178.04 on GP10x).
+             if mask != 16 {
+                 return Err(Error::Contract(format!(
+                     "a context in a shared TSG supports only the compute engine (mask 0x10), got {mask:#x}"
+                 )));
+             }
+-            device.client.compat.require_constant(
+-                "NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_SPECIFIED",
+-                CTXSHARE_SPECIFIED.into(),
+-            )?;
++            if modern {
++                device.client.compat.require_constant(
++                    "NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_SPECIFIED",
++                    CTXSHARE_SPECIFIED.into(),
++                )?;
++            }
+             if !Rc::ptr_eq(&share.subcontext.tsg.object.device, device) {
+                 return Err(Error::Contract(
+                     "a shared TSG belongs to another RM device".into(),
+@@ -1576,8 +1582,14 @@ impl Queue {
+             }
+         };
+         // Declared before the context share and channel: on an error below
+-        // they drop (RM free) first and the VEID returns afterwards.
+-        let subcontext = Subcontext::take(tsg)?;
++        // they drop (RM free) first and the VEID returns afterwards. Before
++        // Volta there are no subcontexts and no context-share objects: a
++        // channel joining the group is allocated under the TSG with
++        // hContextShare 0 and runs in the group's GR context (stock
++        // 580.178.04 skips the context-share allocation below Volta,
++        // libnvidia-eglcore.so.580.178.04 E 0xa76fab, and still places the
++        // compute queue's channel in the graphics queue's TSG, E 0xa7b167).
++        let subcontext = if modern { Subcontext::take(tsg)? } else { Subcontext::legacy(tsg) };
+         let veid = subcontext.veid;
+         let group = Rc::clone(&subcontext.tsg.object);
+         let context = if modern {
+diff --git a/nvidia-prolapse/driver-source/native/src/mesa.rs b/nvidia-prolapse/driver-source/native/src/mesa.rs
+index b1498b1..66f1552 100644
+--- a/nvidia-prolapse/driver-source/native/src/mesa.rs
++++ b/nvidia-prolapse/driver-source/native/src/mesa.rs
+@@ -76,6 +76,18 @@ pub struct Info {
+     /// RM's SM ISA code (NV2080_CTRL_GR_INFO_INDEX_SM_VERSION), from which
+     /// `sm` is derived.
+     sm_isa: u32,
++    /// NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_COUNT and
++    /// NV2080_CTRL_GR_INFO_INDEX_SHADER_PIPE_SUB_COUNT (the TPC count, as
++    /// OGKM nv_gpu_ops.c reads it), the inputs of the compute contexts'
++    /// SET_SCG_CONTROL limits.
++    shader_pipe_count: u32,
++    shader_pipe_sub_count: u32,
++    /// Contexts that can join another context's channel group
++    /// (`Queue::new_in_group`): the group's subcontext count less the
++    /// creator's VEID 0 from Volta on, its channel count less one before
++    /// (query_info).
++    max_shared_ctx: u32,
++    _reserved: u32,
+ }
+ #[repr(C)]
+ #[derive(Clone, Copy)]
+@@ -1601,14 +1613,36 @@ fn query_info(d: &Device) -> Result<Info> {
+     d.client.control(d.subdevice, 0x20801701, &mut arch)?;
+     let mut name = [0u32; 17];
+     d.client.control(d.subdevice, 0x20800110, &mut name)?;
+-    let mut gr = [[0xcu32, 0], [0xd, 0], [0x20, 0]];
++    let mut gr = [[0xcu32, 0], [0xd, 0], [0x20, 0], [0x7, 0], [0x9, 0]];
+     let mut query = abi::GrInfo {
+-        count: 3,
++        count: gr.len() as u32,
+         entries: gr.as_mut_ptr() as u64,
+         ..Default::default()
+     };
+     d.client.control(d.subdevice, 0x20801201, &mut query)?;
+     let caps = capabilities::select(&d.classes()?, gr[0][1])?;
++    // Contexts that can join a channel group. From Volta on each takes a
++    // subcontext of its own: RM's per-chip count is GR info
++    // NV2080_CTRL_GR_INFO_INDEX_MAX_SUBCONTEXT_COUNT (ctrl0080gr.h 0x2c; RM's
++    // own FIFO bound reads the same entry, OGKM kernel_fifo.c:2791 /
++    // kernel_fifo_gv100.c:181-207), within the 128 channels a group holds
++    // (gv100 dev_ram.h NV_RAMRL_ENTRY_TSG_LENGTH_MAX). Before Volta there are
++    // no subcontexts: joining channels share the group's GR context and the
++    // group holds 32 channels (gm107 dev_ram.h NV_RAMRL_ENTRY_TSG_LENGTH_MAX,
++    // Maxwell and Pascal). The group's first context keeps one of them.
++    let joinable = if caps.usermode.is_some() {
++        let mut sub = [[0x2cu32, 0]];
++        let mut query = abi::GrInfo {
++            count: sub.len() as u32,
++            entries: sub.as_mut_ptr() as u64,
++            ..Default::default()
++        };
++        d.client.control(d.subdevice, 0x20801201, &mut query)?;
++        sub[0][1].min(0x80)
++    } else {
++        0x20
++    };
++    let max_shared_ctx = joinable.saturating_sub(1);
+     // Route info is {u32 flags,pad,u64 data}; final mask follows at offset16.
+     let mut gpc = [0u64; 3];
+     d.client.control(d.subdevice, 0x2080122a, &mut gpc)?;
+@@ -1664,6 +1698,10 @@ fn query_info(d: &Device) -> Result<Info> {
+         zcull_ctxsw_align,
+         has_zcull_info,
+         sm_isa: gr[0][1],
++        shader_pipe_count: gr[3][1],
++        shader_pipe_sub_count: gr[4][1],
++        max_shared_ctx,
++        _reserved: 0,
+     })
+ }
+ 
+@@ -2846,11 +2884,14 @@ mod tests {
+     #[test]
+     fn bridge_info_matches_independent_c_oracle() {
+         // mesa/abi-check.c: host and Android compile from the public bridge header.
+-        assert_eq!(size_of::<Info>(), 208);
++        assert_eq!(size_of::<Info>(), 224);
++        assert_eq!(offset_of!(Info, max_shared_ctx), 216);
+         assert_eq!(offset_of!(Info, zcull), 152);
+         assert_eq!(offset_of!(Info, zcull_ctxsw_size), 192);
+         assert_eq!(offset_of!(Info, has_zcull_info), 200);
+         assert_eq!(offset_of!(Info, sm_isa), 204);
++        assert_eq!(offset_of!(Info, shader_pipe_count), 208);
++        assert_eq!(offset_of!(Info, shader_pipe_sub_count), 212);
+         assert_eq!(offset_of!(Info, generic_kind), 68);
+         assert_eq!(offset_of!(Info, vram_size), 72);
+         assert_eq!(offset_of!(Info, bar_size), 80);
+-- 
+2.56.0
+

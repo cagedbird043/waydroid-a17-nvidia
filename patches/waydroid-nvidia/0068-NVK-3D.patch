@@ -1,0 +1,116 @@
+From 878c9ae8daaa6871f6a140a1122ad7d2c51dcc84 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 17:24:05 +0800
+Subject: [PATCH 68/72] =?utf-8?q?NVK=EF=BC=9A=E4=B8=BA=E6=89=80=E6=9C=89?=
+ =?utf-8?q?=203D=20=E7=B1=BB=E5=90=AF=E7=94=A8=E5=83=8F=E7=B4=A0=E7=9D=80?=
+ =?utf-8?q?=E8=89=B2=E5=99=A8=E5=B1=8F=E9=9A=9C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 53274670d67ded6669974ea03b8e09831b015305)
+---
+ .../mesa/nvk-pixel-shader-barrier.patch       | 38 ++++++++-----------
+ 1 file changed, 16 insertions(+), 22 deletions(-)
+
+diff --git a/nvidia-prolapse/driver-source/native/mesa/nvk-pixel-shader-barrier.patch b/nvidia-prolapse/driver-source/native/mesa/nvk-pixel-shader-barrier.patch
+index d761f76..810aa1b 100644
+--- a/nvidia-prolapse/driver-source/native/mesa/nvk-pixel-shader-barrier.patch
++++ b/nvidia-prolapse/driver-source/native/mesa/nvk-pixel-shader-barrier.patch
+@@ -1,12 +1,13 @@
+-nvk: order colour-attachment output -> fragment reads with PIXEL_SHADER_BARRIER on Blackwell B
++nvk: order colour-attachment output -> fragment reads with PIXEL_SHADER_BARRIER
+ 
+ NVIDIA's driver (libnvidia-eglcore.so 615.78.08: barrier record E 0xc63a00, finalise E 0xc63f50,
+ drain E 0xc65ae0) drains a dependency whose only source stage is COLOR_ATTACHMENT_OUTPUT and whose
+ destinations are fragment-stage reads (FRAGMENT_SHADER / LATE_FRAGMENT_TESTS / COLOR_ATTACHMENT_OUTPUT /
+ BOTTOM_OF_PIPE stages; uniform, input-attachment, sampled, storage or colour reads) with one
+ PIXEL_SHADER_BARRIER, followed by the undocumented method 0x0f74 for texture / shader-data reads,
+-instead of WAIT_FOR_IDLE. NVK's texture-data invalidate is kept next to 0x0f74. Every other
+-dependency, and every class without a known rule, keeps WAIT_FOR_IDLE.
++instead of WAIT_FOR_IDLE, on every 3D class (no class is read on that path; 580.178.04, the branch
++for Maxwell/Pascal/Volta, has the same class-free 0x0f74 emitter at E 0xcfe200). NVK's texture-data
++invalidate is kept next to 0x0f74. Every other dependency keeps WAIT_FOR_IDLE.
+ 
+ diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+ index d9509d5bf67a..07738ae55e00 100644
+@@ -28,7 +29,7 @@ index d9509d5bf67a..07738ae55e00 100644
+  #include "nv_push_clc86f.h"
+  
+  static uint8_t
+-@@ -550,6 +552,156 @@ nvk_barrier_invalidates(VkPipelineStageFlags2 stages,
++@@ -550,6 +552,150 @@ nvk_barrier_invalidates(VkPipelineStageFlags2 stages,
+     return barriers;
+  }
+  
+@@ -37,19 +38,13 @@ index d9509d5bf67a..07738ae55e00 100644
+ + * barrier record built at E 0xc63a00, finalised at E 0xc63f50 and drained
+ + * at E 0xc65ae0) orders such a dependency with one PIXEL_SHADER_BARRIER
+ + * instead of WAIT_FOR_IDLE and every other dependency with WAIT_FOR_IDLE.
+-+ * That rule is only known for the classes listed here; every other class
+-+ * keeps WAIT_FOR_IDLE.
+++ * No class is read on that path: the record keeps the barrier through the
+++ * stream's engine table (E 0xcde120), and the 0x0f74 emitter (E 0xc63e80;
+++ * 580.178.04 E 0xcfe200, the driver branch for Maxwell, Pascal and Volta)
+++ * tests only the record, so every 3D class takes the rule
+++ * (PIXEL_SHADER_BARRIER 0x0de0 is in clb097.h onwards; data 0 is
+++ * BLOCK_BEFORE_PS where the class has BARRIER_LOCATION).
+ + */
+-+static bool
+-+nvk_class_has_pixel_shader_barrier_drain(const struct nvk_physical_device *pdev)
+-+{
+-+   switch (pdev->info.cls_eng3d) {
+-+   case BLACKWELL_B:
+-+      return true;
+-+   default:
+-+      return false;
+-+   }
+-+}
+ +
+ +struct nvk_pixel_dep {
+ +   VkPipelineStageFlags2 src_stages;
+@@ -185,7 +180,7 @@ index d9509d5bf67a..07738ae55e00 100644
+  void
+  nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+                         const VkDependencyInfo *dep,
+-@@ -562,6 +714,7 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
++@@ -562,6 +708,7 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+        nvk_queue_engines_from_queue_flags(queue_flags);
+  
+     enum nvk_barrier barriers = 0;
+@@ -193,7 +188,7 @@ index d9509d5bf67a..07738ae55e00 100644
+  
+     /* For asymmetric, we don't know what the access flags will be yet.
+      * Handle this by setting access to everything.
+-@@ -576,18 +729,24 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
++@@ -576,18 +723,24 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+        barriers |= nvk_barrier_flushes_waits(bar->srcStageMask,
+                                              VK_ACCESS_2_MEMORY_READ_BIT |
+                                              VK_ACCESS_2_MEMORY_WRITE_BIT);
+@@ -218,7 +213,7 @@ index d9509d5bf67a..07738ae55e00 100644
+  
+        if (bar->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT)
+           barriers |= NVK_BARRIER_HOST_WFI_INVALIDATE_SYSMEM;
+-@@ -597,6 +756,8 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
++@@ -597,6 +750,8 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+        const VkImageMemoryBarrier2 *bar = &dep->pImageMemoryBarriers[i];
+        barriers |= nvk_barrier_flushes_waits(bar->srcStageMask,
+                                              bar->srcAccessMask);
+@@ -227,12 +222,11 @@ index d9509d5bf67a..07738ae55e00 100644
+  
+        if (bar->srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT)
+           barriers |= NVK_BARRIER_HOST_WFI_INVALIDATE_SYSMEM;
+-@@ -631,6 +792,26 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
++@@ -631,6 +786,25 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+         */
+        switch (nvk_cmd_buffer_last_subchannel(cmd)) {
+        case SUBC_NV9097: {
+-+         if (nvk_class_has_pixel_shader_barrier_drain(pdev) &&
+-+             nvk_pixel_dep_is_pixel_ordered(&pixel_dep)) {
+++         if (nvk_pixel_dep_is_pixel_ordered(&pixel_dep)) {
+ +            struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
+ +            P_IMMD(p, NVC797, PIXEL_SHADER_BARRIER, {
+ +               .sysmembar_enable = SYSMEMBAR_ENABLE_FALSE,
+-- 
+2.56.0
+
