@@ -1,0 +1,49 @@
+From 249e3435584a3e731eb811527cedb0de9182cd38 Mon Sep 17 00:00:00 2001
+From: Shiro836 <noreply>
+Date: Sun, 25 Oct 2026 16:44:26 +0300
+Subject: [PATCH 48/56] =?utf-8?q?HAL=EF=BC=9A=E5=85=B3=E9=97=AD=E8=AE=BE?=
+ =?utf-8?q?=E5=A4=87=E6=97=B6=E4=BF=9D=E7=95=99=20ICD=20=E5=88=B0=E8=BF=9B?=
+ =?utf-8?q?=E7=A8=8B=E9=80=80=E5=87=BA?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 04251fc6355e9343fd03a4045e551690e32c421d)
+---
+ nvidia-prolapse/hal/src/hal.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/nvidia-prolapse/hal/src/hal.c b/nvidia-prolapse/hal/src/hal.c
+index 823d132..b491ba4 100644
+--- a/nvidia-prolapse/hal/src/hal.c
++++ b/nvidia-prolapse/hal/src/hal.c
+@@ -648,16 +648,22 @@ static int hal_open(const struct hw_module_t *module, const char *id, struct hw_
+     return 0;
+ }
+ 
++/* close() never unloads the ICD: once loaded it stays for the life of the process (as the gralloc backend keeps it).
++ * NVIDIA's libEGL_nvidia keeps a dlopen() handle of its own (its "libEGL_nvidia.so.0" string; the dlopen and dlclose
++ * wrappers at ELF 0xb80e0 / 0xb8140 in 615.78.08) and closes it from the exit-time destructor it registers with
++ * __cxa_atexit (ELF 0x316d0 registers 0x9f950; 0x9f950 -> 0x33e70 -> 0x33ea0 -> 0xb8140). With our reference gone,
++ * that dlclose drops the last one and bionic unmaps the library while its destructor is still running: the process
++ * dies with SIGSEGV at exit, on the return address after the dlclose call (measured in the guest: HAL open, instance,
++ * close, exit -> SIGSEGV at libEGL_nvidia+0xb8178; without the close: exit 0). Android's libvulkan closes the device
++ * when an updated driver namespace replaces the built-in driver (frameworks/native android13-release
++ * vulkan/libvulkan/driver.cpp Hal::UnloadBuiltinDriver), so the path is reachable from apps too. */
+ static int hal_close(struct hw_device_t *dev) {
+     (void)dev;
+     pthread_mutex_lock(&nvhal_lock);
+     if (open_refs && --open_refs == 0) {
+         if (instances.n) {
+-            NVHAL_ERR("close(): %zu VkInstance(s) still alive; keeping the ICD loaded", instances.n);
++            NVHAL_ERR("close(): %zu VkInstance(s) still alive", instances.n);
+         } else {
+-            dlclose(icd_dl);
+-            icd_dl = NULL;
+-            nvhal_icd_gipa = NULL;
+             nvhal_map_free(&instances);
+             nvhal_map_free(&physdevs);
+         }
+-- 
+2.56.0
+

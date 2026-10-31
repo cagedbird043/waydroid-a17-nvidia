@@ -1,0 +1,158 @@
+From 895880de76171f8c25a2cc1823253667671629d1 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 15:36:27 +0800
+Subject: [PATCH 33/34] =?utf-8?q?=E6=8A=A5=E5=91=8A=20EGL=20=E5=83=8F?=
+ =?utf-8?q?=E7=B4=A0=E8=AF=BB=E5=9B=9E=E5=A4=B1=E8=B4=A5=E5=B9=B6=E4=BF=9D?=
+ =?utf-8?q?=E7=95=99=E6=9C=89=E6=95=88=E7=AA=97=E5=8F=A3=E5=BF=AB=E7=85=A7?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+检查 context、image、texture、FBO 和 readpixels，按失败次数限频记录具体步骤。与上游不同，保留 ATV 的 WMS 文件快照、180 帧等待和 CPU 读回路径；EGL 失败进入现有分支保留最后 live buffer，不发布透明快照。普通 shm 更新只适配返回类型，不改变发布策略。
+
+(cherry picked from commit 38c84f9e55685bcc98f088ae4e6ed2ea9edd7391)
+---
+ hwcomposer/egl-tools.cpp       | 70 +++++++++++++++++++++++++++++++---
+ hwcomposer/egl-tools.h         |  2 +-
+ hwcomposer/gralloc_handler.cpp |  3 +-
+ hwcomposer/wayland-hwc.cpp     |  2 +-
+ 4 files changed, 69 insertions(+), 8 deletions(-)
+
+diff --git a/hwcomposer/egl-tools.cpp b/hwcomposer/egl-tools.cpp
+index d91e58f..3ca7aaf 100644
+--- a/hwcomposer/egl-tools.cpp
++++ b/hwcomposer/egl-tools.cpp
+@@ -91,7 +91,46 @@ void egl_init(struct display* display) {
+     glBindFramebuffer(GL_FRAMEBUFFER, offscreen_framebuffer);
+ }
+ 
+-void egl_render_to_pixels(struct display* display, struct buffer* buf) {
++static const char* glStrError(GLenum err) {
++    switch (err) {
++        case GL_NO_ERROR: return "GL_NO_ERROR";
++        case GL_INVALID_ENUM: return "GL_INVALID_ENUM";
++        case GL_INVALID_VALUE: return "GL_INVALID_VALUE";
++        case GL_INVALID_OPERATION: return "GL_INVALID_OPERATION";
++        case GL_INVALID_FRAMEBUFFER_OPERATION: return "GL_INVALID_FRAMEBUFFER_OPERATION";
++        case GL_OUT_OF_MEMORY: return "GL_OUT_OF_MEMORY";
++        default: return "UNKNOWN";
++    }
++}
++
++static const char* glFramebufferStatusStr(GLenum status) {
++    switch (status) {
++        case GL_FRAMEBUFFER_COMPLETE: return "GL_FRAMEBUFFER_COMPLETE";
++        case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT: return "GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT";
++        case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT: return "GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT";
++        case GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS: return "GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS";
++        case GL_FRAMEBUFFER_UNSUPPORTED: return "GL_FRAMEBUFFER_UNSUPPORTED";
++        case 0: return "error (status 0)";
++        default: return "UNKNOWN";
++    }
++}
++
++/* Called on the EGL worker only. Log the first failure and every 500 thereafter. */
++static void readback_failed(const struct buffer* buf, const char* step, const char* error) {
++    static unsigned failures = 0;
++    if ((failures++ % 500) == 0)
++        ALOGE("wl_shm read-back of a %ux%u buffer (format %d, stride %d) failed at %s: %s; "
++              "the copy shows stale or transparent pixels (%u failures so far)",
++              buf->metadata.width, buf->metadata.height, buf->metadata.format,
++              buf->metadata.pixel_stride, step, error, failures);
++}
++
++bool egl_render_to_pixels(struct display* display, struct buffer* buf) {
++    if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
++        readback_failed(buf, "the read-back EGL context", "none is current (see egl_init log)");
++        return false;
++    }
++    while (glGetError() != GL_NO_ERROR) {}
+     // Wrap native handle into ANativeWindowBuffer for eglCreateImageKHR
+     android::sp<android::GraphicBuffer> graphicBuffer = new android::GraphicBuffer(
+             (native_handle_t*)buf->handle, android::GraphicBuffer::WRAP_HANDLE,
+@@ -103,20 +142,41 @@ void egl_render_to_pixels(struct display* display, struct buffer* buf) {
+     auto image = eglCreateImageKHR(display->egl_dpy, EGL_NO_CONTEXT,
+                                 EGL_NATIVE_BUFFER_ANDROID, (EGLClientBuffer) graphicBuffer->getNativeBuffer(),
+                                 image_attrs);
++    if (image == EGL_NO_IMAGE_KHR) {
++        readback_failed(buf, "eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID)", eglStrError(eglGetError()));
++        return false;
++    }
+ 
+-    GLuint texture;
++    bool ok = false;
++
++    GLuint texture = 0;
+     glGenTextures(1, &texture);
+     glBindTexture(GL_TEXTURE_2D, texture);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+ 
+-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+-
+-    glReadPixels(0, 0, buf->metadata.width, buf->metadata.height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, buf->shm_data);
++    GLenum err = glGetError();
++    if (err != GL_NO_ERROR) {
++        readback_failed(buf, "glEGLImageTargetTexture2DOES", glStrError(err));
++    } else {
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
++        const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++        if (status != GL_FRAMEBUFFER_COMPLETE) {
++            readback_failed(buf, "glCheckFramebufferStatus", glFramebufferStatusStr(status));
++        } else {
++            glReadPixels(0, 0, buf->metadata.width, buf->metadata.height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, buf->shm_data);
++            err = glGetError();
++            if (err != GL_NO_ERROR)
++                readback_failed(buf, "glReadPixels(GL_BGRA_EXT)", glStrError(err));
++            else
++                ok = true;
++        }
++    }
+ 
+     glDeleteTextures(1, &texture);
+     eglDestroyImageKHR(display->egl_dpy, image);
++    return ok;
+ }
+ 
+ void* egl_loop(void* data) {
+diff --git a/hwcomposer/egl-tools.h b/hwcomposer/egl-tools.h
+index fce2dd4..36b7563 100644
+--- a/hwcomposer/egl-tools.h
++++ b/hwcomposer/egl-tools.h
+@@ -28,4 +28,4 @@
+ #include "wayland-hwc.h"
+ 
+ void* egl_loop(void* data);
+-void egl_render_to_pixels(struct display* display, struct buffer* buf);
++bool egl_render_to_pixels(struct display* display, struct buffer* buf);
+diff --git a/hwcomposer/gralloc_handler.cpp b/hwcomposer/gralloc_handler.cpp
+index 220e79f..344e6f9 100644
+--- a/hwcomposer/gralloc_handler.cpp
++++ b/hwcomposer/gralloc_handler.cpp
+@@ -533,7 +533,8 @@ bool cpu_render_to_pixels(buffer *buffer) {
+ 
+ namespace {
+ void update_shm_buffer_generic(display *display, buffer *buffer) {
+-    display->egl_work_queue.emplace_back(std::bind(egl_render_to_pixels, display, buffer));
++    /* The readback reports failures itself; there is no replacement pixel source here. */
++    display->egl_work_queue.emplace_back([display, buffer] { egl_render_to_pixels(display, buffer); });
+     sem_post(&display->egl_go);
+     sem_wait(&display->egl_done);
+ }
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index ea25187..7d527e5 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -220,7 +220,7 @@ void snapshot_inactive_app_window(struct display *display, struct window *window
+                 /* The EGL readback aborts in mapper.pixel on this gralloc. */
+                 ok = cpu_render_to_pixels(window->snapshot_buffer.get());
+             } else {
+-                egl_render_to_pixels(display, window->snapshot_buffer.get());
++                ok = egl_render_to_pixels(display, window->snapshot_buffer.get());
+             }
+         }
+         if (!ok) {
+-- 
+2.56.0
+

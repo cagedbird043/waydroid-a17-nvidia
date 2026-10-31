@@ -1,0 +1,41 @@
+From 0c4c0e96b37468a9870cd06e3e3454a4572509c0 Mon Sep 17 00:00:00 2001
+From: Shiro836 <noreply>
+Date: Sat, 24 Oct 2026 15:33:15 +0300
+Subject: [PATCH 47/56] =?utf-8?q?HAL=EF=BC=9A=E5=8C=85=E8=A3=85=E5=85=A5?=
+ =?utf-8?q?=E5=8F=A3=E5=9B=9E=E9=80=80=E5=88=B0=20ICD=20=E7=9A=84=E5=AE=9E?=
+ =?utf-8?q?=E4=BE=8B=E5=87=BD=E6=95=B0=E6=9F=A5=E8=AF=A2?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 5328278789d309ada22d21257592a6f714bd44df)
+---
+ nvidia-prolapse/hal/src/device.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/nvidia-prolapse/hal/src/device.c b/nvidia-prolapse/hal/src/device.c
+index 67fee77..30491fa 100644
+--- a/nvidia-prolapse/hal/src/device.c
++++ b/nvidia-prolapse/hal/src/device.c
+@@ -697,6 +697,18 @@ VkResult VKAPI_CALL nvhal_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreate
+ #define XL_FETCH(type, field, name) DFN(xl.field, name);
+     NVHAL_XL_FNS(XL_FETCH)
+ #undef XL_FETCH
++    /* The app can hold our wrapper for an entry point the ICD's vkGetDeviceProcAddr withholds: hal.c's
++     * vkGetInstanceProcAddr hands the wrapper out whenever the ICD's vkGetInstanceProcAddr knows the name. NVIDIA's
++     * ICD (libnvidia-eglcore 615.78.08) returns every device-level command from vkGetInstanceProcAddr(instance, name)
++     * with no check of enabled extensions or API version (E 0xd73840: a device-table hit returns directly), while
++     * its vkGetDeviceProcAddr (E 0xd73900) returns only enabled commands, checking an instance extension's device
++     * command against the instance's enabled set. Measured: vkSetDebugUtilsObjectNameEXT without VK_EXT_debug_utils
++     * is NULL from vkGetDeviceProcAddr, non-NULL from vkGetInstanceProcAddr and returns VK_SUCCESS; 3DMark Wild Life
++     * Extreme calls it that way. So such a wrapper forwards to the entry point the app would have reached without
++     * the HAL. */
++#define XL_FETCH_GIPA(type, field, name) if (!d->xl.field) d->xl.field = (void *)nvhal_icd_gipa(inst->handle, name);
++    NVHAL_XL_FNS(XL_FETCH_GIPA)
++#undef XL_FETCH_GIPA
+     /* the AHB-kind intercepts are also reachable through vkGetInstanceProcAddr on any device */
+     DREQ(AllocateMemory, "vkAllocateMemory");
+     DREQ(FreeMemory, "vkFreeMemory");
+-- 
+2.56.0
+

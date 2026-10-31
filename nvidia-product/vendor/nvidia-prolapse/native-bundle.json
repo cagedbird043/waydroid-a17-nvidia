@@ -1,6 +1,6 @@
 {
-  "path": "nvidia/build/native-a17-c2rust2",
-  "build_record_sha256": "6e926d089ab27804f6171623b2beaec4ab3033090ab22686bc0c88dc40aa5fb0",
-  "release": "v0.2.0-rc11-a17-c2rust2",
-  "nvk_commit": "47083f7aad2a284428969f782d0437f8d859301b"
+  "path": "nvidia/build/native-a17-porta",
+  "build_record_sha256": "d193f1dadd5a00a23335d6d034d7e91cd12327599378b34a09a126ea8c87fa73",
+  "release": "v0.2.0-rc11-a17-porta",
+  "nvk_commit": "3b1b3d2e54e8746df668568b6b1651f3d83e3134"
 }

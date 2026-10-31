@@ -1,0 +1,561 @@
+From 07f7fe29f0566b93ece8c930de015f105c8d3a2e Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 16:33:26 +0800
+Subject: [PATCH 34/34] =?utf-8?q?=E6=8C=89=E8=BF=9E=E6=8E=A5=E9=9A=94?=
+ =?utf-8?q?=E7=A6=BB=E7=AA=97=E5=8F=A3=E5=90=8C=E6=AD=A5=E5=88=9B=E5=BB=BA?=
+ =?utf-8?q?=E5=B9=B6=E5=9C=A8=E8=A7=A3=E9=94=81=E5=90=8E=E5=A4=84=E7=90=86?=
+ =?utf-8?q?=E4=BB=BB=E5=8A=A1=E5=91=BD=E4=BB=A4?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+同步创建通过 factory wrapper 把角色对象放在 wl_conn 私有队列，专用 roundtrip 完成 configure；排空队列并持 read intent 迁回默认队列后 cancel_read。open、reconnect 和 destroy 管理队列生命周期。保留 ATV task-stream 的异步默认队列路径和 fractional-scale 校准。
+
+与上游 display 级队列不同，适配 ATV 每连接模型；同步创建回调只记录 focus、resize、close，窗口入表后交给默认队列 continuation，在 windowsMutex 内复制状态、锁外执行任务控制，避免等待 system_server 的锁循环。continuation 以连接为上下文并在析构时注销，关闭路径不带窗口裸指针出锁。同步创建失败不插入空窗口，图层消费者安全释放 acquire fence，交由后续帧重连。保留既有 WMS 快照和显示尺寸归属规则。
+
+(cherry picked from commit 9a37dcf528dd228207a494f4ca4bf1a20b18c846)
+---
+ hwcomposer/hwcomposer.cpp  |   8 +
+ hwcomposer/wayland-hwc.cpp | 294 ++++++++++++++++++++++++++++---------
+ hwcomposer/wayland-hwc.h   |  17 ++-
+ 3 files changed, 245 insertions(+), 74 deletions(-)
+
+diff --git a/hwcomposer/hwcomposer.cpp b/hwcomposer/hwcomposer.cpp
+index 0ca6c86..fc9dfea 100644
+--- a/hwcomposer/hwcomposer.cpp
++++ b/hwcomposer/hwcomposer.cpp
+@@ -685,6 +685,14 @@ out:
+ }
+ 
+ int apply_hwc_layer_to_window(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t hwc_layer_index, window *window) {
++    /* Synchronous creation may lose the connection before its first configure.
++     * Drop this layer safely; the next present follows the reconnect path. */
++    if (!window) {
++        hwc_layer->releaseFenceFd = -1;
++        if (hwc_layer->acquireFenceFd != -1)
++            close(hwc_layer->acquireFenceFd);
++        return -1;
++    }
+     /* Dozing: what still arrives is the screen-off animation fading to black.
+      * Attaching it blanks every card, which is what users report as "the
+      * screen turns black after a few seconds". Keep the last real frame
+diff --git a/hwcomposer/wayland-hwc.cpp b/hwcomposer/wayland-hwc.cpp
+index 7d527e5..b1c1002 100644
+--- a/hwcomposer/wayland-hwc.cpp
++++ b/hwcomposer/wayland-hwc.cpp
+@@ -677,7 +677,10 @@ freeform_request_size(struct window *window, int32_t width, int32_t height)
+           window->taskID.c_str(), width, height, b.left, b.top, rect_width(b), rect_height(b));
+     window->target = b;
+     display->card_targets[window->taskID] = b;
+-    display->task_ctl->resize(stoi(window->taskID), b);
++    if (window->creating)
++        window->creation_resize_pending = true;
++    else
++        display->task_ctl->resize(stoi(window->taskID), b);
+ }
+ 
+ /* Grace before concluding "no Waydroid toplevel is engaged" and dozing.
+@@ -905,7 +908,10 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
+         && window->taskID != "none" && window->taskID != "0") {
+         ALOGI("ACTIVATED edge for %s#%s -> setFocusedTask",
+               window->appID.c_str(), window->taskID.c_str());
+-        display->task_ctl->focus(stoi(window->taskID));
++        if (window->creating)
++            window->creation_focus_pending = true;
++        else
++            display->task_ctl->focus(stoi(window->taskID));
+         /* The card is showing a frozen frame and setFocusedTask is a no-op
+          * for a task that is already top and resumed, so nothing here is
+          * guaranteed to produce a frame. Ask for one, and let the next
+@@ -1021,86 +1027,88 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
+ static bool
+ send_key_event(display *data, uint32_t key, wl_keyboard_key_state state);
+ 
+-static void
+-xdg_toplevel_handle_close(void *data, struct xdg_toplevel *)
+-{
+-    struct window *window = (struct window *)data;
+-    struct display *display = window->conn->dpy;
++struct close_action {
++    int task = -1;
++    bool clear_recents = false;
++    bool desktop = false;
++    std::string apps = "none";
++};
+ 
++/* Caller owns windowsMutex. No window pointer escapes this state update. */
++static close_action close_window_locked(struct window *window)
++{
++    auto *display = window->conn->dpy;
++    close_action action;
+     ALOGI("compositor closed toplevel task=%s app=%s",
+           window->taskID.c_str(), window->appID.c_str());
++    send_key_event(display, 0, WL_KEYBOARD_KEY_STATE_PRESSED);
++    send_key_event(display, 0, WL_KEYBOARD_KEY_STATE_RELEASED);
+ 
+-    // simulate user input to restart idle timeout (TODO: find a better way)
+-    send_key_event(window->conn->dpy, 0, WL_KEYBOARD_KEY_STATE_PRESSED);
+-    send_key_event(window->conn->dpy, 0, WL_KEYBOARD_KEY_STATE_RELEASED);
+-
+-    /* Closing the desktop leaves the apps running: each goes back to a card
+-     * of its own. Per-app mode is any active_apps but "none" and "Waydroid";
+-     * name an app actually open, so the system service starts from a real
+-     * foreground and Android is not put to sleep with apps on screen. */
+     if (window->is_freeform_desktop()) {
+-        std::string apps = "none";
+-        {
+-            std::scoped_lock lock(display->windowsMutex);
+-            auto is_app = [](const task_info &task) {
+-                return !task.closing && !task.appID.empty()
+-                        && task.appID != "com.android.launcher3"
+-                        && task.appID != "com.android.systemui";
+-            };
+-            for (const auto &[tid, task] : display->tasks)
+-                if (is_app(task) && (task.focused || apps == "none"))
+-                    apps = task.appID;
+-            /* window dies here: nothing below may touch it. */
+-            display->windows.erase("Waydroid");
+-        }
+-        ALOGI("desktop closed: apps back on cards (active_apps=%s)", apps.c_str());
+-        property_set("waydroid.active_apps", apps.c_str());
++        action.desktop = true;
++        for (const auto &[tid, task] : display->tasks)
++            if (!task.closing && !task.appID.empty()
++                    && task.appID != "com.android.launcher3"
++                    && task.appID != "com.android.systemui"
++                    && (task.focused || action.apps == "none"))
++                action.apps = task.appID;
++        display->windows.erase("Waydroid");
+         display->want_frame.store(true);
+-        return;
+-    }
+-
+-    if (window->taskID != "none") {
+-        if (window->taskID == "0") {
+-            property_set("waydroid.active_apps", "none");
+-            display->task_ctl->clear_recents();
+-        } else {
+-            display->task_ctl->remove(stoi(window->taskID));
+-        }
++        return action;
+     }
+ 
+-    std::scoped_lock lock(window->conn->dpy->windowsMutex);
+     std::string key;
+     if (window->taskID != "0" && window->taskID != "none") {
+         key = window->taskID;
+-        /* Two-phase close: the card is gone host-side, but the task entry
+-         * stays marked closing until WMS confirms with taskRemoved, so
+-         * teardown frames (or a reused task ID) can't recreate it. */
++        action.task = stoi(key);
+         auto &task = display->tasks[key];
+         if (task.appID.empty())
+             task.appID = window->appID;
+         task.closing = true;
+         task.closing_since = std::chrono::steady_clock::now();
+-
+-        /* With a connection per task the connection is the session, so a
+-         * closed card tears the whole thing down, not just the window. We are
+-         * on that connection's own dispatch thread: quiescing it here is
+-         * safe, and the worker's join cannot outrun this handler. */
+-        if (detach_task_conn(display, (uint32_t)stoul(key)))
+-            return;
++        /* A per-task connection is reaped only after this dispatch returns. */
++        if (detach_task_conn(display, (uint32_t)action.task))
++            return action;
+     } else {
++        action.clear_recents = window->taskID == "0";
+         key = window->appID;
+     }
+     display->windows.erase(key);
+-
+-    /* The shell may have dropped the app entry backing this connection
+-     * (qtmir authorizes clients only at connect time), never presenting our
+-     * windows again. Kill the socket; hwc_set reconnects. Not needed with
+-     * shells that keep the session presentable. */
+     if (display->windows.size() == 0 && display->ctl->wl_alive.load() &&
+             property_get_bool("persist.waydroid.reconnect_on_close", true)) {
+         ALOGI("last toplevel closed by compositor, forcing wayland reconnect");
+         shutdown(wl_display_get_fd(display->ctl->display), SHUT_RDWR);
+     }
++    return action;
++}
++
++static void perform_close(struct display *display, const close_action &action)
++{
++    if (action.desktop) {
++        ALOGI("desktop closed: apps back on cards (active_apps=%s)", action.apps.c_str());
++        property_set("waydroid.active_apps", action.apps.c_str());
++    } else if (action.clear_recents) {
++        property_set("waydroid.active_apps", "none");
++        display->task_ctl->clear_recents();
++    } else if (action.task >= 0) {
++        display->task_ctl->remove(action.task);
++    }
++}
++
++static void xdg_toplevel_handle_close(void *data, struct xdg_toplevel *)
++{
++    auto *window = static_cast<struct window *>(data);
++    auto *display = window->conn->dpy;
++    close_action action;
++    {
++        std::scoped_lock lock(display->windowsMutex);
++        if (window->creating) {
++            window->creation_close_pending = true;
++            return;
++        }
++        action = close_window_locked(window);
++    }
++    perform_close(display, action);
+ }
+ 
+ static const struct xdg_toplevel_listener xdg_toplevel_listener = {
+@@ -1318,6 +1326,13 @@ void window::minimize() {
+ }
+ 
+ window::~window() {
++    {
++        std::scoped_lock lock(conn->dpy->windowsMutex);
++        if (creation_done) {
++            conn->creation_continuations.erase(creation_done);
++            wl_callback_destroy(creation_done);
++        }
++    }
+     if (decoration)
+         zxdg_toplevel_decoration_v1_destroy(decoration);
+     if (xdg_toplevel)
+@@ -1397,6 +1412,93 @@ static const struct wl_surface_listener surface_listener = {
+     .leave = surface_handle_leave,
+ };
+ 
++/* Role factories inherit their wrapper's queue without changing the shared
++ * global proxy. Async task-stream creation never uses these wrappers. */
++template <typename T>
++static T *creation_queue_wrapper(struct wl_conn *conn, T *factory)
++{
++    T *wrapper = static_cast<T *>(wl_proxy_create_wrapper(factory));
++    if (!wrapper) {
++        ALOGE("window::create: cannot allocate proxy wrapper");
++        abort();
++    }
++    wl_proxy_set_queue(reinterpret_cast<struct wl_proxy *>(wrapper), conn->create_queue);
++    return wrapper;
++}
++
++static bool hand_to_default_queue(struct window *window)
++{
++    auto *conn = window->conn;
++    while (wl_display_prepare_read_queue(conn->display, conn->create_queue) != 0) {
++        if (wl_display_dispatch_queue_pending(conn->display, conn->create_queue) < 0)
++            return false;
++    }
++    void *proxies[] = {window->xdg_surface, window->xdg_toplevel,
++                       window->decoration, window->shell_surface};
++    for (void *proxy : proxies)
++        if (proxy)
++            wl_proxy_set_queue(static_cast<struct wl_proxy *>(proxy), nullptr);
++    window->creating = false;
++    wl_display_cancel_read(conn->display);
++    return true;
++}
++
++/* Default-queue continuation: the creator no longer waits for this thread.
++ * Copy commands under windowsMutex, then release it before system_server can
++ * wait on SurfaceFlinger. Normal input still asserts focus before injection. */
++static void creation_done(void *data, struct wl_callback *callback, uint32_t)
++{
++    auto *conn = static_cast<struct wl_conn *>(data);
++    auto *display = conn->dpy;
++    bool focus, resize, close;
++    int task = -1;
++    hwc_rect_t bounds{};
++    close_action action;
++    {
++        std::scoped_lock lock(display->windowsMutex);
++        auto pending = conn->creation_continuations.find(callback);
++        /* The window destructor may have cancelled an already-entered
++         * callback while it was waiting for this lock. */
++        if (pending == conn->creation_continuations.end())
++            return;
++        auto *window = pending->second;
++        conn->creation_continuations.erase(pending);
++        window->creation_done = nullptr;
++        wl_callback_destroy(callback);
++        focus = window->creation_focus_pending && window->activated;
++        resize = window->creation_resize_pending;
++        close = window->creation_close_pending;
++        if (window->taskID != "0" && window->taskID != "none")
++            task = stoi(window->taskID);
++        bounds = window->target;
++        if (close)
++            action = close_window_locked(window);
++    }
++    if (close) {
++        perform_close(display, action);
++        return;
++    }
++    if (task >= 0 && resize)
++        display->task_ctl->resize(task, bounds);
++    if (task >= 0 && focus) {
++        force_screen_wakeup(display);
++        display->task_ctl->focus(task);
++    }
++}
++
++static const struct wl_callback_listener creation_done_listener = {creation_done};
++static void resume_created_window(struct window *window)
++{
++    if (!window->creation_focus_pending && !window->creation_resize_pending && !window->creation_close_pending)
++        return;
++    auto *conn = window->conn;
++    window->creation_done = wl_display_sync(conn->display);
++    conn->creation_continuations.emplace(window->creation_done, window);
++    wl_callback_add_listener(window->creation_done, &creation_done_listener, conn);
++    wl_display_flush(conn->display);
++}
++
++
+ std::unique_ptr<window>
+ window::create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, std::string taskID, hwc_color_t color, bool sync_configure)
+ {
+@@ -1406,6 +1508,7 @@ window::create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, st
+         return nullptr;
+ 
+     window->conn = conn;
++    window->creating = sync_configure;
+     ALOGI("creating toplevel task=%s app=%s", taskID.c_str(), appID.c_str());
+     window->surface = wl_compositor_create_surface(conn->compositor);
+     wl_surface_set_user_data(window->surface, window.get());
+@@ -1433,8 +1536,10 @@ window::create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, st
+     bool calibrating = conn->is_ctl && (!display->height || !display->width);
+ 
+     if (conn->wm_base) {
+-        window->xdg_surface =
+-                xdg_wm_base_get_xdg_surface(conn->wm_base, window->surface);
++        auto *wm_base = sync_configure ? creation_queue_wrapper(conn, conn->wm_base) : conn->wm_base;
++        window->xdg_surface = xdg_wm_base_get_xdg_surface(wm_base, window->surface);
++        if (sync_configure)
++            wl_proxy_wrapper_destroy(wm_base);
+         assert(window->xdg_surface);
+         xdg_surface_add_listener(window->xdg_surface,
+                                      &xdg_surface_listener, window.get());
+@@ -1446,16 +1551,22 @@ window::create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, st
+          * takes the host's title bar; so is the desktop showing them all. */
+         if ((display->wantDecorations || window->is_freeform_card() || window->is_freeform_desktop())
+                 && conn->decoration_manager) {
++            auto *manager = sync_configure ? creation_queue_wrapper(conn, conn->decoration_manager)
++                                           : conn->decoration_manager;
+             window->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
+-                    conn->decoration_manager, window->xdg_toplevel);
++                    manager, window->xdg_toplevel);
++            if (sync_configure)
++                wl_proxy_wrapper_destroy(manager);
+             zxdg_toplevel_decoration_v1_add_listener(window->decoration,
+                     &toplevel_decoration_listener, window.get());
+             zxdg_toplevel_decoration_v1_set_mode(window->decoration,
+                     ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+         }
+     } else if (conn->shell) {
+-        window->shell_surface =
+-            wl_shell_get_shell_surface(conn->shell, window->surface);
++        auto *shell = sync_configure ? creation_queue_wrapper(conn, conn->shell) : conn->shell;
++        window->shell_surface = wl_shell_get_shell_surface(shell, window->surface);
++        if (sync_configure)
++            wl_proxy_wrapper_destroy(shell);
+         assert(window->shell_surface);
+         wl_shell_surface_add_listener(window->shell_surface, &shell_surface_listener, window.get());
+         wl_shell_surface_set_toplevel(window->shell_surface);
+@@ -1490,7 +1601,11 @@ window::create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, st
+     if (sync_configure) {
+         // Wait for first configure event
+         do {
+-            wl_display_roundtrip(conn->display);
++            if (wl_display_roundtrip_queue(conn->display, conn->create_queue) < 0) {
++                wl_shm_pool_destroy(pool);
++                munmap(shm_data, 4);
++                return nullptr;
++            }
+         } while (!window->configured);
+     } else {
+         wl_display_flush(conn->display);
+@@ -1500,8 +1615,11 @@ window::create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, st
+         wp_fractional_scale_v1* fs = nullptr;
+         if (conn->fractional_scale_manager) {
+             // We only support one global scale
+-            fs = wp_fractional_scale_manager_v1_get_fractional_scale(
+-                    conn->fractional_scale_manager, window->surface);
++            auto *manager = sync_configure ? creation_queue_wrapper(conn, conn->fractional_scale_manager)
++                                           : conn->fractional_scale_manager;
++            fs = wp_fractional_scale_manager_v1_get_fractional_scale(manager, window->surface);
++            if (sync_configure)
++                wl_proxy_wrapper_destroy(manager);
+             wp_fractional_scale_v1_add_listener(fs, &fractional_scale_listener, conn);
+         }
+ 
+@@ -1514,7 +1632,10 @@ window::create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, st
+         if (window->viewport && display->req_width && display->req_height)
+             wp_viewport_set_destination(window->viewport, display->req_width, display->req_height);
+         wl_surface_commit(window->surface);
+-        wl_display_roundtrip(conn->display);
++        if (sync_configure)
++            wl_display_roundtrip_queue(conn->display, conn->create_queue);
++        else
++            wl_display_roundtrip(conn->display);
+ 
+         if (fs) {
+             wp_fractional_scale_v1_destroy(fs);
+@@ -1533,6 +1654,14 @@ window::create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, st
+             window->set_maximize(false);
+     }
+ 
++    if (sync_configure) {
++        if (!hand_to_default_queue(window.get())) {
++            wl_shm_pool_destroy(pool);
++            munmap(shm_data, 4);
++            return nullptr;
++        }
++    }
++
+     /* Only the window that stands for the whole display may describe itself
+      * with the display size; a task card is whatever size the host gave it,
+      * and claiming the display size here is what starts the shrink ratchet
+@@ -4227,15 +4356,19 @@ void display::note_task_from_layer(const std::string &tid, const std::string &ai
+ }
+ 
+ window *open_windows::add(waydroid_hwc_composer_device_1 *pdev, const std::string& key, const std::string& aid, const std::string& tid, hwc_color_t color) {
++    std::scoped_lock lock(pdev->display->windowsMutex);
+     window *window = nullptr;
+     update([&](){
+-        auto res = windows.emplace(
+-            key,
+-            window::create(pdev->display->ctl.get(), pdev->should_compose, aid, tid, color)
+-        );
++        auto created = window::create(pdev->display->ctl.get(), pdev->should_compose, aid, tid, color);
++        if (!created)
++            return;
++        auto res = windows.emplace(key, std::move(created));
+         assert(res.second);
+         window = res.first->second.get();
++        resume_created_window(window);
+     });
++    if (!window)
++        return nullptr;
+     /* A new toplevel may need the display awake to draw its first frame; if it
+      * launched while Android was dozed, wake it now (see any_window_visible). */
+     update_screen_power(pdev->display);
+@@ -4244,7 +4377,10 @@ window *open_windows::add(waydroid_hwc_composer_device_1 *pdev, const std::strin
+ }
+ 
+ void open_windows::add(const std::string& key, std::unique_ptr<window> window) {
++    if (!window)
++        return;
+     struct display *display = window->conn->dpy;
++    std::scoped_lock lock(display->windowsMutex);
+     struct window *added = nullptr;
+     update([&](){
+         auto res = windows.emplace(
+@@ -4254,6 +4390,7 @@ void open_windows::add(const std::string& key, std::unique_ptr<window> window) {
+         assert(res.second);
+         added = res.first->second.get();
+     });
++    resume_created_window(added);
+     take_pending_raise(display, added);
+ }
+ 
+@@ -4460,6 +4597,8 @@ static void wl_conn_reconnect(struct wl_conn *conn) {
+     if (conn->registry)
+         wl_registry_destroy(conn->registry);
+     conn->proxies_valid = false;
++    wl_event_queue_destroy(conn->create_queue);
++    conn->create_queue = nullptr;
+     wl_display_disconnect(conn->display);
+     conn->display = nullptr;
+     reset_wayland_globals(conn);
+@@ -4474,6 +4613,11 @@ static void wl_conn_reconnect(struct wl_conn *conn) {
+         ALOGE("wl_conn_reconnect: wl_display_connect failed, retrying");
+         usleep(500 * 1000);
+     }
++    conn->create_queue = wl_display_create_queue(conn->display);
++    if (!conn->create_queue) {
++        ALOGE("wl_conn_reconnect: cannot allocate creation queue");
++        abort();
++    }
+ 
+     conn->registry = wl_display_get_registry(conn->display);
+     wl_registry_add_listener(conn->registry, &registry_listener, conn);
+@@ -4574,12 +4718,20 @@ static bool wl_conn_open(struct wl_conn *conn) {
+         sem_destroy(&conn->reconnect_resume);
+         return false;
+     }
++    conn->create_queue = wl_display_create_queue(conn->display);
++    if (!conn->create_queue) {
++        wl_display_disconnect(conn->display);
++        sem_destroy(&conn->reconnect_resume);
++        return false;
++    }
+ 
+     if (conn->dpy->gtype == GrallocType::GRALLOC_ANDROID && !conn->android_wlegl)
+         ALOGE("GRALLOC_ANDROID requested, but the Wayland compositor did not advertise android_wlegl");
+ 
+     if (pthread_create(&conn->wayland_thread, nullptr, wl_conn_thread, conn) != 0) {
+         ALOGE("Couldn't create wayland thread");
++        wl_event_queue_destroy(conn->create_queue);
++        conn->create_queue = nullptr;
+         wl_display_disconnect(conn->display);
+         sem_destroy(&conn->reconnect_resume);
+         return false;
+@@ -4640,6 +4792,8 @@ static void wl_conn_destroy(struct wl_conn *conn) {
+     wl_registry_destroy(conn->registry);
+     wl_display_flush(conn->display);
+     conn->proxies_valid = false;
++    wl_event_queue_destroy(conn->create_queue);
++    conn->create_queue = nullptr;
+     wl_display_disconnect(conn->display);
+ 
+     sem_destroy(&conn->reconnect_resume);
+diff --git a/hwcomposer/wayland-hwc.h b/hwcomposer/wayland-hwc.h
+index 5b400e3..59ddd0b 100644
+--- a/hwcomposer/wayland-hwc.h
++++ b/hwcomposer/wayland-hwc.h
+@@ -226,6 +226,12 @@ struct wl_conn {
+     pthread_t wayland_thread; // constant after init
+ 
+     struct wl_display *display;
++    /* Only synchronous window creation dispatches this queue. Role objects
++     * return to the default queue under a read intent before create returns. */
++    struct wl_event_queue *create_queue = nullptr;
++    /* Guarded by windowsMutex. Dispatch userdata is the connection, whose
++     * lifetime extends past the dispatch-thread join, never a window. */
++    std::map<struct wl_callback *, struct window *> creation_continuations;
+     struct wl_registry *registry;
+     struct wl_compositor *compositor;
+     std::atomic<uint32_t> presentation_clk_id{UINT32_MAX};
+@@ -363,6 +369,11 @@ struct window {
+     struct xdg_surface *xdg_surface;
+     struct xdg_toplevel *xdg_toplevel;
+     struct zxdg_toplevel_decoration_v1 *decoration;
++    bool creating = false;
++    bool creation_focus_pending = false;
++    bool creation_resize_pending = false;
++    bool creation_close_pending = false;
++    struct wl_callback *creation_done = nullptr;
+ 
+     /* Used for the background color */
+     bool dedicated_background_surface;
+@@ -466,10 +477,8 @@ struct window {
+ 
+     ~window();
+ 
+-    /* sync_configure: wait for the initial xdg configure before returning.
+-     * Must be false when called off the wayland thread with windowsMutex held
+-     * (post_task_buffer): the roundtrip can deadlock against the configure
+-     * handler (do_hotplug -> adapter mutex -> hwc_set -> windowsMutex). */
++    /* sync_configure waits on the connection's private creation queue. The
++     * task-stream path remains asynchronous on the default queue. */
+     static std::unique_ptr<window> create(struct wl_conn *conn, bool use_subsurfaces, std::string appID, std::string taskID, hwc_color_t color, bool sync_configure = true);
+ 
+     window::layer &get_next_layer();
+-- 
+2.56.0
+

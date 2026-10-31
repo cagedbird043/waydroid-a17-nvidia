@@ -1,0 +1,195 @@
+From 83219c0ecde89cdcc0aff5a4b9625d15998d93d2 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 15:37:27 +0800
+Subject: [PATCH 54/56] =?utf-8?q?=E5=AE=89=E8=A3=85=E9=85=8D=E7=BD=AE?=
+ =?utf-8?q?=EF=BC=9A=E6=AF=8F=E6=AC=A1=E5=81=9C=E5=AE=B9=E5=99=A8=E5=90=8E?=
+ =?utf-8?q?=E6=B8=85=E7=90=86=E5=AE=9E=E9=99=85=E6=95=B0=E6=8D=AE=E6=8C=82?=
+ =?utf-8?q?=E8=BD=BD=E4=B8=AD=E7=9A=84=E5=BA=94=E7=94=A8=E7=BC=93=E5=AD=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 38bc6642e51cadf1d47dee272bdb73bfe42d1019)
+---
+ .../waydroid-nvidia-bin/waydroid-nvidia-setup |  38 +++++-
+ packaging/native/test_setup_caches.py         | 112 ++++++++++++++++++
+ 2 files changed, 149 insertions(+), 1 deletion(-)
+ create mode 100755 packaging/native/test_setup_caches.py
+
+diff --git a/packaging/aur/waydroid-nvidia-bin/waydroid-nvidia-setup b/packaging/aur/waydroid-nvidia-bin/waydroid-nvidia-setup
+index 489be92..786c0d9 100644
+--- a/packaging/aur/waydroid-nvidia-bin/waydroid-nvidia-setup
++++ b/packaging/aur/waydroid-nvidia-bin/waydroid-nvidia-setup
+@@ -25,7 +25,8 @@
+ #      -o`, container unit check). An image already gated on the loaded module is not gated again;
+ #      venus: puts the official vendor image back if ours is installed, installs the Venus guest stack (ANGLE,
+ #      hwcomposer, SurfaceFlinger, Venus guest driver) into /var/lib/waydroid/nv/guest and switches the cfg;
+-#   5. stops the Waydroid container for the switch, then enables and starts waydroid-container.service.
++#   5. stops the Waydroid container for the switch, clears per-app code_cache directories from its actual data
++#      mount on every run (Android regenerates them), then enables and starts waydroid-container.service.
+ # Any failure stops with the reason and the remedy and puts the previous image and configuration back.
+ # --restore-official-vendor puts the official vendor image back and returns waydroid.cfg to stock Waydroid (no
+ # nvidia_* keys); the package removal runs it.
+@@ -93,6 +94,41 @@ stop_container() {
+         [ "$state" = STOPPED ] ||
+             die "the Waydroid container did not stop; stop it (waydroid session stop; systemctl stop waydroid-container) and re-run"
+     fi
++    # Resolve the actual Android data mount, including non-default host locations.
++    python3 -I - /var/lib/waydroid/lxc/waydroid/config_session <<'PY'
++from pathlib import Path
++import shutil
++import sys
++
++session = Path(sys.argv[1])
++if session.exists():
++    lines = [line for line in session.read_text().splitlines()
++             if line.strip() and not line.lstrip().startswith('#')]
++    if not lines:
++        # waydroid init creates this file before any user session/data mount exists.
++        sys.exit(0)
++    mounts = []
++    for line in lines:
++        fields = line.split()
++        if len(fields) >= 6 and fields[:2] == ['lxc.mount.entry', '='] and fields[3] == 'data':
++            mounts.append(Path(fields[2].replace('\\040', ' ').replace('\\011', '\t').replace('\\134', '\\')))
++    if len(mounts) != 1:
++        raise RuntimeError('Cannot identify the guest data mount in ' + str(session))
++    data = mounts[0].resolve()
++    count = 0
++    for pattern in ('data/*/code_cache', 'user/*/*/code_cache', 'user_de/*/*/code_cache'):
++        for cache in data.glob(pattern):
++            if cache.is_dir() and not cache.is_symlink():
++                real = cache.resolve()
++                try:
++                    relative = real.relative_to(data)
++                except ValueError:
++                    continue
++                if relative.parts:
++                    shutil.rmtree(real)
++                    count += 1
++    print('== Cleared {} per-app shader/code caches'.format(count))
++PY
+ }
+ restart() {   # after a failure: back to the state we found
+     if [ "$WAS_ACTIVE" = 1 ]; then say "starting waydroid-container.service again"; systemctl start waydroid-container.service; fi
+diff --git a/packaging/native/test_setup_caches.py b/packaging/native/test_setup_caches.py
+new file mode 100755
+index 0000000..8aec75c
+--- /dev/null
++++ b/packaging/native/test_setup_caches.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++"""Run the setup's cache cleanup heredoc against a synthetic data mount."""
++import ast
++import os
++import platform
++import types
++from unittest import mock
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import unittest
++
++SETUP = Path(__file__).resolve().parents[1] / 'aur/waydroid-nvidia-bin/waydroid-nvidia-setup'
++
++
++class SetupCacheTest(unittest.TestCase):
++    def test_actual_mount_multiple_users_and_repeated_setup(self):
++        setup = SETUP.read_text()
++        cleanup = setup.split("config_session <<'PY'\n", 1)[1].split('\nPY', 1)[0]
++        stop = setup.split('stop_container() {', 1)[1].split('\nrestart()', 1)[0]
++        self.assertIn(cleanup, stop)
++        self.assertLess(stop.index('systemctl stop'), stop.index(cleanup))
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            data = root / 'actual data'
++            session = root / 'config_session'
++            session.write_text('lxc.mount.entry = {} data none bind 0 0\n'.format(
++                str(data).replace(' ', r'\040')))
++            apps = [data / area / str(user) / 'com.example.app'
++                    for area in ('user', 'user_de') for user in (0, 10)]
++            apps.append(data / 'data/com.android.systemui')
++            for _ in range(2):
++                for app in apps:
++                    (app / 'code_cache/nested').mkdir(parents=True)
++                    (app / 'code_cache/nested/shader').write_text('stale')
++                    (app / 'user-data').write_text('keep')
++                result = subprocess.run([sys.executable, '-I', '-', str(session)],
++                                        input=cleanup, text=True, capture_output=True)
++                self.assertEqual(result.returncode, 0, result.stderr)
++                for app in apps:
++                    self.assertTrue(app.is_dir())
++                    self.assertEqual((app / 'user-data').read_text(), 'keep')
++                    self.assertFalse((app / 'code_cache').exists())
++
++    def cleanup(self, session):
++        code = SETUP.read_text().split("config_session <<'PY'\n", 1)[1].split('\nPY', 1)[0]
++        return subprocess.run([sys.executable, '-I', '-', str(session)],
++                              input=code, text=True, capture_output=True)
++
++    def test_missing_and_empty_session(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            session = Path(tmp) / 'config_session'
++            self.assertEqual(self.cleanup(session).returncode, 0)
++            session.touch()
++            self.assertEqual(self.cleanup(session).returncode, 0)
++            session.write_text('lxc.environment = USER_ID=0\n')
++            self.assertNotEqual(self.cleanup(session).returncode, 0)
++            session.write_text('lxc.mount.entry = /a data none bind 0 0\n' * 2)
++            self.assertNotEqual(self.cleanup(session).returncode, 0)
++
++    def test_first_init_then_setup(self):
++        lxc = SETUP.parents[3] / 'build/waydroid/tools/helpers/lxc.py'
++        if not lxc.is_file():
++            self.skipTest('assemble Waydroid with dev/build-waydroid first')
++        function = next(node for node in ast.parse(lxc.read_text()).body
++                        if isinstance(node, ast.FunctionDef) and node.name == 'set_lxc_config')
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            (root / 'waydroid').mkdir()
++            tools = types.SimpleNamespace(
++                config=types.SimpleNamespace(defaults={'lxc': tmp}, tools_src=tmp),
++                helpers=types.SimpleNamespace(run=types.SimpleNamespace(user=mock.Mock())))
++            scope = dict(tools=tools, os=os, platform=platform, Path=Path,
++                         get_lxc_version=lambda args: 5, get_apparmor_status=lambda args: False,
++                         drop_unsupported_apparmor=mock.Mock(), generate_nodes_lxc_config=lambda args: [])
++            exec(compile(ast.Module(body=[function], type_ignores=[]), str(lxc), 'exec'), scope)
++            scope['set_lxc_config'](types.SimpleNamespace(work=tmp))
++            session = root / 'waydroid/config_session'
++            self.assertEqual(session.read_bytes(), b'')
++            self.assertEqual(self.cleanup(session).returncode, 0)
++
++    def test_symlink_boundaries(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            root = Path(tmp)
++            data = root / 'data'
++            user = data / 'user/0'
++            user.mkdir(parents=True)
++            outside = root / 'outside'
++            (outside / 'code_cache').mkdir(parents=True)
++            (outside / 'code_cache/keep').write_text('keep')
++            (user / 'external-app').symlink_to(outside, target_is_directory=True)
++            app = user / 'cache-link-app'
++            app.mkdir()
++            (app / 'code_cache').symlink_to(outside / 'code_cache', target_is_directory=True)
++            inside = user / 'normal-app'
++            (inside / 'code_cache').mkdir(parents=True)
++            (inside / 'user-data').write_text('keep')
++            (data / 'data').symlink_to(user, target_is_directory=True)
++            session = root / 'config_session'
++            session.write_text('lxc.mount.entry = {} data none bind 0 0\n'.format(data))
++            result = self.cleanup(session)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            self.assertTrue((outside / 'code_cache/keep').is_file())
++            self.assertTrue((app / 'code_cache').is_symlink())
++            self.assertFalse((inside / 'code_cache').exists())
++            self.assertEqual((inside / 'user-data').read_text(), 'keep')
++
++
++
++if __name__ == '__main__':
++    unittest.main()
+-- 
+2.56.0
+

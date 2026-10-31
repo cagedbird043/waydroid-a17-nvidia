@@ -1,0 +1,33 @@
+From 611f56ae62e7e6d38ee7f85a3928bc96c9933d46 Mon Sep 17 00:00:00 2001
+From: Shiro836 <noreply>
+Date: Sun, 25 Oct 2026 15:49:27 +0300
+Subject: [PATCH 52/56] =?utf-8?q?=E5=AE=89=E8=A3=85=E6=8F=90=E7=A4=BA?=
+ =?utf-8?q?=EF=BC=9A=E8=AF=B4=E6=98=8E=20nvrm=20=E5=A4=B1=E8=B4=A5?=
+ =?utf-8?q?=E5=90=8E=E7=9A=84=E9=87=8D=E6=96=B0=E9=97=A8=E7=A6=81=E6=9D=A1?=
+ =?utf-8?q?=E4=BB=B6?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 1cc05140c7de02b463be3f2be507c614b0e09ea4)
+---
+ packaging/native/vendor_image.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/packaging/native/vendor_image.py b/packaging/native/vendor_image.py
+index 261abdd..188079d 100644
+--- a/packaging/native/vendor_image.py
++++ b/packaging/native/vendor_image.py
+@@ -393,7 +393,8 @@ def install(args):
+         print(media['reason'], flush=True)
+     if not native_gl_ok:
+         print(f'native GL (nvrm, opt-in): not available on this GPU: {native_gl_reason}. GLES is ANGLE on the Vulkan '
+-              'driver; --native-gl on is refused until a later setup run passes the nvrm gate.', flush=True)
++              'driver; --native-gl on is refused (the gate runs nvrm again after a package or driver update).',
++              flush=True)
+ 
+ 
+ def restore_official(args):
+-- 
+2.56.0
+

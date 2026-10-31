@@ -1,0 +1,32 @@
+From ca77585aa3b4618cd63626d4c5c2494823f88bae Mon Sep 17 00:00:00 2001
+From: Shiro836 <noreply>
+Date: Sun, 25 Oct 2026 15:46:27 +0300
+Subject: [PATCH 50/56] =?utf-8?q?=E9=83=A8=E7=BD=B2=E5=B7=A5=E5=85=B7?=
+ =?utf-8?q?=EF=BC=9A=E6=8E=A5=E5=8F=97=E4=B8=A4=E6=AE=B5=E5=BC=8F=20NVIDIA?=
+ =?utf-8?q?=20=E9=A9=B1=E5=8A=A8=E7=89=88=E6=9C=AC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 39491338ab7095a8db42f1402eace936d50ff85d)
+---
+ dev/deploy-guest | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/dev/deploy-guest b/dev/deploy-guest
+index 2ef64f7..a57ae2c 100755
+--- a/dev/deploy-guest
++++ b/dev/deploy-guest
+@@ -8,7 +8,8 @@ NVP=$(cd "$(dirname "$(readlink -f "$0")")/../nvidia-prolapse" && pwd)   # the n
+ # Waydroid user data of the invoking user (sudo keeps SUDO_USER); override with WAYDROID_DATA=.
+ DATA=${WAYDROID_DATA:-$(getent passwd "${SUDO_USER:-$(id -un)}" | cut -d: -f6)/.local/share/waydroid/data}
+ D=$DATA/local/tmp/nvp
+-V=$(awk '/NVRM version/{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) print $i}' /proc/driver/nvidia/version)
++# two- or three-part versions (595.80, 615.78.08), the first one on the line
++V=$(awk '/NVRM version/{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+(\.[0-9]+)?$/) {print $i; exit}}' /proc/driver/nvidia/version)
+ [ -n "$V" ] || { echo "deploy-guest: cannot read the driver version from /proc/driver/nvidia/version" >&2; exit 1; }
+ mkdir -p "$D/lib" "$D/shim" "$D/bin"
+ for f in libEGL_nvidia.so.$V libnvidia-glsi.so.$V libnvidia-eglcore.so.$V libnvidia-gpucomp.so.$V libnvidia-glvkspirv.so.$V; do
+-- 
+2.56.0
+

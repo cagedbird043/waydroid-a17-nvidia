@@ -1,0 +1,41 @@
+From 3b1b3d2e54e8746df668568b6b1651f3d83e3134 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 15:59:35 +0800
+Subject: [PATCH 56/56] =?utf-8?q?=E6=B5=8B=E8=AF=95=EF=BC=9A=E4=BF=AE?=
+ =?utf-8?q?=E5=A4=8D=E6=97=A2=E6=9C=89=20source-native=20=E5=A4=B9?=
+ =?utf-8?q?=E5=85=B7=E4=B8=8E=E5=BD=93=E5=89=8D=E6=BA=90=E7=A0=81=E4=B8=8D?=
+ =?utf-8?q?=E4=B8=80=E8=87=B4?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+---
+ dev/test_source_native.py | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/dev/test_source_native.py b/dev/test_source_native.py
+index d95c6ea..b70aa54 100644
+--- a/dev/test_source_native.py
++++ b/dev/test_source_native.py
+@@ -463,7 +463,8 @@ class RustProfileTest(unittest.TestCase):
+         self.profiles = sn.profiles
+         for name in ('src/lib.rs', 'Cargo.toml', 'Cargo.lock', 'mesa/nv_rm.h',
+                      'mesa/nvkmd_rm.h', 'mesa/nvkmd_rm.c', 'mesa/build.py',
+-                     'mesa/build-compat.patch', 'mesa/rm-integration.patch'):
++                     'mesa/build-compat.patch', 'mesa/rm-integration.patch',
++                     'mesa/nvk-rm-graphics-multiqueue.patch'):
+             touch(self.root / 'nvidia-prolapse/driver-source/native' / name, b'fixture source')
+         touch(self.root / 'tools/native_rust_profile.py', b'fixture helper')
+         self.runner = sn._load(REPO / 'tools/native-vulkan-regression.py', 'profile_regression_test')
+@@ -796,7 +797,7 @@ class MediaClosureTest(unittest.TestCase):
+ 
+     def test_backend_without_nv_video_refused(self):
+         self.exports['libnv_bionic_native.so'] = {'nv_rm_x'}
+-        self.assertRaisesRegex(RuntimeError, 'lacks nv_video symbols', self.closure)
++        self.assertRaisesRegex(RuntimeError, 'lacks nv_video/nv_venc symbols', self.closure)
+ 
+ 
+ class StageMediaTest(SourceRootFixture):
+-- 
+2.56.0
+

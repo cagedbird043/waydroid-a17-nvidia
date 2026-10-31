@@ -1,0 +1,39 @@
+From 549efaec97cff51d66e33a58e700ffa42d2333d5 Mon Sep 17 00:00:00 2001
+From: Shiro836 <noreply>
+Date: Sun, 25 Oct 2026 15:45:18 +0300
+Subject: [PATCH 49/56] =?utf-8?q?pacman=20=E9=92=A9=E5=AD=90=EF=BC=9A?=
+ =?utf-8?q?=E8=A6=86=E7=9B=96=20580xx=20=E5=92=8C=20beta=20=E9=A9=B1?=
+ =?utf-8?q?=E5=8A=A8=E5=8C=85?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit bdf92183a89f282a8a4e8ecf515bb9c358b5da00)
+---
+ .../waydroid-nvidia-bin/waydroid-nvidia-driver.hook    | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/packaging/aur/waydroid-nvidia-bin/waydroid-nvidia-driver.hook b/packaging/aur/waydroid-nvidia-bin/waydroid-nvidia-driver.hook
+index e8331cb..a8ea3d8 100644
+--- a/packaging/aur/waydroid-nvidia-bin/waydroid-nvidia-driver.hook
++++ b/packaging/aur/waydroid-nvidia-bin/waydroid-nvidia-driver.hook
+@@ -11,6 +11,16 @@ Target = nvidia-open-lts
+ Target = nvidia
+ Target = nvidia-dkms
+ Target = nvidia-lts
++# AUR driver branches (names checked against the AUR RPC on 2026-10-25): the 580 legacy branch for
++# Maxwell/Pascal/Volta, and the beta branch. Explicit names, not a glob: nvidia* would also match
++# nvidia-settings, nvidia-prime and the like, which do not change the kernel module.
++Target = nvidia-580xx-utils
++Target = nvidia-580xx-dkms
++Target = nvidia-utils-beta
++Target = nvidia-beta
++Target = nvidia-beta-dkms
++Target = nvidia-open-beta
++Target = nvidia-open-beta-dkms
+ 
+ [Action]
+ Description = Checking the waydroid-nvidia driver mode...
+-- 
+2.56.0
+

@@ -1,0 +1,565 @@
+From 69283959c05d45601aa675fe6e40174a214ba0d7 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Sat, 31 Oct 2026 15:47:56 +0800
+Subject: [PATCH 55/56] =?utf-8?q?=E5=AA=92=E4=BD=93=EF=BC=9A=E4=BB=A5=20Ru?=
+ =?utf-8?q?st=20=E8=83=BD=E5=8A=9B=E5=BF=AB=E7=85=A7=E6=94=AF=E6=8C=81?=
+ =?utf-8?q?=E9=9B=B6=E8=A7=A3=E7=A0=81=20codec=20=E7=9A=84=20GPU=EF=BC=881?=
+ =?utf-8?q?e4c6b5=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 1e4c6b56b684ba7281ae97803a900cd6174e7ff3)
+---
+ docs/troubleshooting.md                       |  2 +-
+ .../native/src/bin/nvc2-xmlgen.rs             | 35 ++++---
+ .../driver-source/native/src/video/caps.rs    | 57 +++++++----
+ .../native/src/video/ffi_caps.rs              | 13 +--
+ .../driver-source/native/video/README.md      | 12 +++
+ .../driver-source/native/video/nv_c2_caps.h   | 10 +-
+ nvidia-prolapse/media/c2/NvC2Component.cpp    |  8 +-
+ nvidia-prolapse/media/c2/NvC2Component.h      |  6 +-
+ nvidia-prolapse/media/c2/service.cpp          |  7 +-
+ .../media/test/test_nvc2_xmlgen.py            | 95 +++++++++++++++++++
+ packaging/native/release_gate.py              |  4 +-
+ packaging/native/vendor_image.py              |  2 +-
+ waydroid/0001-lxc-nvidia-native-mounts.patch  |  2 +-
+ waydroid/nvidia_native.py                     |  2 +-
+ 14 files changed, 192 insertions(+), 63 deletions(-)
+ create mode 100755 nvidia-prolapse/media/test/test_nvc2_xmlgen.py
+
+diff --git a/docs/troubleshooting.md b/docs/troubleshooting.md
+index 64db168..9b247c0 100644
+--- a/docs/troubleshooting.md
++++ b/docs/troubleshooting.md
+@@ -26,7 +26,7 @@ python3 /usr/lib/waydroid-nvidia/native/dev/driver-mode status
+ | Waydroid is not running after a reboot ("no /dev/nvidia<N> device node found") | 0.2.0-rc1 started the container before the NVIDIA driver finished loading | update, then `sudo waydroid-nvidia-setup` once; until then `sudo systemctl start waydroid-container` |
+ | Waydroid fails at boot with "NVIDIA GPU not up at container start" | the NVIDIA driver did not load within 90 s | check `journalctl -b -k \| grep -iE 'NVRM\|nvidia-drm'`, fix the driver, then `sudo systemctl start waydroid-container` |
+ | Waydroid refuses to start after `waydroid init` or `waydroid init -f` | init installs the official vendor image, not ours | `sudo waydroid-nvidia-setup` |
+-| Setup says "hardware video decode: not available on ..." | the GPU is older than RTX 20 / GTX 16 (Turing); our decoder starts there | nothing: video plays through Android's software decoders. After a GPU change run `sudo waydroid-nvidia-setup` again |
++| Setup says "hardware video decode: not available on ..." | this GPU reports no codecs supported by our decoder | nothing: video plays through Android's software decoders. After a GPU change run `sudo waydroid-nvidia-setup` again |
+ | Setup stops with "lxc-info cannot read the Waydroid container" | LXC rejects the container config (LXC's own message follows) | `sudo waydroid upgrade -o`, then the setup again; report it if LXC still refuses |
+ | Setup stops at `nvidia-drm.modeset` | without modeset the driver cannot share buffers at all | add `nvidia_drm.modeset=1` to the kernel command line or modprobe.d, reboot |
+ | Setup stops at a failing test case | the driver does not work on this GPU or driver version | the message names a log in `/var/lib/waydroid-nvidia/gate-*`; [report it](#reporting-a-problem) and use `sudo waydroid-nvidia-setup --mode venus` meanwhile |
+diff --git a/nvidia-prolapse/driver-source/native/src/bin/nvc2-xmlgen.rs b/nvidia-prolapse/driver-source/native/src/bin/nvc2-xmlgen.rs
+index 22e206a..dacf47e 100644
+--- a/nvidia-prolapse/driver-source/native/src/bin/nvc2-xmlgen.rs
++++ b/nvidia-prolapse/driver-source/native/src/bin/nvc2-xmlgen.rs
+@@ -3,7 +3,6 @@ use std::{
+     ffi::{c_char, c_void, CStr, OsString},
+     io::{self, Write},
+     path::PathBuf,
+-    ptr,
+ };
+ #[repr(C)]
+ struct DeviceInfo {
+@@ -40,8 +39,8 @@ unsafe extern "C" {
+     fn nv_c2_caps_view(caps: *const c_void, out: *mut View) -> i32;
+     fn nv_c2_media_codecs_xml(caps: *const c_void, out: *mut Bytes) -> i32;
+     fn nv_c2_caps_destroy(caps: *mut c_void);
+-    fn nv_c2_no_decoder_xml(gpu: *const c_char, out: *mut *mut c_void) -> i32;
+-    fn nv_c2_no_decoder_reason(gpu: *const c_char, out: *mut *mut c_void) -> i32;
++    fn nv_c2_no_decoder_xml(gpu: *const c_char, nvdec_class: u32, out: *mut *mut c_void) -> i32;
++    fn nv_c2_no_decoder_reason(gpu: *const c_char, nvdec_class: u32, out: *mut *mut c_void) -> i32;
+     fn nv_c2_text_view(text: *const c_void, out: *mut Bytes) -> i32;
+     fn nv_c2_text_destroy(text: *mut c_void);
+ }
+@@ -130,10 +129,20 @@ fn generate(o: &Options) -> Result<i32, String> {
+     }
+     let gpu = unsafe { CStr::from_ptr(info.name.as_ptr().cast()) }.to_string_lossy();
+     let mut xml = Bytes::default();
+-    let status = if info.nvdec_class == 0 {
+-        unsafe { nv_video_device_close(h.dev) };
+-        h.dev = ptr::null_mut();
+-        if unsafe { nv_c2_no_decoder_reason(info.name.as_ptr().cast(), &mut h.reason) } != 0 {
++    let mut view = View::default();
++    if info.nvdec_class != 0 {
++        if unsafe { nv_c2_caps_query(h.dev, &mut h.caps) } != 0 {
++            return Err(error());
++        }
++        if unsafe { nv_c2_caps_view(h.caps, &mut view) } != 0 {
++            return Err(error());
++        }
++        if view.abi_version != 2 {
++            return Err(format!("caps ABI {}, built for 2", view.abi_version));
++        }
++    }
++    let status = if view.decoder_count == 0 {
++        if unsafe { nv_c2_no_decoder_reason(info.name.as_ptr().cast(), info.nvdec_class, &mut h.reason) } != 0 {
+             return Err(error());
+         }
+         let mut reason = Bytes::default();
+@@ -144,7 +153,7 @@ fn generate(o: &Options) -> Result<i32, String> {
+             "nvc2-xmlgen: {}",
+             unsafe { CStr::from_ptr(reason.data) }.to_string_lossy()
+         );
+-        if unsafe { nv_c2_no_decoder_xml(info.name.as_ptr().cast(), &mut h.text) } != 0 {
++        if unsafe { nv_c2_no_decoder_xml(info.name.as_ptr().cast(), info.nvdec_class, &mut h.text) } != 0 {
+             return Err(error());
+         }
+         if unsafe { nv_c2_text_view(h.text, &mut xml) } != 0 {
+@@ -152,16 +161,6 @@ fn generate(o: &Options) -> Result<i32, String> {
+         }
+         3
+     } else {
+-        if unsafe { nv_c2_caps_query(h.dev, &mut h.caps) } != 0 {
+-            return Err(error());
+-        }
+-        let mut view = View::default();
+-        if unsafe { nv_c2_caps_view(h.caps, &mut view) } != 0 {
+-            return Err(error());
+-        }
+-        if view.abi_version != 1 {
+-            return Err(format!("caps ABI {}, built for 1", view.abi_version));
+-        }
+         if unsafe { nv_c2_media_codecs_xml(h.caps, &mut xml) } != 0 {
+             return Err(error());
+         }
+diff --git a/nvidia-prolapse/driver-source/native/src/video/caps.rs b/nvidia-prolapse/driver-source/native/src/video/caps.rs
+index 9d7d542..017e103 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/caps.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/caps.rs
+@@ -122,10 +122,7 @@ impl NvC2Caps {
+                 caps: c,
+             });
+         }
+-        if decoders.is_empty() {
+-            return Err((-2, "GPU supports none of VP9/AV1/HEVC/H.264".into()));
+-        }
+-        let nvenc_class = nvenc()?;
++        let nvenc_class = if decoders.is_empty() { 0 } else { nvenc()? };
+         let mut encoders = Vec::with_capacity(3);
+         x.push_str("    </Decoders>\n    <Encoders>\n");
+         if nvenc_class == 0xc9b7 {
+@@ -153,7 +150,7 @@ impl NvC2Caps {
+     }
+     pub fn view(&self) -> NvC2CapsView {
+         NvC2CapsView {
+-            abi_version: 1,
++            abi_version: 2,
+             nvenc_class: self.nvenc_class,
+             decoders: if self.decoders.is_empty() {
+                 ptr::null()
+@@ -179,11 +176,15 @@ pub fn bytes(s: &CString) -> NvC2Bytes {
+         len: s.as_bytes().len(),
+     }
+ }
+-pub fn no_decoder_reason(gpu: &str) -> String {
+-    format!("hardware video decode: not available on {gpu} (no NVDEC class this decoder supports; supported from Turing): Android software decoders are used")
++pub fn no_decoder_reason(gpu: &str, nvdec_class: u32) -> String {
++    if nvdec_class == 0 {
++        format!("hardware video decode: not available on {gpu} (no NVDEC class this decoder supports; supported from Turing): Android software decoders are used")
++    } else {
++        format!("hardware video decode: not available on {gpu} (NVDEC class 0x{nvdec_class:x}: no supported decode codecs): Android software decoders are used")
++    }
+ }
+-pub fn no_decoder_xml(gpu: &str) -> String {
+-    let mut reason = no_decoder_reason(gpu);
++pub fn no_decoder_xml(gpu: &str, nvdec_class: u32) -> String {
++    let mut reason = no_decoder_reason(gpu, nvdec_class);
+     while reason.contains("--") {
+         reason = reason.replace("--", "-");
+     }
+@@ -263,16 +264,15 @@ mod tests {
+     }
+     #[test]
+     fn errors_are_atomic() {
+-        assert_eq!(
+-            NvC2Caps::query(
+-                |_| Ok(NvVideoCaps::default()),
+-                || panic!("must not open encoder")
+-            )
+-            .err()
+-            .unwrap()
+-            .0,
+-            -2
+-        );
++        let empty = NvC2Caps::query(
++            |_| Ok(NvVideoCaps::default()),
++            || panic!("must not open encoder"),
++        ).unwrap();
++        let view = empty.view();
++        assert_eq!(view.decoder_count, 0);
++        assert_eq!(view.encoder_count, 0);
++        assert_eq!(view.nvenc_class, 0);
++        assert!(view.decoders.is_null() && view.encoders.is_null());
+         assert!(NvC2Caps::query(
+             |codec| {
+                 let mut c = caps(codec)?;
+@@ -303,11 +303,26 @@ mod tests {
+     }
+     #[test]
+     fn no_decoder_contract() {
+-        let reason = no_decoder_reason("stub");
++        let reason = no_decoder_reason("stub", 0);
+         assert_eq!(reason,"hardware video decode: not available on stub (no NVDEC class this decoder supports; supported from Turing): Android software decoders are used");
+-        let xml = no_decoder_xml("a---b");
++        let xml = no_decoder_xml("a---b", 0);
+         assert!(xml.contains("on a-b ("));
+         assert!(!xml.contains("<MediaCodec "));
+         assert!(xml.ends_with("</MediaCodecs>\n"));
++        let known = no_decoder_xml("a---b", 0xc3b0);
++        assert_ne!(known, xml);
++        assert!(known.contains("NVDEC class 0xc3b0: no supported decode codecs"));
++        assert!(!known.contains("<MediaCodec "));
++        for invalid in [0, 1, 2] {
++            assert!(NvC2Caps::query(|codec| {
++                let mut c = caps(codec)?;
++                match invalid {
++                    0 => c.max_width = 0,
++                    1 => c.min_height = c.max_height + 1,
++                    _ => c.bit_depth_mask = 0,
++                }
++                Ok(c)
++            }, || panic!("must not open encoder")).is_err());
++        }
+     }
+ }
+diff --git a/nvidia-prolapse/driver-source/native/src/video/ffi_caps.rs b/nvidia-prolapse/driver-source/native/src/video/ffi_caps.rs
+index b144d62..671dd75 100644
+--- a/nvidia-prolapse/driver-source/native/src/video/ffi_caps.rs
++++ b/nvidia-prolapse/driver-source/native/src/video/ffi_caps.rs
+@@ -128,7 +128,7 @@ pub unsafe extern "C" fn nv_c2_caps_destroy(caps: *mut NvC2Caps) {
+         Ok(())
+     });
+ }
+-unsafe fn text(gpu: *const c_char, out: *mut *mut NvC2Text, render: fn(&str) -> String) -> i32 {
++unsafe fn text(gpu: *const c_char, nvdec_class: u32, out: *mut *mut NvC2Text, render: fn(&str, u32) -> String) -> i32 {
+     guard(|| {
+         if out.is_null() {
+             return Err(invalid("out"));
+@@ -140,21 +140,22 @@ unsafe fn text(gpu: *const c_char, out: *mut *mut NvC2Text, render: fn(&str) ->
+         let gpu = unsafe { CStr::from_ptr(gpu) }
+             .to_str()
+             .map_err(|_| invalid("gpu_name UTF-8"))?;
+-        let text = CString::new(render(gpu)).map_err(|_| invalid("text NUL"))?;
++        let text = CString::new(render(gpu, nvdec_class)).map_err(|_| invalid("text NUL"))?;
+         unsafe { out.write(Box::into_raw(Box::new(NvC2Text(text)))) };
+         Ok(())
+     })
+ }
+ #[no_mangle]
+-pub unsafe extern "C" fn nv_c2_no_decoder_xml(gpu: *const c_char, out: *mut *mut NvC2Text) -> i32 {
+-    unsafe { text(gpu, out, no_decoder_xml) }
++pub unsafe extern "C" fn nv_c2_no_decoder_xml(gpu: *const c_char, nvdec_class: u32, out: *mut *mut NvC2Text) -> i32 {
++    unsafe { text(gpu, nvdec_class, out, no_decoder_xml) }
+ }
+ #[no_mangle]
+ pub unsafe extern "C" fn nv_c2_no_decoder_reason(
+     gpu: *const c_char,
++    nvdec_class: u32,
+     out: *mut *mut NvC2Text,
+ ) -> i32 {
+-    unsafe { text(gpu, out, no_decoder_reason) }
++    unsafe { text(gpu, nvdec_class, out, no_decoder_reason) }
+ }
+ #[no_mangle]
+ pub unsafe extern "C" fn nv_c2_text_view(text: *const NvC2Text, out: *mut NvC2Bytes) -> i32 {
+@@ -212,7 +213,7 @@ mod tests {
+         unsafe {
+             let gpu = CString::new("a---b").unwrap();
+             let mut t = ptr::null_mut();
+-            assert_eq!(nv_c2_no_decoder_xml(gpu.as_ptr(), &mut t), 0);
++            assert_eq!(nv_c2_no_decoder_xml(gpu.as_ptr(), 0, &mut t), 0);
+             drop(gpu);
+             let mut a = NvC2Bytes::default();
+             assert_eq!(nv_c2_text_view(t, &mut a), 0);
+diff --git a/nvidia-prolapse/driver-source/native/video/README.md b/nvidia-prolapse/driver-source/native/video/README.md
+index 1b332fd..8c68f40 100644
+--- a/nvidia-prolapse/driver-source/native/video/README.md
++++ b/nvidia-prolapse/driver-source/native/video/README.md
+@@ -11,6 +11,18 @@ decode → next_picture → copy_out into a LINEAR NV12 dma-buf → release fenc
+ HDR metadata of every picture that carries any; `NV_VIDEO_MEASURE_ACQUIRE=1` (AVC test)
+ re-passes the previous release fence as the acquire fence and times the copy_out call.
+ 
++## Codec2 能力快照 ABI
++
++`nv_c2_caps.h` 的 caps ABI 为 2，`nv_c2_no_decoder_xml` / `nv_c2_no_decoder_reason`
++接收 GPU 名称和 NVDEC class。class 为 0 时保留原有 XML 字节；非零 class 没有支持的
++codec 时，原因明确列出 class。成功查询但 decoder_count 为 0 是合法空快照，不打开 NVENC。
++查询错误、不可用尺寸或位深仍是错误，不能当作无硬解。xmlgen 对空能力生成/检查匹配的
++XML 均退出 3，XML 不匹配或能力错误退出 1；Codec2 服务使用相同文本接口。
++修改这个 ABI 后必须同时重编 RM、xmlgen 和 Codec2 服务。
++
++宿主 CLI 回归（先构建匹配 ABI 的 host cdylib 和 xmlgen）：
++`python3 nvidia-prolapse/media/test/test_nvc2_xmlgen.py`，可用 `NVC2_XMLGEN` 指定可执行文件。
++
+ ## Codec2 解码驱动 ABI
+ 
+ `nv_c2_dec.h` 的 `nv_c2_dec_*` 由 `src/video/{c2_dec,ffi_dec,c2_layout}.rs` 实现。
+diff --git a/nvidia-prolapse/driver-source/native/video/nv_c2_caps.h b/nvidia-prolapse/driver-source/native/video/nv_c2_caps.h
+index aea811d..4d2c5dc 100644
+--- a/nvidia-prolapse/driver-source/native/video/nv_c2_caps.h
++++ b/nvidia-prolapse/driver-source/native/video/nv_c2_caps.h
+@@ -7,7 +7,7 @@
+ extern "C" {
+ #endif
+ 
+-#define NV_C2_CAPS_ABI_VERSION 1u
++#define NV_C2_CAPS_ABI_VERSION 2u
+ #define NV_C2_XMLGEN_EXIT_NO_NVDEC 3
+ /* Return codes, never errno. NV_VIDEO_* values retain their existing meaning. */
+ #define NV_C2_OK                 0
+@@ -53,8 +53,8 @@ struct NvC2Bytes {
+ /* dev: valid device from nv_video_device_open with ABI 2 and nonzero NVDEC class.
+  * Must remain open until snapshot destruction. out nonnull; *out NULL on failure.
+  * Query all decoder caps and NVENC class once; validate and format XML once.
+- * No partial snapshot on any failure. Zero advertised decoders -> UNSUPPORTED.
+- * NVENC open failure -> mapped NV_VIDEO error, not an empty encoder table.
++ * No partial snapshot on any failure. Zero advertised decoders -> empty snapshot,
++ * without opening NVENC. Otherwise NVENC open failure -> mapped NV_VIDEO error.
+  * Unsupported NVENC class -> success with encoder_count=0.
+  */
+ int32_t nv_c2_caps_query(struct NvVideoDevice *dev, struct NvC2Caps **out);
+@@ -67,8 +67,8 @@ void nv_c2_caps_destroy(struct NvC2Caps *caps); /* NULL allowed */
+  * Return an owned text handle; *out=NULL on failure. Reason excludes added period;
+  * XML has existing exact bytes, including comment sanitization and final newline.
+  */
+-int32_t nv_c2_no_decoder_xml(const char *gpu_name, struct NvC2Text **out);
+-int32_t nv_c2_no_decoder_reason(const char *gpu_name, struct NvC2Text **out);
++int32_t nv_c2_no_decoder_xml(const char *gpu_name, uint32_t nvdec_class, struct NvC2Text **out);
++int32_t nv_c2_no_decoder_reason(const char *gpu_name, uint32_t nvdec_class, struct NvC2Text **out);
+ int32_t nv_c2_text_view(const struct NvC2Text *text, struct NvC2Bytes *out);
+ void nv_c2_text_destroy(struct NvC2Text *text); /* NULL allowed */
+ 
+diff --git a/nvidia-prolapse/media/c2/NvC2Component.cpp b/nvidia-prolapse/media/c2/NvC2Component.cpp
+index d4a9ac4..5747f64 100644
+--- a/nvidia-prolapse/media/c2/NvC2Component.cpp
++++ b/nvidia-prolapse/media/c2/NvC2Component.cpp
+@@ -888,7 +888,7 @@ void Component::loop()
+ 
+ /* ------------------------------------------------------------------ store */
+ 
+-std::shared_ptr<Store> Store::Create(std::string *error, std::string *no_nvdec_gpu)
++std::shared_ptr<Store> Store::Create(std::string *error, std::string *no_nvdec_gpu, uint32_t *no_nvdec_class)
+ {
+     std::shared_ptr<Store> s(new Store());
+     NvVideoDeviceInfo info{};
+@@ -904,6 +904,7 @@ std::shared_ptr<Store> Store::Create(std::string *error, std::string *no_nvdec_g
+     }
+     if (info.nvdec_class == 0) {
+         *no_nvdec_gpu = info.name;
++        *no_nvdec_class = info.nvdec_class;
+         return nullptr;
+     }
+     rc = nv_c2_caps_query(s->mDevice, &s->mCaps);
+@@ -921,6 +922,11 @@ std::shared_ptr<Store> Store::Create(std::string *error, std::string *no_nvdec_g
+         *error = "incompatible caps snapshot ABI " + std::to_string(view.abi_version);
+         return nullptr;
+     }
++    if (view.decoder_count == 0) {
++        *no_nvdec_gpu = info.name;
++        *no_nvdec_class = info.nvdec_class;
++        return nullptr;
++    }
+     s->mEntries.reserve(view.decoder_count);
+     for (uint32_t i = 0; i < view.decoder_count; ++i) {
+         const auto &e = view.decoders[i];
+diff --git a/nvidia-prolapse/media/c2/NvC2Component.h b/nvidia-prolapse/media/c2/NvC2Component.h
+index c886bda..686a718 100644
+--- a/nvidia-prolapse/media/c2/NvC2Component.h
++++ b/nvidia-prolapse/media/c2/NvC2Component.h
+@@ -35,9 +35,9 @@ bool decode_routed_here();
+ class Store : public C2ComponentStore {
+ public:
+     /* Opens the device and queries caps (decoders, then encoders). A failure is fatal for the
+-     * service (no store, no silent empty list): *error names it. A GPU without an NVDEC class
+-     * this decoder drives is no failure: no store, *error empty, *no_nvdec_gpu = its name. */
+-    static std::shared_ptr<Store> Create(std::string *error, std::string *no_nvdec_gpu);
++     * service (no store, no silent empty list): *error names it. No advertised decoder
++     * is no failure: no store, *error empty, *no_nvdec_gpu/name and *no_nvdec_class identify it. */
++    static std::shared_ptr<Store> Create(std::string *error, std::string *no_nvdec_gpu, uint32_t *no_nvdec_class);
+     ~Store() override;
+ 
+     C2String getName() const override { return "nvprolapse"; }
+diff --git a/nvidia-prolapse/media/c2/service.cpp b/nvidia-prolapse/media/c2/service.cpp
+index 6d87d85..d09250b 100644
+--- a/nvidia-prolapse/media/c2/service.cpp
++++ b/nvidia-prolapse/media/c2/service.cpp
+@@ -50,17 +50,18 @@ int main()
+         fclose(f);
+     }
+     std::string err, no_nvdec_gpu;
+-    std::shared_ptr<nvc2::Store> impl = nvc2::Store::Create(&err, &no_nvdec_gpu);
++    uint32_t no_nvdec_class = 0;
++    std::shared_ptr<nvc2::Store> impl = nvc2::Store::Create(&err, &no_nvdec_gpu, &no_nvdec_class);
+     if (!impl && !no_nvdec_gpu.empty()) {
+         NvC2Text *xml_raw = nullptr, *reason_raw = nullptr;
+-        const int32_t xml_rc = nv_c2_no_decoder_xml(no_nvdec_gpu.c_str(), &xml_raw);
++        const int32_t xml_rc = nv_c2_no_decoder_xml(no_nvdec_gpu.c_str(), no_nvdec_class, &xml_raw);
+         if (xml_rc != 0) {
+             const std::string error = nv_video_last_error();
+             ALOGE("no-NVDEC XML: %s", error.c_str());
+             return 1;
+         }
+         std::unique_ptr<NvC2Text, decltype(&nv_c2_text_destroy)> xml(xml_raw, nv_c2_text_destroy);
+-        if (nv_c2_no_decoder_reason(no_nvdec_gpu.c_str(), &reason_raw) != 0) {
++        if (nv_c2_no_decoder_reason(no_nvdec_gpu.c_str(), no_nvdec_class, &reason_raw) != 0) {
+             const std::string error = nv_video_last_error();
+             ALOGE("no-NVDEC reason: %s", error.c_str());
+             return 1;
+diff --git a/nvidia-prolapse/media/test/test_nvc2_xmlgen.py b/nvidia-prolapse/media/test/test_nvc2_xmlgen.py
+new file mode 100755
+index 0000000..a843dd0
+--- /dev/null
++++ b/nvidia-prolapse/media/test/test_nvc2_xmlgen.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Exercise the real xmlgen CLI and Rust text ABI without opening a GPU.
++
++Build native's host cdylib and xmlgen first, then run this unittest. NVC2_XMLGEN
++can select another host executable linked to the matching caps ABI.
++"""
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import unittest
++
++NATIVE = Path(__file__).resolve().parents[2] / 'driver-source/native'
++CLI = Path(os.environ.get('NVC2_XMLGEN', NATIVE / 'target/debug/nvc2-xmlgen'))
++# Only device discovery/caps acquisition are substituted. XML/reason formatting,
++# owned text handles, CLI output/checking, and exit statuses use production code.
++STUB = r'''
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include "nv_c2_caps.h"
++static int mode(void) { return atoi(getenv("NVC2_TEST_MODE")); }
++int32_t nv_video_device_open(struct NvVideoDevice **out, struct NvVideoDeviceInfo *info) {
++    memset(info, 0, sizeof(*info));
++    info->abi_version = 2;
++    strcpy(info->name, "xmlgen-test");
++    info->nvdec_class = mode() == 0 ? 0 : 0xc3b0;
++    *out = (struct NvVideoDevice *)(uintptr_t)1;
++    return 0;
++}
++void nv_video_device_close(struct NvVideoDevice *dev) { (void)dev; }
++int32_t nv_c2_caps_query(struct NvVideoDevice *dev, struct NvC2Caps **out) {
++    (void)dev;
++    if (mode() == 0) abort(); /* class zero must never query */
++    *out = 0;
++    if (mode() == 2) return NV_C2_E_INTERNAL;
++    *out = (struct NvC2Caps *)(uintptr_t)1;
++    return 0;
++}
++int32_t nv_c2_caps_view(const struct NvC2Caps *caps, struct NvC2CapsView *out) {
++    (void)caps;
++    memset(out, 0, sizeof(*out));
++    out->abi_version = mode() == 3 ? 1 : NV_C2_CAPS_ABI_VERSION;
++    return 0;
++}
++void nv_c2_caps_destroy(struct NvC2Caps *caps) { (void)caps; }
++const char *nv_video_last_error(void) { return "injected unusable/query caps"; }
++'''
++
++
++class XmlgenNoDecoderTest(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        if not CLI.is_file():
++            raise RuntimeError('build the host nvc2-xmlgen first: ' + str(CLI))
++        cls.tmp = tempfile.TemporaryDirectory(prefix='nvc2-xmlgen-test-')
++        cls.root = Path(cls.tmp.name)
++        source = cls.root / 'device.c'
++        source.write_text(STUB)
++        cls.shim = cls.root / 'device.so'
++        subprocess.run(['cc', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
++                        '-I', str(NATIVE / 'video'), str(source), '-o', str(cls.shim)], check=True)
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.tmp.cleanup()
++
++    def run_cli(self, mode, *args):
++        env = dict(os.environ, NVC2_TEST_MODE=str(mode), LD_PRELOAD=str(self.shim))
++        return subprocess.run([str(CLI), *map(str, args)], env=env, capture_output=True)
++
++    def test_empty_classes_generate_and_check(self):
++        listings = []
++        for mode in (0, 1):
++            xml = self.root / ('codecs-{}.xml'.format(mode))
++            generated = self.run_cli(mode, '-o', xml)
++            self.assertEqual(generated.returncode, 3, generated.stderr)
++            self.assertNotIn(b'<MediaCodec ', xml.read_bytes())
++            self.assertEqual(self.run_cli(mode, '--check', xml).returncode, 3)
++            self.assertEqual(self.run_cli(1 - mode, '--check', xml).returncode, 1)
++            listings.append(xml.read_bytes())
++        self.assertIn(b'no NVDEC class this decoder supports; supported from Turing', listings[0])
++        self.assertIn(b'NVDEC class 0xc3b0: no supported decode codecs', listings[1])
++        self.assertNotEqual(*listings)
++
++    def test_errors_are_not_no_decoder(self):
++        for mode in (2, 3):
++            result = self.run_cli(mode)
++            self.assertEqual(result.returncode, 1, result.stderr)
++            self.assertEqual(result.stdout, b'')
++            self.assertNotIn(b'Android software decoders', result.stderr)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/packaging/native/release_gate.py b/packaging/native/release_gate.py
+index 94be739..9e2ca81 100644
+--- a/packaging/native/release_gate.py
++++ b/packaging/native/release_gate.py
+@@ -43,7 +43,7 @@ ABIS = {'android': ('lib64', 64, 'x86_64'), 'android32': ('lib', 32, 'x86')}
+ RUNTIME_ROOTS = ('libcutils.so', 'libhardware.so', 'liblog.so', 'libsync.so', 'libnativewindow.so')
+ BIONIC = ('libc.so', 'libm.so', 'libdl.so', 'libdl_android.so')
+ CASE_TIMEOUT = 600
+-# nvc2-xmlgen's exit status for a GPU without an NVDEC class the Codec2 decoder drives (before Turing): a
++# nvc2-xmlgen's exit status when this GPU reports no codecs supported by the Codec2 decoder: a
+ # capability gap, not a failure (driver-source/native/video/nv_c2_caps.h)
+ XMLGEN_NO_NVDEC = 3
+ REMEDY_BUNDLE = 'reinstall the package (Arch: pacman -S waydroid-nvidia-bin; other distros: packaging/install.sh)'
+@@ -529,7 +529,7 @@ def media_case_image(gate, native, vendor_img):
+     --check against the live caps), the service's ELF closure against vendor_img + the system image's VNDK apex
+     and LL-NDK, the nv_video symbols it imports, device access for uid mediacodec. Returns the media record;
+     its 'xml' is the generated file (the setup installs it and the LXC generator binds it over the image's
+-    placeholder /odm/etc/media_codecs_c2.xml). A GPU without an NVDEC class the decoder drives (nvc2-xmlgen exit
++    placeholder /odm/etc/media_codecs_c2.xml). A GPU with no supported decode codecs (nvc2-xmlgen exit
+     XMLGEN_NO_NVDEC) passes with 'hardware_decode' False: its listing has no codecs, 'reason' says why, and every
+     other check still runs (the service still starts once on such a GPU)."""
+     check_xmlgen_elf(gate.progs / 'bin/android/nvc2-xmlgen')
+diff --git a/packaging/native/vendor_image.py b/packaging/native/vendor_image.py
+index b55866c..652e8fa 100644
+--- a/packaging/native/vendor_image.py
++++ b/packaging/native/vendor_image.py
+@@ -23,7 +23,7 @@ module) as a Waydroid OTA zip plus its OTA channel JSON (packaging/vendor-ota.py
+      vendor-image, runs `waydroid upgrade -o`, `dev/driver-mode verify-active`, and the container unit's
+      ExecStartPre drop-in. Any failure puts the previous image, waydroid.cfg, record and drop-in back.
+ 
+-A GPU without an NVDEC class the Codec2 decoder drives (before Turing) installs without hardware decode: the gate's
++A GPU reporting no codecs supported by the Codec2 decoder installs without hardware decode: the gate's
+ nvc2-xmlgen exits 3, the codec list has no codecs, and the image's service .rc (made oneshot) and a VINTF fragment
+ without the Codec2 HAL are written next to it for the generator to bind (nvidia_native.VENDOR_IMAGE_NO_NVDEC), so
+ Android uses its software decoders. The setup says so in one line.
+diff --git a/waydroid/0001-lxc-nvidia-native-mounts.patch b/waydroid/0001-lxc-nvidia-native-mounts.patch
+index bd7bf1a..8ea5088 100644
+--- a/waydroid/0001-lxc-nvidia-native-mounts.patch
++++ b/waydroid/0001-lxc-nvidia-native-mounts.patch
+@@ -1752,7 +1752,7 @@ new file mode 100755
+ +VENDOR_IMAGE_RECORD_FORMAT = 2
+ +VENDOR_IMAGE_XML = "media_codecs_c2.xml"
+ +XMLGEN_MARK = "Generated by nvc2-xmlgen"
+-+# A GPU without an NVDEC class the Codec2 service drives (before Turing: the gate's nvc2-xmlgen exits 3) runs the
+++# A GPU reporting no codecs supported by the Codec2 decoder (the gate's nvc2-xmlgen exits 3) runs the
+ +# image without hardware decode (install record media.hardware_decode = false). The setup then writes these files
+ +# into VENDOR_IMAGE_STATE and the generator binds them over the image's: the service's .rc with `oneshot` (it
+ +# starts once, checks the codec listing, logs the reason and exits) and a VINTF fragment that declares no Codec2
+diff --git a/waydroid/nvidia_native.py b/waydroid/nvidia_native.py
+index 693ca13..4313f2a 100755
+--- a/waydroid/nvidia_native.py
++++ b/waydroid/nvidia_native.py
+@@ -1534,7 +1534,7 @@ VENDOR_IMAGE_RECORD = "install.json"
+ VENDOR_IMAGE_RECORD_FORMAT = 2
+ VENDOR_IMAGE_XML = "media_codecs_c2.xml"
+ XMLGEN_MARK = "Generated by nvc2-xmlgen"
+-# A GPU without an NVDEC class the Codec2 service drives (before Turing: the gate's nvc2-xmlgen exits 3) runs the
++# A GPU reporting no codecs supported by the Codec2 decoder (the gate's nvc2-xmlgen exits 3) runs the
+ # image without hardware decode (install record media.hardware_decode = false). The setup then writes these files
+ # into VENDOR_IMAGE_STATE and the generator binds them over the image's: the service's .rc with `oneshot` (it
+ # starts once, checks the codec listing, logs the reason and exits) and a VINTF fragment that declares no Codec2
+-- 
+2.56.0
+

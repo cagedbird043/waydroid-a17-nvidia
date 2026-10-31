@@ -1,0 +1,309 @@
+From 168503b47fe084ffdc0bc5886f5d4ff26164dd71 Mon Sep 17 00:00:00 2001
+From: Shiro836 <noreply>
+Date: Sun, 25 Oct 2026 15:44:26 +0300
+Subject: [PATCH 53/56] =?utf-8?q?=E5=AE=89=E8=A3=85=E5=B7=A5=E5=85=B7?=
+ =?utf-8?q?=EF=BC=9A=E5=85=BC=E5=AE=B9=20Python=203.8=20=E5=B9=B6=E5=88=86?=
+ =?utf-8?q?=E5=9D=97=E8=AE=A1=E7=AE=97=20SHA256?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit fe0d102e77be91c89430dc5f43bb52d1cf7ec42e)
+---
+ dev/source-native                            |  7 +++-
+ dev/test_source_native.py                    | 42 ++++++++++++++++++++
+ packaging/install.sh                         |  8 ++--
+ packaging/native/install-native.sh           |  6 ++-
+ packaging/native/release_gate.py             |  5 ++-
+ packaging/native/vendor_image.py             |  5 ++-
+ packaging/vendor-ota.py                      |  5 ++-
+ tools/native_rust_profile.py                 |  6 ++-
+ waydroid/0001-lxc-nvidia-native-mounts.patch | 16 ++++++--
+ waydroid/nvidia_native.py                    | 14 +++++--
+ 10 files changed, 95 insertions(+), 19 deletions(-)
+
+diff --git a/dev/source-native b/dev/source-native
+index 0030d8d..0c57a0e 100755
+--- a/dev/source-native
++++ b/dev/source-native
+@@ -128,8 +128,11 @@ def now():
+ 
+ 
+ def sha256(path):
++    digest = hashlib.sha256()
+     with open(path, 'rb') as f:
+-        return hashlib.file_digest(f, 'sha256').hexdigest()
++        for block in iter(lambda: f.read(1 << 20), b''):
++            digest.update(block)
++    return digest.hexdigest()
+ 
+ 
+ def write_atomic(path, text):
+@@ -1433,7 +1436,7 @@ def status(root):
+         if tomb.returncode != 0:
+             item('UNKNOWN', 'tombstones', f'lxc-attach failed: {tomb.stderr.strip()}')
+         else:
+-            new = sorted({Path(n).name.removesuffix('.pb') for t, n in
++            new = sorted({Path(n).stem if n.endswith('.pb') else Path(n).name for t, n in
+                           (l.split(None, 1) for l in tomb.stdout.splitlines() if l.strip())
+                           if int(t) >= started})
+             item('FAIL' if new else 'PASS', 'tombstones',
+diff --git a/dev/test_source_native.py b/dev/test_source_native.py
+index 5a1b2d6..d95c6ea 100644
+--- a/dev/test_source_native.py
++++ b/dev/test_source_native.py
+@@ -1004,6 +1004,48 @@ class MediaStatusTest(SourceRootFixture):
+         self.assertEqual(self.status(self.RUNNING, media=off)['c2 service'], 'FAIL')
+ 
+ 
++class TombstoneStatusTest(SourceRootFixture):
++    def test_text_and_pb_tombstones_keep_reporting(self):
++        self.build(media={'enabled': False, 'reason': 'test'})
++        root = self.root.parent
++        output = io.StringIO()
++
++        def run(command, **kwargs):
++            text = ''
++            if command[:2] == ['systemctl', 'is-active']:
++                text = 'active'
++            elif 'lxc-info' in command:
++                text = 'RUNNING' if command[-1] == '-sH' else '1234'
++            elif 'lxc-attach' in command:
++                if 'tombstone_' in command[-1]:
++                    text = ('99 /data/tombstones/tombstone_old\n'
++                            '101 /data/tombstones/tombstone_01\n'
++                            '101 /data/tombstones/tombstone_01.pb\n'
++                            '102 /data/tombstones/tombstone_02.pb\n')
++                else:
++                    return mock.Mock(returncode=3, stdout='', stderr='no surfaceflinger')
++            elif command[:2] == ['journalctl', '-k'] and '--since' not in command:
++                text = 'kernel log available'
++            return mock.Mock(returncode=0, stdout=text, stderr='')
++
++        with mock.patch.object(sn, 'CFG', root / 'cfg'), \
++             mock.patch.object(sn, 'OVERRIDE', root / 'override'), \
++             mock.patch.object(sn, 'HOOK', root / 'hook'), \
++             mock.patch.object(nn, 'lxc_nodes', return_value=[]), \
++             mock.patch.object(sn, 'check'), \
++             mock.patch.object(sn, 'installed_module_version', return_value=V), \
++             mock.patch.object(sn, 'process_start', return_value=100), \
++             mock.patch.object(sn, 'media_status') as media, \
++             mock.patch.object(sn.subprocess, 'run', side_effect=run), \
++             contextlib.redirect_stdout(output):
++            sn.status(self.root)
++        media.assert_called_once()
++        report = output.getvalue()
++        self.assertIn('tombstones: 2 since container start: tombstone_01, tombstone_02', report)
++        self.assertNotIn('tombstone_old', report)
++        self.assertIn('kernel Xid: 0 since container start', report)
++
++
+ class ShaderCacheMigrationTest(unittest.TestCase):
+     """invalidate_caches(): a fresh `waydroid init` leaves config_session empty (no session ever ran)."""
+ 
+diff --git a/packaging/install.sh b/packaging/install.sh
+index 81ae015..1a1173e 100755
+--- a/packaging/install.sh
++++ b/packaging/install.sh
+@@ -189,9 +189,9 @@ need=(curl tar zstd gzip sha256sum python3 git)          # verification (--check
+ for tool in "${need[@]}"; do
+     command -v "$tool" >/dev/null 2>&1 || die "$tool is required (install it${DEPS:+, or drop --no-deps}; --check installs no packages)"
+ done
+-# the tools and Waydroid's generator use Python 3.11 (hashlib.file_digest)
+-[ "$CHECK" = 1 ] || python3 -c 'import sys; sys.exit(sys.version_info < (3, 11))' ||
+-    die "Python 3.11 or newer is required, $(command -v python3) is $(python3 -V 2>&1) (Ubuntu 22.04 ships 3.10: use Ubuntu 24.04 or newer)"
++# the tools and Waydroid's generator need Python 3.8 or newer (assignment expressions); Waydroid itself needs 3.7
++[ "$CHECK" = 1 ] || python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' ||
++    die "Python 3.8 or newer is required, $(command -v python3) is $(python3 -V 2>&1)"
+ 
+ # ---------------------------------------------------------------- assets
+ WORK=$(mktemp -d)
+@@ -344,7 +344,7 @@ for cand in /usr/bin/python3 /usr/local/bin/python3; do
+     [ -x "$cand" ] && "$cand" -c 'import dbus, gi, gbinder' >/dev/null 2>&1 && { PYBIN=$cand; break; }
+ done
+ [ -n "$PYBIN" ] || die "no system python3 with the dbus, gobject and gbinder bindings (install python3-dbus, python3-gi/python3-gobject, python3-gbinder)"
+-"$PYBIN" -c 'import sys; sys.exit(sys.version_info < (3, 11))' || die "$PYBIN is $("$PYBIN" -V 2>&1); Python 3.11 or newer is required"
++"$PYBIN" -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "$PYBIN is $("$PYBIN" -V 2>&1); Python 3.8 or newer is required"
+ sed -i "1s|^#!.*python3.*$|#!$PYBIN|" "$ROOT/usr/lib/waydroid/waydroid.py"
+ 
+ info "host Venus renderer, guest stack, nvidia-prolapse vendor image, bundle and tools"
+diff --git a/packaging/native/install-native.sh b/packaging/native/install-native.sh
+index 22c092f..4b24b71 100755
+--- a/packaging/native/install-native.sh
++++ b/packaging/native/install-native.sh
+@@ -76,7 +76,11 @@ python3 -I - "$VZIP" "$VCHANNEL" <<'EOF'
+ import hashlib, json, os, sys
+ z, c = sys.argv[1:3]
+ (entry,) = json.load(open(c))['response']
+-if os.path.basename(z) != entry['filename'] or hashlib.file_digest(open(z, 'rb'), 'sha256').hexdigest() != entry['id']:
++digest = hashlib.sha256()
++with open(z, 'rb') as f:
++    for block in iter(lambda: f.read(1 << 20), b''):
++        digest.update(block)
++if os.path.basename(z) != entry['filename'] or digest.hexdigest() != entry['id']:
+     sys.exit(f'install-native: {z} is not the image {c} names ({entry["filename"]}, sha256 {entry["id"]})')
+ print(f'install-native: vendor image {entry["filename"]} matches its channel (datetime {entry["datetime"]})')
+ EOF
+diff --git a/packaging/native/release_gate.py b/packaging/native/release_gate.py
+index d182e3a..94be739 100644
+--- a/packaging/native/release_gate.py
++++ b/packaging/native/release_gate.py
+@@ -50,8 +50,11 @@ REMEDY_BUNDLE = 'reinstall the package (Arch: pacman -S waydroid-nvidia-bin; oth
+ 
+ 
+ def sha256(path):
++    digest = hashlib.sha256()
+     with open(path, 'rb') as f:
+-        return hashlib.file_digest(f, 'sha256').hexdigest()
++        for block in iter(lambda: f.read(1 << 20), b''):
++            digest.update(block)
++    return digest.hexdigest()
+ 
+ 
+ def now():
+diff --git a/packaging/native/vendor_image.py b/packaging/native/vendor_image.py
+index 188079d..b55866c 100644
+--- a/packaging/native/vendor_image.py
++++ b/packaging/native/vendor_image.py
+@@ -92,8 +92,11 @@ def release_gate():
+ 
+ 
+ def sha256(path):
++    digest = hashlib.sha256()
+     with open(path, 'rb') as f:
+-        return hashlib.file_digest(f, 'sha256').hexdigest()
++        for block in iter(lambda: f.read(1 << 20), b''):
++            digest.update(block)
++    return digest.hexdigest()
+ 
+ 
+ def now():
+diff --git a/packaging/vendor-ota.py b/packaging/vendor-ota.py
+index 9b29164..95782a6 100644
+--- a/packaging/vendor-ota.py
++++ b/packaging/vendor-ota.py
+@@ -30,8 +30,11 @@ def build_props(image):
+ 
+ 
+ def sha256(path):
++    digest = hashlib.sha256()
+     with open(path, 'rb') as f:
+-        return hashlib.file_digest(f, 'sha256').hexdigest()
++        for block in iter(lambda: f.read(1 << 20), b''):
++            digest.update(block)
++    return digest.hexdigest()
+ 
+ 
+ def main():
+diff --git a/tools/native_rust_profile.py b/tools/native_rust_profile.py
+index fe8e78d..44179cd 100644
+--- a/tools/native_rust_profile.py
++++ b/tools/native_rust_profile.py
+@@ -25,9 +25,11 @@ def metadata_path(root, target):
+ 
+ def identity(path):
+     path = Path(path).resolve()
++    digest = hashlib.sha256()
+     with path.open('rb') as source:
+-        digest = hashlib.file_digest(source, 'sha256').hexdigest()
+-    return {'path': str(path), 'sha256': digest}
++        for block in iter(lambda: source.read(1 << 20), b''):
++            digest.update(block)
++    return {'path': str(path), 'sha256': digest.hexdigest()}
+ 
+ 
+ def source_snapshot(root):
+diff --git a/waydroid/0001-lxc-nvidia-native-mounts.patch b/waydroid/0001-lxc-nvidia-native-mounts.patch
+index 2721297..bd7bf1a 100644
+--- a/waydroid/0001-lxc-nvidia-native-mounts.patch
++++ b/waydroid/0001-lxc-nvidia-native-mounts.patch
+@@ -215,7 +215,7 @@ diff --git a/tools/helpers/nvidia_native.py b/tools/helpers/nvidia_native.py
+ new file mode 100755
+ --- /dev/null
+ +++ b/tools/helpers/nvidia_native.py
+-@@ -0,0 +1,1858 @@
++@@ -0,0 +1,1866 @@
+ +#!/usr/bin/env python3
+ +# waydroid-nvidia-prolapse: LXC mount entries and property rules for NVIDIA-native mode.
+ +# SPDX-License-Identifier: GPL-3.0-or-later
+@@ -1161,9 +1161,17 @@ new file mode 100755
+ +    return isinstance(record, dict) and record.get("enabled") is True
+ +
+ +
+++def _sha256_of(f):
+++    """sha256 of an open binary file, read in 1 MiB blocks."""
+++    digest = hashlib.sha256()
+++    for block in iter(lambda: f.read(1 << 20), b""):
+++        digest.update(block)
+++    return digest.hexdigest()
+++
+++
+ +def _sha256(path):
+ +    with open(path, "rb") as f:
+-+        return hashlib.file_digest(f, "sha256").hexdigest()
+++        return _sha256_of(f)
+ +
+ +
+ +def check_native_gl(root, manifest):
+@@ -1503,7 +1511,7 @@ new file mode 100755
+ +        path = os.path.join(root, relative)
+ +        try:
+ +            with open(path, "rb") as f:
+-+                actual = hashlib.file_digest(f, "sha256").hexdigest()
+++                actual = _sha256_of(f)
+ +        except PermissionError as e:
+ +            # root-only staged file (odm/etc/build.prop is 0600 like vendor.img): not missing, verify as root
+ +            raise PermissionError(e.errno, "Source RM artifact not readable as uid {} (verify as root: sudo -n "
+@@ -1801,7 +1809,7 @@ new file mode 100755
+ +
+ +def _sha256_file(path):
+ +    with open(path, "rb") as f:
+-+        return hashlib.file_digest(f, "sha256").hexdigest()
+++        return _sha256_of(f)
+ +
+ +
+ +def load_vendor_image_record(state=None):
+diff --git a/waydroid/nvidia_native.py b/waydroid/nvidia_native.py
+index 4ea7e05..693ca13 100755
+--- a/waydroid/nvidia_native.py
++++ b/waydroid/nvidia_native.py
+@@ -943,9 +943,17 @@ def native_gl_enabled(manifest):
+     return isinstance(record, dict) and record.get("enabled") is True
+ 
+ 
++def _sha256_of(f):
++    """sha256 of an open binary file, read in 1 MiB blocks."""
++    digest = hashlib.sha256()
++    for block in iter(lambda: f.read(1 << 20), b""):
++        digest.update(block)
++    return digest.hexdigest()
++
++
+ def _sha256(path):
+     with open(path, "rb") as f:
+-        return hashlib.file_digest(f, "sha256").hexdigest()
++        return _sha256_of(f)
+ 
+ 
+ def check_native_gl(root, manifest):
+@@ -1285,7 +1293,7 @@ def _check_source_rm_artifacts(root, manifest):
+         path = os.path.join(root, relative)
+         try:
+             with open(path, "rb") as f:
+-                actual = hashlib.file_digest(f, "sha256").hexdigest()
++                actual = _sha256_of(f)
+         except PermissionError as e:
+             # root-only staged file (odm/etc/build.prop is 0600 like vendor.img): not missing, verify as root
+             raise PermissionError(e.errno, "Source RM artifact not readable as uid {} (verify as root: sudo -n "
+@@ -1583,7 +1591,7 @@ def describe_image(props):
+ 
+ def _sha256_file(path):
+     with open(path, "rb") as f:
+-        return hashlib.file_digest(f, "sha256").hexdigest()
++        return _sha256_of(f)
+ 
+ 
+ def load_vendor_image_record(state=None):
+-- 
+2.56.0
+
