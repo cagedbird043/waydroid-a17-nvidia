@@ -27,6 +27,7 @@ waydroid-a17-nvidia：Waydroid Android 17 + NVIDIA 加速 + KernelSU 的发布�
 | 编译、重编 native 栈、bundle、导出补丁 | `waydroid-a17-build` |
 | 在 Waydroid 里验证、回归、截图 | `waydroid-a17-test` |
 | 发版、Release、AUR | `waydroid-a17-release` |
+| 检查上游更新、判断哪些修复值得移植 | `waydroid-a17-upstream` |
 
 skill 在 `.agents/skills/`，`.claude/skills` 和 `.codex/skills` 是指向它的符号链接。
 

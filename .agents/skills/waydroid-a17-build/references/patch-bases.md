@@ -9,7 +9,7 @@
 | `hardware_interfaces` | `hardware/interfaces` | https://github.com/WayDroid-ATV/android_hardware_interfaces | lineage-24.0 | `1b0bcde9a85b` | 1 |
 | `external_wayland-protocols` | `external/wayland-protocols` | https://android.googlesource.com/platform/external/wayland-protocols | AOSP | `2dabfe6879b2` | 3 |
 | `device_waydroid_waydroid` | `device/waydroid/waydroid` | https://github.com/WayDroid-ATV/android_device_waydroid_waydroid | lineage-24.0 | `ce2f57ee2768` | 4 |
-| `vendor_waydroid_init` | `vendor/waydroid/init` | https://github.com/WayDroid-ATV/android_vendor_waydroid_init | lineage-24.0 | `e97b43d97f70` | 2 |
+| `vendor_waydroid_init` | `vendor/waydroid/init` | https://github.com/WayDroid-ATV/android_vendor_waydroid_init | main | `e97b43d97f70` | 2 |
 | `waydroid-nvidia` | `../nvidia/waydroid-nvidia` | https://github.com/Shiro836/waydroid-nvidia | public-test | `29ffa3a237b0` | 46 |
 
 `waydroid-nvidia` 的补丁 AUR 包在 prepare() 里用 `git apply` 打（补丁含二进制测试码流），并要求
