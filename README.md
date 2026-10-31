@@ -13,7 +13,7 @@
 ![KernelSU](https://img.shields.io/badge/root-KernelSU-orange)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-[English](#english) · [中文](#中文)
+[English](#english) · [中文](#中文) · Blog: [English](https://cagedbird.cn/2026/10/31/技术实践/系统工程/系统编程/Android/Waydroid-A17-NVIDIA-hardware-accelerated-Android-17-on-NVIDIA-Linux/) / [中文](https://cagedbird.cn/2026/10/31/技术实践/系统工程/系统编程/Android/Waydroid-A17-NVIDIA：N卡Linux桌面上的硬件加速Android17/)
 
 ![Android apps as KDE windows](docs/images/multiwindow.png)
 
