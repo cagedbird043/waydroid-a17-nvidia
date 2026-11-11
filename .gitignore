@@ -7,3 +7,7 @@ aur/*/src/
 aur/*/pkg/
 aur/*/*.tar.gz
 aur/*/*.part[0-9][0-9]
+__pycache__/
+*.bundle
+kernelsu/kernelsu-dkms/src/
+kernelsu/kernelsu-dkms/pkg/

@@ -58,7 +58,7 @@ git push -q origin HEAD
 git clone -q ssh://aur@aur.archlinux.org/waydroid-a17-nvidia-bin.git "$T/aur"
 cp "$A/PKGBUILD" "$A/.SRCINFO" "$A/waydroid-a17-nvidia.install" "$T/aur/"
 cd "$T/aur"
-git add -A
+git add -- PKGBUILD .SRCINFO waydroid-a17-nvidia.install
 git diff --cached --quiet && { echo "aur-publish: AUR already at $TAG"; exit 0; }
 git commit -qm "更新到 $TAG"
 git push -q origin master

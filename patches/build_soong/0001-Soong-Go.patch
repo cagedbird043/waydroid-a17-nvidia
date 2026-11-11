@@ -1,0 +1,34 @@
+From d42ee5dac83539b80600f8c2e7fceb9c7e58986e Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Wed, 11 Nov 2026 22:07:20 +0800
+Subject: [PATCH] =?utf-8?q?=E6=9E=84=E5=BB=BA=E6=97=B6=E5=90=91=20Soong=20?=
+ =?utf-8?q?=E5=88=86=E6=9E=90=E8=BF=9B=E7=A8=8B=E4=BC=A0=E9=80=92=20Go=20?=
+ =?utf-8?q?=E5=86=85=E5=AD=98=E6=8E=A7=E5=88=B6?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Change-Id: Icc116b33894cdce0d5c9f1d93efc2a99c4f9f0ff
+---
+ ui/build/soong.go | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ui/build/soong.go b/ui/build/soong.go
+index 4521b4a..93df8a0 100644
+--- a/ui/build/soong.go
++++ b/ui/build/soong.go
+@@ -215,6 +215,11 @@ func (pb PrimaryBuilderFactory) primaryBuilderInvocation(config Config) bootstra
+ 
+ 	commonArgs = append(commonArgs, "-l", filepath.Join(pb.config.FileListDir(), "Android.bp.list"))
+ 	invocationEnv := make(map[string]string)
++	for _, key := range []string{"GOMEMLIMIT", "GOGC"} {
++		if value := os.Getenv(key); value != "" {
++			invocationEnv[key] = value
++		}
++	}
+ 	if pb.debugPort != "" {
+ 		//debug mode
+ 		commonArgs = append(commonArgs, "--delve_listen", pb.debugPort,
+-- 
+2.56.0
+

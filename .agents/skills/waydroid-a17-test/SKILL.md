@@ -15,6 +15,19 @@ $T/session-restart.sh                 # 后台启动并等到 ready；前台 `wa
 $T/guest.sh 'logcat -d -s nvc2 nvc2-enc | tail'   # root shell 进容器
 ```
 
+图形认证从具备 `WAYLAND_DISPLAY`、`DISPLAY`、`DBUS_SESSION_BUS_ADDRESS` 的主终端发起，
+例如 `SUDO_ASKPASS=/usr/bin/ksshaskpass "$T/guest.sh" 'id'`。Python Eval 子进程未必继承这些变量；
+认证失败先查显示环境，不从聊天或历史读取密码，也不因此改写已支持 `-A` 的 helper。
+
+本机 `lxc-attach` 直接接收日志文件作为 stdout 时，曾将该文件属主改为 root。用普通用户管道落盘，
+或采集完成后仅恢复本次日志的用户属主；保持私有日志权限 `0600`，不要用放宽权限来解决读取失败。
+单独启动 systemd 容器服务不等于用户会话已启动；用户会话 ready 后才能执行 guest 部署和版本验证。
+
+GPU 回归前查看当前负载与显存余量。出现 RM `0x51`（`NV_ERR_NO_MEMORY`）或 gralloc
+`vkAllocateMemory` 失败时，先核实资源占用；不擅自关闭其他应用，不在资源不足时把结果归为驱动版本回归。
+用户释放资源后重建 guest 会话，再采集新窗口的首次错误和实际画面；`ready`、`am start Status: ok`
+或 Activity resumed 均不能替代首帧验证。
+
 - 容器 `/data` = 宿主 `~/.local/share/waydroid/data`，推文件直接拷到 `.../data/local/tmp`。
 - 应用：`waydroid app launch <包名>`；网页：`waydroid app intent android.intent.action.VIEW <url>`。
 - 图形确认：`$T/guest.sh 'dumpsys SurfaceFlinger | grep GLES:'` 应是 ANGLE → NVK（RTX 4060）。
@@ -68,9 +81,17 @@ WEB_ENCODE_OUT=/tmp/web-evidence $T/web-encode-test.sh 150
 
 ## 截图与桌面
 
-- 用 `kde_window` 的 list/activate/place 找和摆窗口，再截全屏；多窗口模式下每个安卓应用一个 KDE 窗口，
-  标题 `waydroid.<包名>`。整块安卓桌面窗口叫 `Waydroid`。
+- 用 `computer.window({app: "waydroid.<包名>"})` 定位实际原生窗口，截图与输入使用同一窗口的新截图坐标；
+  多窗口模式下每个安卓应用一个 KDE 窗口。Android 自绘控件未暴露 AX 时使用窗口像素，不用 Activity resumed 代替画面。
 - 截图要公开时先看内容：YouTube 推荐栏、通知、账号头像都可能带不该公开的东西，裁掉或换画面。
+- 临时合成网页使用 `http.server.ThreadingHTTPServer`，只绑定 guest 私有桥；单线程 `HTTPServer`
+  会被已连接但尚未发送请求的客户端阻塞（已用空闲 TCP 连接复现），不能把页面连接失败归为渲染回归。
+  Chrome 入口复用 `scripts/web-encode-server.py` 的 guest loopback 转发与 `http://localhost:<端口>/`，
+  不另立直连私有桥地址的测试路径。
+- 剪贴板双向验证只用唯一合成标识；原剪贴板仅保存在内存，结束后恢复，不写入日志或页面报告。
+- 输入法验证先核实当前方案、全拼/双拼码及实际触发键（包括 Rime 内部绑定），不默认 `Ctrl+Space` 的含义；
+  在同一编辑器焦点下用真实逐键输入观察候选与汉字提交。Unicode 注入或粘贴不计为宿主 IME 通过。
+  Fcitx 单项目组的 `State=1` 不能判断 Rime 中文/英文模式；以状态面板、候选及最终提交为准。
 
 ## 宿主 Chrome/Firefox
 

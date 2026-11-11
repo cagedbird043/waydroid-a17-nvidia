@@ -20,6 +20,9 @@ tag `a17-YYYYMMDD-N`（同一天第 N 版），pkgver `YYYYMMDD.N`。native bund
    分块默认 5 MiB，数量必须等于 PKGBUILD `_vendor_parts`（脚本会检查）；仅重切已有压缩镜像可用 `package.sh <tag> --resplit`，不重建镜像或 native bundle。`VENDOR_PART_SIZE` 可指定分块大小。
 5. **安装 + 门禁**：`$R/install-gate.sh <pkgver>`。要看到 `Release gate PASS: 22 cases + media` 和
    `Installed the nvidia-prolapse vendor image <bundle 名>`。
+   安装前先核实实际 `images_path`、要替换的文件和 `/var/lib/waydroid-nvidia/vendor-image/` 状态目录；
+   安装记录是该目录的 `install.json`，不是父目录中的同名文件。只保留被替换文件及配置的回滚副本，不复制整份 `/data`。
+   保留 system 的更新须在部署前后用只读 SHA-256 验证现有 `system.img` 未变；受保护的镜像通过 sudo 读取，不改其权限。
 6. **回归**（`waydroid-a17-test` skill）：会话起来、GLES 是 ANGLE/NVK、`codec-smoke.sh`、`web-encode-test.sh`，
    加上这一版改动相关的场景（卡片、桌面窗口、输入法、剪贴板、文件共享、KernelSU）。
 7. **推送**：`git tag <tag> && git push origin HEAD <tag>`。
@@ -34,7 +37,9 @@ tag `a17-YYYYMMDD-N`（同一天第 N 版），pkgver `YYYYMMDD.N`。native bund
    ```
    说明格式见 [references/release-notes.md](references/release-notes.md)。发布前用
    `gh api repos/cagedbird043/waydroid-a17-nvidia/releases --jq '.[] | select(.draft) | .assets[] | "\(.digest) \(.name)"'`
-   对照本地 `sha256sum`，资产数须为 `_vendor_parts + 2`（分块、校验表、native bundle）。
+   对照本地 `sha256sum`，vendor 资产数须为 `_vendor_parts + 2`（分块、校验表、native bundle）。
+   本轮另附 KernelSU Manager APK、DKMS 包、完整源码 bundle 三项；逐项核对上传 digest，
+   并确认 PKGBUILD 的固定源码 bundle URL 与实际 Release 资产一致，不依赖第三方仓库中不存在的本地提交。
 9. **AUR**：`$R/aur-publish.sh <tag>`（Release 必须已发布）：Release 资产的校验和取 GitHub API 记录的 `digest`，
    不下载；tag/commit 源码包由 GitHub 现打，哈希与本地 `git archive` 不同，下载后计算。然后生成 `.SRCINFO`，
    提交 `AUR：<tag> 的校验和与 .SRCINFO` 并推送本仓库和 AUR。
