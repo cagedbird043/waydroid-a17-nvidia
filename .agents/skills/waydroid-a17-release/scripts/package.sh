@@ -3,9 +3,9 @@
 #   vendor.img -> vendor.img.zst (zstd -19) -> small numbered parts + checksums
 #   pinned native bundle -> waydroid-a17-nvidia-native-x86_64.tar.zst (reproducible tar)
 #   places the assets under the PKGBUILD's source names, updpkgsums, makepkg
-# The release commit must exist already and carry _tag/pkgver: the repository tarball is `git archive HEAD`,
-# which is what GitHub serves for the tag once it is pushed. A first run with a new tag bumps the PKGBUILD and
-# stops so the bump goes into that commit.
+# The release commit must exist already and carry _tag/pkgver; the local source tarball is `git archive HEAD`.
+# Before publishing to AUR, download the exact GitHub tag source URL and repeat makepkg with its actual checksum.
+# A first run with a new tag bumps the PKGBUILD and stops so the bump goes into that commit.
 # Usage: package.sh <tag> [--resplit] (reuse the existing compressed image and native archive)
 set -euo pipefail
 TAG=${1:?usage: package.sh <tag>}

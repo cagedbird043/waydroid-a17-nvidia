@@ -9,6 +9,7 @@ set -euo pipefail
 TAG=${1:?usage: aur-publish.sh <tag>}
 REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 A=$REPO/aur/waydroid-a17-nvidia-bin
+cd "$REPO"
 grep -qx "_tag=$TAG" "$A/PKGBUILD" || { echo "aur-publish: PKGBUILD is not at $TAG" >&2; exit 1; }
 [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" = false ] ||
     { echo "aur-publish: release $TAG is still a draft" >&2; exit 1; }
@@ -51,7 +52,6 @@ done
 cp "$T/PKGBUILD" "$A/PKGBUILD"
 (cd "$A" && makepkg --printsrcinfo > .SRCINFO)
 
-cd "$REPO"
 git add aur/waydroid-a17-nvidia-bin/PKGBUILD aur/waydroid-a17-nvidia-bin/.SRCINFO
 git diff --cached --quiet || git commit -qm "AUR：$TAG 的校验和与 .SRCINFO"
 git push -q origin HEAD

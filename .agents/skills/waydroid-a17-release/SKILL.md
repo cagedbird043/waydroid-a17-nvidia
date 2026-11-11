@@ -40,9 +40,13 @@ tag `a17-YYYYMMDD-N`（同一天第 N 版），pkgver `YYYYMMDD.N`。native bund
    对照本地 `sha256sum`，vendor 资产数须为 `_vendor_parts + 2`（分块、校验表、native bundle）。
    本轮另附 KernelSU Manager APK、DKMS 包、完整源码 bundle 三项；逐项核对上传 digest，
    并确认 PKGBUILD 的固定源码 bundle URL 与实际 Release 资产一致，不依赖第三方仓库中不存在的本地提交。
-9. **AUR**：`$R/aur-publish.sh <tag>`（Release 必须已发布）：Release 资产的校验和取 GitHub API 记录的 `digest`，
-   不下载；tag/commit 源码包由 GitHub 现打，哈希与本地 `git archive` 不同，下载后计算。然后生成 `.SRCINFO`，
+9. **AUR**：推送前先用 PKGBUILD 中实际 GitHub 标签 URL 的源码包替换本地 `git archive` 缓存，
+   `updpkgsums` 后在本机运行 `makepkg -fC --noconfirm`；镜像和 native 输入复用已核实的同一批资产。
+   不把本地 `git archive` 的构建成功代替正式 GitHub 源码包验收。
+   Release 已发布后运行 `$R/aur-publish.sh <tag>`：Release 资产的校验和取 GitHub API 的 `digest`，
+   不下载；tag/commit 源码包由 GitHub 现打，下载后计算实际哈希。然后生成 `.SRCINFO`，
    提交 `AUR：<tag> 的校验和与 .SRCINFO` 并推送本仓库和 AUR。
+   AUR 脚本先切入自身发布仓库再调用 `gh`，可从工作区根目录启动。
 10. 汇报：门禁结果、回归数字、各提交号、Release 链接。
 
 ## 门禁失败
