@@ -43,11 +43,16 @@ KDE window.
 | 🔓 | **Root** | KernelSU on the host kernel, with modules (Zygisk Next, LSPosed and friends). |
 | 🛒 | **Google apps** | Use ATV's GAPPS system image; Play Store is certified. |
 
-The hardware encoding core is now Rust, with the same H.264/HEVC/AV1 support and encoding performance within 10% of
-the previous core in our 720p tests. The Codec2 sandbox policy now permits its logging socket, including cold starts.
-The Codec2 decoding driver is also Rust. VP9 packets carrying multiple displayed frames now deliver every frame;
-codec-specific startup/replay data (CSD) is capped at 2 MiB, and gralloc buffer handles and plane layouts are validated
-before use to reject malformed buffers safely.
+The maintenance build updates Mesa to **26.2.6**, retains the local graphics/compute queue support, and pairs the
+current Rust RM encoding-parameter/RGB fixes with its Codec2 service. Codec2 decoding is also Rust: VP9 packets
+with multiple displayed frames deliver every frame, CSD is capped at 2 MiB, and gralloc handles/layouts are validated.
+The Codec2 sandbox permits its logging socket, including cold starts.
+
+KernelSU **32713** keeps the container adaptations and the existing signing certificate, with targeted shell-escaping,
+profile/template-path and file-reference fixes; see [`kernelsu/`](kernelsu/).
+The ATV system image is unchanged (SPL **2026-10-01**). Saved system-security source patches are not a deployed
+system update or a complete November ASB. The performance tables below are earlier measurements; this maintenance
+update has no new FPS, CPU-use or latency A/B result.
 
 ### 📸 Screenshots
 
@@ -164,10 +169,13 @@ Waydroid 里的 LineageOS 24.0（Android 17），显卡、视频引擎、root �
 | 🔓 | **Root** | 宿主内核上的 KernelSU，支持模块（Zygisk Next、LSPosed 等）。 |
 | 🛒 | **Google 应用** | 用 ATV 的 GAPPS system 镜像，Play 商店已认证。 |
 
-硬件编码核心现已 Rust 化，继续支持 H.264/HEVC/AV1；本机 720p 实测编码性能与原核心相差不超过 10%。
-同时补齐 Codec2 沙箱的日志套接字权限，覆盖服务冷启动。
-Codec2 解码驱动也已 Rust 化：修复单个 VP9 输入含多张显示帧时的输出；启动与回放的编解码专用数据（CSD）
-设为 2 MiB 上限；使用前校验 gralloc 缓冲句柄、平面布局与访问范围，拒绝非法缓冲。
+本轮维护更新 Mesa 到 **26.2.6**，保留本地图形/计算队列支持，将共享 Rust RM 的编码参数处理和 RGB 通道修复
+与匹配的 Codec2 服务一同交付。Codec2 解码也使用 Rust：VP9 单输入含多张显示帧时逐帧输出，CSD 上限 2 MiB，
+使用前校验 gralloc 句柄与平面布局；沙箱允许日志套接字，覆盖冷启动。
+
+KernelSU **32713** 保留容器适配与原签名，定向修复 shell 参数转义、profile/template 路径验证和文件引用平衡，
+见 [`kernelsu/`](kernelsu/)。ATV system 保持不变，SPL 仍为 **2026-10-01**；保存的系统安全源码补丁并未部署，
+不代表完整的 11 月 ASB。下方性能表来自此前版本，本轮没有新的 FPS、CPU 占用或延迟 A/B 结果。
 
 ### 📸 截图
 

@@ -68,7 +68,13 @@ def main():
         shutil.copy2(rust, f'{out}/payload/vendor_extra/{lib}/libnv_bionic_native.so')
         shutil.copy2(f'{W}/build/nvk-{target}/src/nouveau/vulkan/libvulkan_nouveau.so',
                      f'{out}/payload/vendor_extra/{lib}/libvulkan_nouveau.so')
-        d['nvk_builds'][target]['build_metadata'] = json.load(open(f'{W}/build/nvk-{target}/rust-build.json'))
+        metadata = json.load(open(f'{W}/build/nvk-{target}/rust-build.json'))
+        if metadata['rust']['sha256'] != sha(rust) or metadata['nvk']['sha256'] != sha(
+                f'{W}/build/nvk-{target}/src/nouveau/vulkan/libvulkan_nouveau.so'):
+            sys.exit(f'{target}: NVK build metadata does not match the deployed native libraries')
+        d['rust_builds'][target] = {key: value for key, value in metadata.items() if key != 'nvk'}
+        d['nvk_builds'][target] = {'build_metadata': metadata,
+                                 'deployed_backend_sha256': r['rust']['sha256']}
         for name, sub in NVRM.items():
             src = f'{nvrm}/{sub}/{name}'
             if r['artifacts'][name]['sha256'] != sha(src):
@@ -77,6 +83,10 @@ def main():
             subprocess.run([strip, '--strip-debug', '-o', f'{out}/{rel}', src], check=True)
         d['nvrm_rust_sha256'][abi] = r['rust']['sha256']
         d['nvrm_builds'][abi] = {k: r.get(k) for k in ('driver_source_head', 'driver_source_dirty', 'mesa_pin', 'rust_profile')}
+    mesa_pins = {record['mesa_pin'] for record in d['nvrm_builds'].values()}
+    if len(mesa_pins) != 1:
+        sys.exit(f'native bundle has different Mesa pins across ABIs: {sorted(mesa_pins)}')
+    d['mesa_commit'] = mesa_pins.pop()
     shutil.copy2(f'{W}/nvidia-prolapse/media/out/android/nvc2-xmlgen', f'{out}/gate/bin/android/nvc2-xmlgen')
     if a.service:
         shutil.copy2(os.path.join(ws, a.service), f'{out}/{SVC}')

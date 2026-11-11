@@ -2,10 +2,10 @@
 
 当前状态、测试结果和移植记录见 `reports/porting.md`；构建、测试、发版流程见 `.agents/skills/`。
 
-## 现状（2026-10-28）
+## 现状（2026-11-12）
 
-- system：ATV LineageOS 24.0 GAPPS 版 `20261017`，Play 商店已认证。
-- vendor：自编 nvidia-prolapse；ANGLE → NVK，HWUI skiavk，NVDEC 硬解，NVENC 硬编（H.264/HEVC/AV1，Chrome WebCodecs 与 WebRTC 已实测）。
+- system：保留 ATV LineageOS 24.0 GAPPS `20261017`，SPL `2026-10-01`。已移植的系统安全源码另行保存，未部署，不声明完整 11 月 ASB；正式 system 签名与现有数据兼容仍需单独解决。
+- vendor：Mesa `26.2.6` 维护构建，保留本地图形/计算多队列；ANGLE → NVK、HWUI skiavk、NVDEC 硬解及 H.264/HEVC/AV1 NVENC 硬编，配套当前共享 Rust RM 与 Codec2 服务。
 - Codec2 编码核心使用 Rust，五种输入格式与 H.264/HEVC/AV1 已验证；能力枚举与 XML 使用同一快照，组件列表保持 4 解码 + 3 编码。
 - Codec2 seccomp 策略补齐日志 socket/connect 权限；冷启动与稳态 syscall 按实参核对，Surface 解码与网页编码有独立回归门禁。
 - Codec2 解码驱动使用 Rust：多显示帧逐帧交付；启动/回放 CSD 上限 2 MiB；gralloc 外壳、元数据与平面范围完整校验。VP9 superframe 的 ByteBuffer/Surface 两条路径与 Chrome 60 秒 VP9 播放已实测。
@@ -15,7 +15,7 @@
 - 文件共享：主机 `~/Downloads` 挂在 Android `Download/Host`（`waydroid.cfg` 的 `shared_folders` 可改），主机侧改动自动进媒体库。
 - 声音：经主机 PulseAudio 输出；网页音频等 AAudio 流也有声（不声明 MMAP），媒体音量默认最大，由主机控制音量。
 - Widevine：L3（`dumpsys android.hardware.drm.IDrmFactory/widevine`：`default_security_level: L3`，`hdcp_level_max: Unprotected`），无法提升。
-- root：KernelSU LKM，本地签名管理器 32708。
+- root：KernelSU LKM、ksud 与本地原证书签名 Manager 均为 `32713`；管理器实机显示工作中/LKM。保留容器适配，定向修复 shell 参数转义、profile/template 路径及 wrapped-file 引用。
 - ABI：`x86_64, arm64-v8a, x86`，ARM 翻译用 ATV 自带的 `libndk_translation`，没有 `armeabi-v7a`。
 
 ## 功能
