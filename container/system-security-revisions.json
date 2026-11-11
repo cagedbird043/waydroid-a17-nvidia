@@ -1,0 +1,102 @@
+{
+  "format": 1,
+  "kind": "local-post-patch-revisions",
+  "projects": [
+    {
+      "path": "frameworks/av",
+      "base": "f18c3ac08a5648d725990b517584b7deec4c4737",
+      "revision": "59f64a8eac155e4a45003b2df20c178192a4a2e6",
+      "patches": 5
+    },
+    {
+      "path": "packages/apps/Settings",
+      "base": "51beb5b15d0c7a3c8dfb2c886c39f3c677e2aae8",
+      "revision": "a3057d41917b84ee8000438f94adaaa3ed357784",
+      "patches": 2
+    },
+    {
+      "path": "external/aac",
+      "base": "41f344ffc0bacea87cac5bb1756bd40761265d1e",
+      "revision": "a0da43625db2b35a2909f71832240895e272132c",
+      "patches": 1
+    },
+    {
+      "path": "external/hplip",
+      "base": "d37ce064e1e2763e4f2307c7dea7aad0c2044aa6",
+      "revision": "65c2d8ad9f0ac7789ea75fa86a395c693790b606",
+      "patches": 1
+    },
+    {
+      "path": "external/tremolo",
+      "base": "100623061b6dd645e61a2431a35e9b5a2bd7e61e",
+      "revision": "730932cc6920ed630b7fbca0e936e29496223d57",
+      "patches": 1
+    },
+    {
+      "path": "packages/apps/ManagedProvisioning",
+      "base": "dcb981579cbbe74a817ecbaf97e7b924be0cdaa0",
+      "revision": "c370114c7ae6adf7e4ada058c2593c8d758f52fb",
+      "patches": 1
+    },
+    {
+      "path": "packages/modules/IntentResolver",
+      "base": "514e2233f8c1183308e31c86386aa932003c307a",
+      "revision": "c4465bc0ddef04d40dcd9613c3b1319183e9ff78",
+      "patches": 1
+    },
+    {
+      "path": "packages/modules/NeuralNetworks",
+      "base": "a44a9032ab9a8438c0e13aca765d6ee4edebba2c",
+      "revision": "56b147057fd4b91814f77aba6f9e66dab8e4bcac",
+      "patches": 1
+    },
+    {
+      "path": "packages/modules/Profiling",
+      "base": "8b3abe8eebc0e97890977d9658038f4966aa7df6",
+      "revision": "1bd72cc810eba4048f82100d118a14806a9729ba",
+      "patches": 1
+    },
+    {
+      "path": "packages/services/Iwlan",
+      "base": "ddf0eb7f277ea6a5a62c63678d17218714f38071",
+      "revision": "dce8bba3b2b48f1939696b30054ed0858e1e521b",
+      "patches": 1
+    },
+    {
+      "path": "system/gsid",
+      "base": "35a92d40f529b605fad8ff622691e76901044cc8",
+      "revision": "9d8377f4c98cacfce6f62be77f9e214b012514f5",
+      "patches": 1
+    },
+    {
+      "path": "trusty/user/base",
+      "base": "165d46c463bd22524a7d33d177bf7f35dad46bf5",
+      "revision": "7b3c12173f0fa8fb58ae46bc4782b6df44f7c63f",
+      "patches": 1
+    },
+    {
+      "path": "frameworks/base",
+      "base": "6e3f1fcdf5d2cace06991dcd94ed9c81e3d4af9c",
+      "revision": "7f5e546d7cd3853fe4264398f813d2ee8f888d04",
+      "patches": 45
+    },
+    {
+      "path": "external/libopenapv",
+      "base": "1f7d75914d98c47ec2109d94c9561aa9718bd75c",
+      "revision": "82f6d92371c402ab5a0555340f25ba678b0f98b1",
+      "patches": 1
+    },
+    {
+      "path": "frameworks/native",
+      "base": "95cdabea07cba3592e7a6ae1f74576b3f0b20235",
+      "revision": "4a1194d6eddc69982a9b6b68da89142b5bcc4f4b",
+      "patches": 4
+    },
+    {
+      "path": ".repo/manifests",
+      "base": "b51a0c449a3279ca55fb6d4d91d2143e42e2fff5",
+      "revision": "20193e3c1cc02fae0afbf591cf86a7e50e42e660",
+      "patches": 4
+    }
+  ]
+}

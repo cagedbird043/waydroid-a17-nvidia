@@ -1,0 +1,418 @@
+From dce8bba3b2b48f1939696b30054ed0858e1e521b Mon Sep 17 00:00:00 2001
+From: Po-Chun Lee <pochunlee@google.com>
+Date: Fri, 10 Jul 2026 19:41:02 -0700
+Subject: [PATCH] =?utf-8?q?=E4=BF=AE=E5=A4=8D=E7=BD=91=E7=BB=9C=E5=88=87?=
+ =?utf-8?q?=E7=89=87=E4=BF=9D=E7=95=99=E5=80=BC=E5=AF=BC=E8=87=B4=E7=9A=84?=
+ =?utf-8?q?=E8=BF=9B=E7=A8=8B=E5=B4=A9=E6=BA=83?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+S-NSSAI Slice Differentiator (SD) has a reserved value 0xFFFFFF meaning
+"no SD value associated with the SST" (TS 24.501 Section 9.11.2.8). A
+previous change removed the filter for this reserved value, causing it
+to be passed to the NetworkSliceInfo Builder, which throws
+IllegalArgumentException because the value exceeds the maximum allowed
+value (0xFFFFFE). This crashes the process. Fix this by mapping 0xFFFFFF
+back to no-slice (-1). Also wrap the payload processing in a try-catch
+block and add null-safety checks to prevent future crashes from parsing
+exceptions.
+
+Bug: 517377034
+Flag: EXEMPT BUGFIX
+Test: atest NetworkSliceSelectionAssistanceInformationTest EpdgTunnelManagerTest
+Change-Id: Ic34dd303506b88a50569401224a646ce7ffdbd86
+Merged-In: Ic34dd303506b88a50569401224a646ce7ffdbd86
+
+(cherry picked from commit 7df1770d5ab4f671e7a2f63074199221ec60a2c8)
+Change-Id: Icbfb7ac16ede2064dfaf802daad73ea6848df381
+---
+ .../android/iwlan/epdg/EpdgTunnelManager.java | 55 ++++++-----
+ ...rkSliceSelectionAssistanceInformation.java | 71 ++++++++------
+ .../iwlan/epdg/EpdgTunnelManagerTest.java     | 94 +++++++++++++++++++
+ ...iceSelectionAssistanceInformationTest.java | 48 ++++++++++
+ 4 files changed, 217 insertions(+), 51 deletions(-)
+
+diff --git a/src/com/google/android/iwlan/epdg/EpdgTunnelManager.java b/src/com/google/android/iwlan/epdg/EpdgTunnelManager.java
+index 2f81819..1bd36d9 100644
+--- a/src/com/google/android/iwlan/epdg/EpdgTunnelManager.java
++++ b/src/com/google/android/iwlan/epdg/EpdgTunnelManager.java
+@@ -324,8 +324,8 @@ public class EpdgTunnelManager {
+             return mSliceInfo;
+         }
+ 
+-        void setSliceInfo(NetworkSliceInfo si) {
+-            mSliceInfo = si;
++        void setSliceInfo(NetworkSliceInfo sliceInfo) {
++            mSliceInfo = sliceInfo;
+         }
+ 
+         boolean isBackoffTimeValid() {
+@@ -577,7 +577,7 @@ public class EpdgTunnelManager {
+         private final String mApnName;
+         private final int mToken;
+ 
+-        private TmIke3gppCallback(String apnName, int token) {
++        TmIke3gppCallback(String apnName, int token) {
+             mApnName = apnName;
+             mToken = token;
+         }
+@@ -2050,26 +2050,12 @@ public class EpdgTunnelManager {
+                     List<Ike3gppData> ike3gppData = ike3gppDataReceived.mIke3gppData;
+                     if (ike3gppData != null && !ike3gppData.isEmpty()) {
+                         tunnelConfig = mApnNameToTunnelConfig.get(apnName);
+-                        for (Ike3gppData payload : ike3gppData) {
+-                            if (payload.getDataType() == DATA_TYPE_NOTIFY_N1_MODE_INFORMATION) {
+-                                Log.d(TAG, "Got payload DATA_TYPE_NOTIFY_N1_MODE_INFORMATION");
+-                                NetworkSliceInfo si =
+-                                        NetworkSliceSelectionAssistanceInformation.getSliceInfo(
+-                                                ((Ike3gppN1ModeInformation) payload).getSnssai());
+-                                if (si != null) {
+-                                    tunnelConfig.setSliceInfo(si);
+-                                    Log.d(TAG, "SliceInfo: " + si);
+-                                }
+-                            } else if (payload.getDataType() == DATA_TYPE_NOTIFY_BACKOFF_TIMER) {
+-                                Log.d(TAG, "Got payload DATA_TYPE_NOTIFY_BACKOFF_TIMER");
+-                                long backoffTime =
+-                                        decodeBackoffTime(
+-                                                ((Ike3gppBackoffTimer) payload).getBackoffTimer());
+-                                if (backoffTime > 0) {
+-                                    tunnelConfig.setBackoffTime(backoffTime);
+-                                    Log.d(TAG, "Backoff Timer: " + backoffTime);
+-                                }
++                        if (tunnelConfig != null) {
++                            for (Ike3gppData payload : ike3gppData) {
++                                processIke3gppData(tunnelConfig, payload);
+                             }
++                        } else {
++                            Log.w(TAG, "No tunnelConfig found for APN: " + apnName);
+                         }
+                     } else {
+                         Log.e(TAG, "Null or empty payloads received:");
+@@ -2550,6 +2536,31 @@ public class EpdgTunnelManager {
+         return dpdDelay;
+     }
+ 
++    private void processIke3gppData(TunnelConfig tunnelConfig, Ike3gppData payload) {
++        try {
++            if (payload.getDataType() == DATA_TYPE_NOTIFY_N1_MODE_INFORMATION) {
++                Log.d(TAG, "Got payload DATA_TYPE_NOTIFY_N1_MODE_INFORMATION");
++                NetworkSliceInfo sliceInfo =
++                        NetworkSliceSelectionAssistanceInformation.getSliceInfo(
++                                ((Ike3gppN1ModeInformation) payload).getSnssai());
++                if (sliceInfo != null) {
++                    tunnelConfig.setSliceInfo(sliceInfo);
++                    Log.d(TAG, "SliceInfo: " + sliceInfo);
++                }
++            } else if (payload.getDataType() == DATA_TYPE_NOTIFY_BACKOFF_TIMER) {
++                Log.d(TAG, "Got payload DATA_TYPE_NOTIFY_BACKOFF_TIMER");
++                long backoffTime =
++                        decodeBackoffTime(((Ike3gppBackoffTimer) payload).getBackoffTimer());
++                if (backoffTime > 0) {
++                    tunnelConfig.setBackoffTime(backoffTime);
++                    Log.d(TAG, "Backoff Timer: " + backoffTime);
++                }
++            }
++        } catch (RuntimeException e) {
++            Log.e(TAG, "Exception while processing 3GPP payload: ", e);
++        }
++    }
++
+     /**
+      * Decodes backoff time as per TS 124 008 10.5.7.4a Bits 5 to 1 represent the binary coded timer
+      * value
+diff --git a/src/com/google/android/iwlan/epdg/NetworkSliceSelectionAssistanceInformation.java b/src/com/google/android/iwlan/epdg/NetworkSliceSelectionAssistanceInformation.java
+index 88a0fd1..3cb8e5c 100644
+--- a/src/com/google/android/iwlan/epdg/NetworkSliceSelectionAssistanceInformation.java
++++ b/src/com/google/android/iwlan/epdg/NetworkSliceSelectionAssistanceInformation.java
+@@ -1,6 +1,5 @@
+ package com.google.android.iwlan.epdg;
+ 
+-import android.support.annotation.NonNull;
+ import android.telephony.data.NetworkSliceInfo;
+ import android.util.Log;
+ 
+@@ -10,7 +9,23 @@ import java.util.List;
+ public class NetworkSliceSelectionAssistanceInformation {
+     private static final String TAG =
+             NetworkSliceSelectionAssistanceInformation.class.getSimpleName();
+-    static final List<Integer> VALID_LENGTHS = Arrays.asList(1, 2, 4, 5, 8);
++
++    // S-NSSAI value lengths as defined in TS 24.501 Section 9.11.2.8
++    private static final int LENGTH_SST_ONLY = 1;
++    private static final int LENGTH_SST_AND_MAPPED_SST = 2;
++    private static final int LENGTH_SST_AND_SD = 4;
++    private static final int LENGTH_SST_SD_AND_MAPPED_SST = 5;
++    private static final int LENGTH_SST_SD_MAPPED_SST_AND_MAPPED_SD = 8;
++
++    static final List<Integer> VALID_LENGTHS =
++            Arrays.asList(
++                    LENGTH_SST_ONLY,
++                    LENGTH_SST_AND_MAPPED_SST,
++                    LENGTH_SST_AND_SD,
++                    LENGTH_SST_SD_AND_MAPPED_SST,
++                    LENGTH_SST_SD_MAPPED_SST_AND_MAPPED_SD);
++
++    private static final int RESERVED_SD_VALUE = 0xFFFFFF;
+ 
+     public static NetworkSliceInfo getSliceInfo(byte[] snssai) {
+         if (snssai == null) {
+@@ -34,7 +49,7 @@ public class NetworkSliceSelectionAssistanceInformation {
+          * 0 0 0 0 1 0 0 0 SST, SD, mapped HPLMN SST and mapped HPLMN SD
+          * All other values are reserved.
+          */
+-        NetworkSliceInfo.Builder siBuilder = new NetworkSliceInfo.Builder();
++        NetworkSliceInfo.Builder sliceInfoBuilder = new NetworkSliceInfo.Builder();
+         int len = snssai.length;
+         // validity checks. See TS 24.501 Section 9.11.2.8
+         // length should be valid
+@@ -43,34 +58,30 @@ public class NetworkSliceSelectionAssistanceInformation {
+             return null;
+         }
+ 
++        sliceInfoBuilder.setSliceServiceType(parseSliceServiceType(snssai, 0));
+         switch (len) {
+-            case 1 -> // get SST
+-                    siBuilder.setSliceServiceType(getSST(snssai, 0));
+-            case 2 -> { // get SST and mapped SST
+-                siBuilder.setSliceServiceType(getSST(snssai, 0));
+-                siBuilder.setMappedHplmnSliceServiceType(getSST(snssai, 1));
+-            }
+-            case 4 -> { // get SST and SD
+-                siBuilder.setSliceServiceType(getSST(snssai, 0));
+-                siBuilder.setSliceDifferentiator(getSD(snssai, 1));
+-            }
+-            case 5 -> { // get SST, SD and mapped SST
+-                siBuilder.setSliceServiceType(getSST(snssai, 0));
+-                siBuilder.setSliceDifferentiator(getSD(snssai, 1));
+-                siBuilder.setMappedHplmnSliceServiceType(getSST(snssai, 4));
++            case LENGTH_SST_ONLY -> {}
++            case LENGTH_SST_AND_MAPPED_SST ->
++                    sliceInfoBuilder.setMappedHplmnSliceServiceType(
++                            parseSliceServiceType(snssai, 1));
++            case LENGTH_SST_AND_SD ->
++                    sliceInfoBuilder.setSliceDifferentiator(parseSliceDifferentiator(snssai, 1));
++            case LENGTH_SST_SD_AND_MAPPED_SST -> {
++                sliceInfoBuilder.setSliceDifferentiator(parseSliceDifferentiator(snssai, 1));
++                sliceInfoBuilder.setMappedHplmnSliceServiceType(parseSliceServiceType(snssai, 4));
+             }
+-            case 8 -> { // get SST, SD, mapped SST, mapped SD
+-                siBuilder.setSliceServiceType(getSST(snssai, 0));
+-                siBuilder.setSliceDifferentiator(getSD(snssai, 1));
+-                siBuilder.setMappedHplmnSliceServiceType(getSST(snssai, 4));
+-                siBuilder.setMappedHplmnSliceDifferentiator(getSD(snssai, 5));
++            case LENGTH_SST_SD_MAPPED_SST_AND_MAPPED_SD -> {
++                sliceInfoBuilder.setSliceDifferentiator(parseSliceDifferentiator(snssai, 1));
++                sliceInfoBuilder.setMappedHplmnSliceServiceType(parseSliceServiceType(snssai, 4));
++                sliceInfoBuilder.setMappedHplmnSliceDifferentiator(
++                        parseSliceDifferentiator(snssai, 5));
+             }
+         }
+ 
+-        return siBuilder.build();
++        return sliceInfoBuilder.build();
+     }
+ 
+-    private static int getSST(@NonNull byte[] snssai, int offset) {
++    static int parseSliceServiceType(byte[] snssai, int offset) {
+         if (offset < 0 || snssai.length < offset + 1) {
+             return NetworkSliceInfo.SLICE_SERVICE_TYPE_NONE;
+         }
+@@ -81,7 +92,7 @@ public class NetworkSliceSelectionAssistanceInformation {
+         return Byte.toUnsignedInt(snssai[offset]);
+     }
+ 
+-    private static int getSD(byte[] snssai, int offset) {
++    static int parseSliceDifferentiator(byte[] snssai, int offset) {
+         /*
+          * Slice Descriptor is 3 bytes long
+          * The SD field has a reserved value "no SD value associated with the SST"
+@@ -89,10 +100,12 @@ public class NetworkSliceSelectionAssistanceInformation {
+          */
+         if (offset >= 0 && snssai.length >= offset + 3) {
+             // Constructs the 24-bit integer from 3 bytes (Big-Endian/Network Order)
+-            return ((snssai[offset] & 0xFF) << 16)
+-                    | ((snssai[offset + 1] & 0xFF) << 8)
+-                    | ((snssai[offset + 2] & 0xFF));
++            int sd =
++                    ((snssai[offset] & 0xFF) << 16)
++                            | ((snssai[offset + 1] & 0xFF) << 8)
++                            | ((snssai[offset + 2] & 0xFF));
++            return (sd == RESERVED_SD_VALUE) ? NetworkSliceInfo.SLICE_DIFFERENTIATOR_NO_SLICE : sd;
+         }
+-        return NetworkSliceInfo.SLICE_SERVICE_TYPE_NONE;
++        return NetworkSliceInfo.SLICE_DIFFERENTIATOR_NO_SLICE;
+     }
+ }
+diff --git a/test/instrumentation/com/google/android/iwlan/epdg/EpdgTunnelManagerTest.java b/test/instrumentation/com/google/android/iwlan/epdg/EpdgTunnelManagerTest.java
+index 67201b0..d405c38 100644
+--- a/test/instrumentation/com/google/android/iwlan/epdg/EpdgTunnelManagerTest.java
++++ b/test/instrumentation/com/google/android/iwlan/epdg/EpdgTunnelManagerTest.java
+@@ -74,6 +74,7 @@ import android.net.ipsec.ike.exceptions.IkeProtocolException;
+ import android.net.ipsec.ike.ike3gpp.Ike3gppBackoffTimer;
+ import android.net.ipsec.ike.ike3gpp.Ike3gppData;
+ import android.net.ipsec.ike.ike3gpp.Ike3gppExtension;
++import android.net.ipsec.ike.ike3gpp.Ike3gppN1ModeInformation;
+ import android.os.PersistableBundle;
+ import android.os.test.TestLooper;
+ import android.telephony.CarrierConfigManager;
+@@ -3561,4 +3562,97 @@ public class EpdgTunnelManagerTest {
+         verify(mMockConnectivityDiagnosticsManager, times(1))
+                 .unregisterConnectivityDiagnosticsCallback(eq(callback));
+     }
++    @Test
++    public void testProcessIke3gppData_N1ModeInformation_success() throws Exception {
++        String apnName = "ims";
++        IkeSessionArgumentCaptors captors =
++                verifyBringUpTunnelWithDnsQuery(apnName, mMockDefaultNetwork);
++
++        // Prepare N1 Mode Info payload
++        Ike3gppN1ModeInformation mockN1Mode = mock(Ike3gppN1ModeInformation.class);
++        doReturn(Ike3gppData.DATA_TYPE_NOTIFY_N1_MODE_INFORMATION).when(mockN1Mode).getDataType();
++        byte[] snssai = {1, 2, 3, 4}; // SST=1, SD=0x020304
++        doReturn(snssai).when(mockN1Mode).getSnssai();
++
++        List<Ike3gppData> payloads = List.of(mockN1Mode);
++
++        // Trigger 3GPP data received
++        IkeSessionParams ikeSessionParams = captors.mIkeSessionParamsCaptor.getValue();
++        Ike3gppExtension.Ike3gppDataListener ike3gppCallback =
++                ikeSessionParams.getIke3gppExtension().getIke3gppDataListener();
++        ike3gppCallback.onIke3gppDataReceived(payloads);
++        mTestLooper.dispatchAll();
++
++        // Verify slice info is set in TunnelConfig by verifying it is passed to onOpened callback
++        clearInvocations(mMockIpSecManager);
++        doReturn(0L)
++                .when(mEpdgTunnelManager)
++                .reportIwlanError(eq(apnName), eq(new IwlanError(IwlanError.NO_ERROR)));
++
++        mEpdgTunnelManager
++                .getTmIkeSessionCallback(apnName, mEpdgTunnelManager.getCurrentTokenForApn(apnName))
++                .onOpened(mMockIkeSessionConfiguration);
++        mTestLooper.dispatchAll();
++
++        ChildSessionCallback childSessionCallback = captors.mChildSessionCallbackCaptor.getValue();
++        childSessionCallback.onIpSecTransformCreated(
++                mMockedIpSecTransformIn, IpSecManager.DIRECTION_IN);
++        mTestLooper.dispatchAll();
++        childSessionCallback.onIpSecTransformCreated(
++                mMockedIpSecTransformOut, IpSecManager.DIRECTION_OUT);
++        mTestLooper.dispatchAll();
++
++        childSessionCallback.onOpened(mMockChildSessionConfiguration);
++        mTestLooper.dispatchAll();
++
++        ArgumentCaptor<TunnelLinkProperties> tlpCaptor =
++                ArgumentCaptor.forClass(TunnelLinkProperties.class);
++        verify(mMockIwlanTunnelCallback).onOpened(eq(apnName), tlpCaptor.capture(), any());
++
++        TunnelLinkProperties tlp = tlpCaptor.getValue();
++        assertTrue(tlp.sliceInfo().isPresent());
++        assertEquals(1, tlp.sliceInfo().get().getSliceServiceType());
++        assertEquals(0x020304, tlp.sliceInfo().get().getSliceDifferentiator());
++    }
++
++    @Test
++    public void testProcessIke3gppData_exception_handled() throws Exception {
++        String apnName = "ims";
++        IkeSessionArgumentCaptors captors =
++                verifyBringUpTunnelWithDnsQuery(apnName, mMockDefaultNetwork);
++
++        // Prepare invalid payload that triggers ClassCastException during processing
++        Ike3gppData badPayload = mock(Ike3gppData.class);
++        doReturn(Ike3gppData.DATA_TYPE_NOTIFY_N1_MODE_INFORMATION).when(badPayload).getDataType();
++        // It is NOT Ike3gppN1ModeInformation, so casting it will fail
++
++        List<Ike3gppData> payloads = List.of(badPayload);
++
++        // Trigger 3GPP data received - should not crash because of try-catch
++        IkeSessionParams ikeSessionParams = captors.mIkeSessionParamsCaptor.getValue();
++        Ike3gppExtension.Ike3gppDataListener ike3gppCallback =
++                ikeSessionParams.getIke3gppExtension().getIke3gppDataListener();
++        ike3gppCallback.onIke3gppDataReceived(payloads);
++        mTestLooper.dispatchAll();
++
++        // Verify tunnel can still open (meaning process didn't crash and state is still ok)
++        verifyTunnelOnOpened(apnName, captors.mChildSessionCallbackCaptor.getValue());
++    }
++
++    @Test
++    public void testProcessIke3gppData_nullTunnelConfig_ignored() throws Exception {
++        String apnName = "ims";
++        // Do NOT bring up tunnel, so tunnelConfig is null for this APN
++
++        Ike3gppN1ModeInformation mockN1Mode = mock(Ike3gppN1ModeInformation.class);
++        doReturn(Ike3gppData.DATA_TYPE_NOTIFY_N1_MODE_INFORMATION).when(mockN1Mode).getDataType();
++
++        List<Ike3gppData> payloads = List.of(mockN1Mode);
++
++        // Trigger 3GPP data received - should not crash because of null check
++        Ike3gppExtension.Ike3gppDataListener callback =
++                mEpdgTunnelManager.new TmIke3gppCallback(apnName, 1);
++        callback.onIke3gppDataReceived(payloads);
++        mTestLooper.dispatchAll();
++    }
+ }
+diff --git a/test/instrumentation/com/google/android/iwlan/epdg/NetworkSliceSelectionAssistanceInformationTest.java b/test/instrumentation/com/google/android/iwlan/epdg/NetworkSliceSelectionAssistanceInformationTest.java
+index cd0f16d..a2f68fa 100644
+--- a/test/instrumentation/com/google/android/iwlan/epdg/NetworkSliceSelectionAssistanceInformationTest.java
++++ b/test/instrumentation/com/google/android/iwlan/epdg/NetworkSliceSelectionAssistanceInformationTest.java
+@@ -106,6 +106,54 @@ public class NetworkSliceSelectionAssistanceInformationTest {
+                 /* expectedMappedSd= */ 0x0F0E0D);
+     }
+ 
++    @Test
++    public void testGetSliceInfo_sstAndSd_withReservedSd_returnsNoSlice() {
++        byte[] nssai = {
++            3, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF
++        }; // SST = 3, SD = 0xFFFFFF (Reserved)
++        parseAndAssertSliceInfo(
++                nssai,
++                /* expectedSst= */ 3,
++                /* expectedSd= */ NetworkSliceInfo.SLICE_DIFFERENTIATOR_NO_SLICE,
++                /* expectedMappedSst= */ NetworkSliceInfo.SLICE_SERVICE_TYPE_NONE,
++                /* expectedMappedSd= */ NetworkSliceInfo.SLICE_DIFFERENTIATOR_NO_SLICE);
++    }
++
++    @Test
++    public void testGetSliceInfo_allFields_withReservedSd_returnsNoSlice() {
++        byte[] nssai = {
++            3, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, 2, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF
++        }; // SST=3, SD=0xFFFFFF, Mapped SST=2, Mapped SD=0xFFFFFF
++        parseAndAssertSliceInfo(
++                nssai,
++                /* expectedSst= */ 3,
++                /* expectedSd= */ NetworkSliceInfo.SLICE_DIFFERENTIATOR_NO_SLICE,
++                /* expectedMappedSst= */ 2,
++                /* expectedMappedSd= */ NetworkSliceInfo.SLICE_DIFFERENTIATOR_NO_SLICE);
++    }
++
++    @Test
++    public void testParseSliceServiceType_invalidOffset_returnsNone() {
++        byte[] snssai = {1, 2};
++        assertEquals(
++                NetworkSliceInfo.SLICE_SERVICE_TYPE_NONE,
++                NetworkSliceSelectionAssistanceInformation.parseSliceServiceType(snssai, -1));
++        assertEquals(
++                NetworkSliceInfo.SLICE_SERVICE_TYPE_NONE,
++                NetworkSliceSelectionAssistanceInformation.parseSliceServiceType(snssai, 2));
++    }
++
++    @Test
++    public void testParseSliceDifferentiator_invalidOffset_returnsNoSlice() {
++        byte[] snssai = {1, 2, 3};
++        assertEquals(
++                NetworkSliceInfo.SLICE_DIFFERENTIATOR_NO_SLICE,
++                NetworkSliceSelectionAssistanceInformation.parseSliceDifferentiator(snssai, -1));
++        assertEquals(
++                NetworkSliceInfo.SLICE_DIFFERENTIATOR_NO_SLICE,
++                NetworkSliceSelectionAssistanceInformation.parseSliceDifferentiator(snssai, 1));
++    }
++
+     /** Helper method to parse NSSAI and assert the state of the resulting NetworkSliceInfo. */
+     private void parseAndAssertSliceInfo(
+             byte[] nssai,
+-- 
+2.56.0
+

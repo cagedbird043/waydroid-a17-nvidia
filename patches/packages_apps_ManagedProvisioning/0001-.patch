@@ -1,0 +1,172 @@
+From c370114c7ae6adf7e4ada058c2593c8d758f52fb Mon Sep 17 00:00:00 2001
+From: Sinduran Sivarajan <sinduran@google.com>
+Date: Thu, 28 May 2026 08:40:43 -0700
+Subject: [PATCH] =?utf-8?q?=E9=98=BB=E6=AD=A2=E5=B7=B2=E9=85=8D=E7=BD=AE?=
+ =?utf-8?q?=E8=AE=BE=E5=A4=87=E8=A2=AB=E8=AE=BE=E7=BD=AE=E5=90=91=E5=AF=BC?=
+ =?utf-8?q?=E9=87=8D=E6=96=B0=E9=85=8D=E7=BD=AE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+This change blocks calls from Setup Wizard to start device owner or financed device provisioning if the device has already completed its initial provisioning.
+
+Bug: 482024712
+Flag: EXEMPT BUGFIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:a27b6d73fcee6553e8977ac0f28feb6390d214c8
+Merged-In: Idaee713a281abdbe7560a297f4aaafe55094c070
+Change-Id: Idaee713a281abdbe7560a297f4aaafe55094c070
+
+(cherry picked from commit 12cd4e297e6fcdd6cd33b91e81a767506f786956)
+Change-Id: Ie32c2c150aeb759c611b468b86752760a1088b05
+---
+ .../managedprovisioning/common/Globals.java   |  3 +
+ .../PreProvisioningActivityController.java    | 16 ++++-
+ ...PreProvisioningActivityControllerTest.java | 72 +++++++++++++++++++
+ 3 files changed, 90 insertions(+), 1 deletion(-)
+
+diff --git a/src/com/android/managedprovisioning/common/Globals.java b/src/com/android/managedprovisioning/common/Globals.java
+index 9b61dcf..a6947da 100644
+--- a/src/com/android/managedprovisioning/common/Globals.java
++++ b/src/com/android/managedprovisioning/common/Globals.java
+@@ -26,6 +26,9 @@ public final class Globals {
+     public static final String ACTION_RESUME_PROVISIONING =
+             "com.android.managedprovisioning.action.RESUME_PROVISIONING";
+ 
++    public static final String SETUP_WIZARD_PACKAGE_NAME = "com.google.android.setupwizard";
++
++
+     /**
+      * Start a provisioning flow that sets a Device Owner without user interaction. Per the Android
+      * Compatibility Definition document, this is not compatible with declaring the feature
+diff --git a/src/com/android/managedprovisioning/preprovisioning/PreProvisioningActivityController.java b/src/com/android/managedprovisioning/preprovisioning/PreProvisioningActivityController.java
+index 6a16880..128f739 100644
+--- a/src/com/android/managedprovisioning/preprovisioning/PreProvisioningActivityController.java
++++ b/src/com/android/managedprovisioning/preprovisioning/PreProvisioningActivityController.java
+@@ -51,6 +51,7 @@ import static android.app.admin.DevicePolicyManager.STATUS_USER_SETUP_COMPLETED;
+ 
+ import static com.android.managedprovisioning.analytics.ProvisioningAnalyticsTracker.CANCELLED_BEFORE_PROVISIONING;
+ import static com.android.managedprovisioning.common.Globals.ACTION_RESUME_PROVISIONING;
++import static com.android.managedprovisioning.common.Globals.SETUP_WIZARD_PACKAGE_NAME;
+ import static com.android.managedprovisioning.model.ProvisioningParams.DEFAULT_EXTRA_PROVISIONING_KEEP_ACCOUNT_MIGRATED;
+ import static com.android.managedprovisioning.model.ProvisioningParams.DEFAULT_EXTRA_PROVISIONING_PERMISSION_GRANT_OPT_OUT;
+ import static com.android.managedprovisioning.model.ProvisioningParams.DEFAULT_EXTRA_PROVISIONING_SKIP_ENCRYPTION;
+@@ -985,12 +986,25 @@ public class PreProvisioningActivityController {
+             return verifyActivityAlias(intent, "PreProvisioningActivityAfterEncryption");
+         } else if (ACTION_PROVISION_MANAGED_DEVICE_FROM_TRUSTED_SOURCE.equals(intent.getAction())
+                 || ACTION_PROVISION_FINANCED_DEVICE.equals(intent.getAction())) {
+-            return verifyActivityAlias(intent, "PreProvisioningActivityViaTrustedApp");
++            return verifyTrustedSource(callingPackage)
++                && verifyActivityAlias(intent, "PreProvisioningActivityViaTrustedApp");
+         } else {
+             return verifyCaller(callingPackage);
+         }
+     }
+ 
++    private boolean verifyTrustedSource(String callingPackage) {
++        if (!mSettingsFacade.isDeviceProvisioned(mContext)) {
++            // All trusted sources are allowed if the device is not provisioned.
++            return true;
++        }
++        ProvisionLogger.logd("Checking if " + callingPackage
++                + " is allowed to start provisioning after SUW flow.");
++        // If the device is already provisioned, then we should not allow setup wizard to
++        // start the provisioning flow as a trusted source.
++        return !SETUP_WIZARD_PACKAGE_NAME.equals(callingPackage);
++    }
++
+     private boolean verifyActivityAlias(Intent intent, String activityAlias) {
+         ComponentName componentName = intent.getComponent();
+         if (componentName == null || componentName.getClassName() == null) {
+diff --git a/tests/instrumentation/src/com/android/managedprovisioning/preprovisioning/PreProvisioningActivityControllerTest.java b/tests/instrumentation/src/com/android/managedprovisioning/preprovisioning/PreProvisioningActivityControllerTest.java
+index a926a2c..3493f2c 100644
+--- a/tests/instrumentation/src/com/android/managedprovisioning/preprovisioning/PreProvisioningActivityControllerTest.java
++++ b/tests/instrumentation/src/com/android/managedprovisioning/preprovisioning/PreProvisioningActivityControllerTest.java
+@@ -49,6 +49,7 @@ import static android.app.admin.DevicePolicyManager.STATUS_OK;
+ 
+ import static com.android.managedprovisioning.TestUtils.assertBundlesEqual;
+ import static com.android.managedprovisioning.common.Globals.ACTION_RESUME_PROVISIONING;
++import static com.android.managedprovisioning.common.Globals.SETUP_WIZARD_PACKAGE_NAME;
+ import static com.android.managedprovisioning.model.ProvisioningParams.DEFAULT_LOCAL_TIME;
+ 
+ import static com.google.common.truth.Truth.assertThat;
+@@ -864,6 +865,77 @@ public class PreProvisioningActivityControllerTest {
+         verifyNoMoreInteractions(mUi);
+     }
+ 
++    @Test
++    public void testTrustedSource_setupWizardCallsWhenDeviceProvisioned_fails() throws Exception {
++        // GIVEN a trusted source intent and the device is provisioned
++        mParams = createParams(
++                /* startedByTrustedSource= */ true,
++                /* skipEncryption= */ false,
++                /* wifiSsid= */ null,
++                ACTION_PROVISION_MANAGED_DEVICE_FROM_TRUSTED_SOURCE,
++                TEST_MDM_PACKAGE
++            );
++        prepareMocksForTrustedSourceIntent(mParams);
++        when(mSettingsFacade.isDeviceProvisioned(mContext)).thenReturn(true);
++
++        // WHEN initiating provisioning called by setup wizard
++        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
++            mController.initiateProvisioning(mIntent, SETUP_WIZARD_PACKAGE_NAME);
++        });
++
++        // THEN validation fails and error is shown
++        verify(mUi).showErrorAndClose(eq(R.string.cant_set_up_device),
++                eq(R.string.contact_your_admin_for_help), any(String.class));
++    }
++
++    @Test
++    public void testTrustedSource_setupWizardCallsWhenDeviceNotProvisioned_succeeds()
++            throws Exception {
++        // GIVEN a trusted source intent and the device is not provisioned
++        mParams = createParams(
++                /* startedByTrustedSource= */ true,
++                /* skipEncryption= */ false,
++                /* wifiSsid= */ null,
++                ACTION_PROVISION_MANAGED_DEVICE_FROM_TRUSTED_SOURCE,
++                TEST_MDM_PACKAGE
++            );
++        prepareMocksForTrustedSourceIntent(mParams);
++        when(mSettingsFacade.isDeviceProvisioned(mContext)).thenReturn(false);
++
++        // WHEN initiating provisioning called by setup wizard
++        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
++            mController.initiateProvisioning(mIntent, SETUP_WIZARD_PACKAGE_NAME);
++        });
++
++        // THEN validation succeeds
++        verify(mUi).onParamsValidated(mParams);
++        verify(mUi, never()).showErrorAndClose(anyInt(), anyInt(), anyString());
++    }
++
++      @Test
++    public void testTrustedSource_nonSetupWizardCallsWhenDeviceProvisioned_succeeds()
++            throws Exception {
++        // GIVEN a trusted source intent and the device is not provisioned
++        mParams = createParams(
++                /* startedByTrustedSource= */ true,
++                /* skipEncryption= */ false,
++                /* wifiSsid= */ null,
++                ACTION_PROVISION_MANAGED_DEVICE_FROM_TRUSTED_SOURCE,
++                TEST_MDM_PACKAGE
++            );
++        prepareMocksForTrustedSourceIntent(mParams);
++        when(mSettingsFacade.isDeviceProvisioned(mContext)).thenReturn(true);
++
++        // WHEN initiating provisioning called by trusted source other than Setup Wizard
++        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
++            mController.initiateProvisioning(mIntent, "trusted.source.package.name");
++        });
++
++        // THEN validation succeeds
++        verify(mUi).onParamsValidated(mParams);
++        verify(mUi, never()).showErrorAndClose(anyInt(), anyInt(), anyString());
++    }
++
+     @Test
+     public void testManagedProfile_withEncryption() throws Exception {
+         // GIVEN a device that is not currently encrypted
+-- 
+2.56.0
+

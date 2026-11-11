@@ -1,0 +1,38 @@
+From 9bbdf227480cd6e6072129a3156bb2dd1eb0d6e4 Mon Sep 17 00:00:00 2001
+From: John Reck <jreck@google.com>
+Date: Tue, 2 Jun 2026 16:53:40 -0400
+Subject: [PATCH 20/45] =?utf-8?q?=E6=8B=92=E7=BB=9D=E4=BD=8D=E5=9B=BE?=
+ =?utf-8?q?=E5=8F=8D=E5=BA=8F=E5=88=97=E5=8C=96=E7=9A=84=E9=9B=B6=E8=A1=8C?=
+ =?utf-8?q?=E5=AD=97=E8=8A=82=E6=95=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Fixes: 513648011
+Test: android.security.cts.BitmapTest#test_513648011
+Flag: EXEMPT BUGFIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:67ef036b9060552258b8caaf8e49c85f48da5db1
+Merged-In: Id8044c7518f51569128f890833ba3beef929bb9a
+Change-Id: Id8044c7518f51569128f890833ba3beef929bb9a
+
+(cherry picked from commit c902dcfa694d275ba80254892bb997f887aa6cfb)
+---
+ libs/hwui/jni/Bitmap.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libs/hwui/jni/Bitmap.cpp b/libs/hwui/jni/Bitmap.cpp
+index d97d1bca4..e01c42fad 100644
+--- a/libs/hwui/jni/Bitmap.cpp
++++ b/libs/hwui/jni/Bitmap.cpp
+@@ -849,7 +849,7 @@ static constexpr auto BadParcelableException = "android/os/BadParcelableExceptio
+ 
+ static bool validateImageInfo(const SkImageInfo& info, int32_t rowBytes) {
+     // TODO: Can we avoid making a SkBitmap for this?
+-    return SkBitmap().setInfo(info, rowBytes);
++    return rowBytes > 0 && SkBitmap().setInfo(info, rowBytes);
+ }
+ 
+ static jobject Bitmap_createFromParcel(JNIEnv* env, jobject, jobject parcel) {
+-- 
+2.56.0
+

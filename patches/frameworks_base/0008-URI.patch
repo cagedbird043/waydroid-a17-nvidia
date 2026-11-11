@@ -1,0 +1,44 @@
+From 0d8f45b57fe1da3fcda430f0213fe3412ed35193 Mon Sep 17 00:00:00 2001
+From: Pranit Rane <pranitrane@google.com>
+Date: Tue, 7 Jul 2026 00:09:51 -0700
+Subject: [PATCH 08/45] =?utf-8?q?=E4=B8=A5=E6=A0=BC=E5=8C=B9=E9=85=8D?=
+ =?utf-8?q?=E6=B6=88=E6=81=AF=E5=8D=87=E7=BA=A7=20URI=20=E7=9A=84=E5=A4=A7?=
+ =?utf-8?q?=E5=B0=8F=E5=86=99?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Align the Message Upgrade framework's authority check with the fix in SendRequest by performing a case-sensitive match against "mms" and "sms".
+
+Previously, MessageUpgradeWorker classified the message type case-insensitively using toLowerCase(), causing it to attempt to upgrade case-variant URIs like "MMS". By matching case-sensitively, we immediately reject upgrades for unauthorized case-variant authorities, bypassing the upgrade bind flow and preventing potential service hangs.
+
+Bug: 517377188
+Flag: EXEMPT BUGFIX
+Test: atest MmsServiceRoboTests:com.android.mms.service.MmsRequestRoboTest
+Ignore-AOSP-First: security
+
+(cherry picked from commit 79de22baeaabe3755b2ed7f53dbfe279af5072b1)
+
+Change-Id: Ic09ebb5565d8ddbeacdf5422d77ce2fffae4aff9
+
+(cherry picked from commit d133c0ace50404096021dac5c2c1a5cfced03825)
+---
+ telephony/java/android/telephony/MessageUpgradeWorker.java | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/telephony/java/android/telephony/MessageUpgradeWorker.java b/telephony/java/android/telephony/MessageUpgradeWorker.java
+index 059ce72b2..11f23fc4a 100644
+--- a/telephony/java/android/telephony/MessageUpgradeWorker.java
++++ b/telephony/java/android/telephony/MessageUpgradeWorker.java
+@@ -582,7 +582,7 @@ public class MessageUpgradeWorker {
+             return MessageType.UNKNOWN;
+         }
+ 
+-        return switch (contentUri.getAuthority().toLowerCase()) {
++        return switch (contentUri.getAuthority()) {
+             case AUTHORITY_SMS -> MessageType.SMS;
+             case AUTHORITY_MMS -> MessageType.MMS;
+             default -> MessageType.UNKNOWN;
+-- 
+2.56.0
+

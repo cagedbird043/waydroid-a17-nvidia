@@ -1,0 +1,113 @@
+From 3da76bf75b4b637f164551ea38c6ccea0748845f Mon Sep 17 00:00:00 2001
+From: Iustin Ventaniuc <iustiniv@google.com>
+Date: Mon, 20 Jul 2026 23:49:50 -0700
+Subject: [PATCH 34/45] =?utf-8?q?=E9=98=B2=E6=AD=A2=E9=87=8D=E5=A4=8D?=
+ =?utf-8?q?=E5=8C=85=E5=90=8D=E7=AD=96=E7=95=A5=E5=AF=BC=E8=87=B4=E7=B3=BB?=
+ =?utf-8?q?=E7=BB=9F=E5=90=AF=E5=8A=A8=E5=BE=AA=E7=8E=AF?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Using Set.of on the array split from device_policy_state.xml can throw
+IllegalArgumentException if an admin set a policy containing the
+separator character (;) multiple times. This crashes system_server and
+causes a bootloop. Use HashSet to silently deduplicate elements.
+
+Test: manual
+Bug: 515039631
+Flag: EXEMPT BUGFIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:7f342a57b386d249847c9ec4928ec81f1a759981
+Merged-In: I65259a1b54da30091ddb3c689ef4fb0e01a52c39
+Change-Id: I65259a1b54da30091ddb3c689ef4fb0e01a52c39
+
+(cherry picked from commit 9aee1d8552c117ef08a0285081157a21832be3b8)
+---
+ core/java/android/app/admin/PackageSetPolicyValue.java    | 3 +++
+ .../android/server/devicepolicy/DevicePolicyEngine.java   | 3 ++-
+ .../server/devicepolicy/LockTaskPolicySerializer.java     | 8 +++++++-
+ .../server/devicepolicy/PackageSetPolicySerializer.java   | 8 +++++++-
+ 4 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/core/java/android/app/admin/PackageSetPolicyValue.java b/core/java/android/app/admin/PackageSetPolicyValue.java
+index bf8f6dfc9..74668fcb0 100644
+--- a/core/java/android/app/admin/PackageSetPolicyValue.java
++++ b/core/java/android/app/admin/PackageSetPolicyValue.java
+@@ -52,6 +52,9 @@ public final class PackageSetPolicyValue extends PolicyValue<Set<String>> {
+         super(value);
+         for (String packageName : value) {
+             PolicySizeVerifier.enforceMaxPackageNameLength(packageName);
++            if (packageName.contains(";")) {
++                throw new IllegalArgumentException("Package name cannot contain ';'");
++            }
+         }
+     }
+ 
+diff --git a/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyEngine.java b/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyEngine.java
+index 28384fc5d..e67c8147c 100644
+--- a/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyEngine.java
++++ b/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyEngine.java
+@@ -2585,7 +2585,8 @@ final class DevicePolicyEngine {
+ 
+                 readInnerLocked(parser);
+ 
+-            } catch (XmlPullParserException | IOException | ClassNotFoundException e) {
++            } catch (XmlPullParserException | IOException | ClassNotFoundException
++                    | IllegalArgumentException e) {
+                 Slogf.wtf(TAG, "Error parsing resources file", e);
+             } finally {
+                 IoUtils.closeQuietly(input);
+diff --git a/services/devicepolicy/java/com/android/server/devicepolicy/LockTaskPolicySerializer.java b/services/devicepolicy/java/com/android/server/devicepolicy/LockTaskPolicySerializer.java
+index 13412d05a..891614a16 100644
+--- a/services/devicepolicy/java/com/android/server/devicepolicy/LockTaskPolicySerializer.java
++++ b/services/devicepolicy/java/com/android/server/devicepolicy/LockTaskPolicySerializer.java
+@@ -26,6 +26,8 @@ import com.android.modules.utils.TypedXmlSerializer;
+ import org.xmlpull.v1.XmlPullParserException;
+ 
+ import java.io.IOException;
++import java.util.Arrays;
++import java.util.HashSet;
+ import java.util.Objects;
+ import java.util.Set;
+ 
+@@ -60,7 +62,11 @@ final class LockTaskPolicySerializer extends PolicySerializer<LockTaskPolicy> {
+             Log.e(TAG, "Error parsing LockTask policy value.");
+             return null;
+         }
+-        Set<String> packages = Set.of(packagesStr.split(ATTR_PACKAGES_SEPARATOR));
++        String[] packagesArray = packagesStr.split(ATTR_PACKAGES_SEPARATOR);
++        Set<String> packages = new HashSet<>(Arrays.asList(packagesArray));
++        if (packages.size() != packagesArray.length) {
++            Log.e(TAG, "Duplicate packages found in LockTask policy");
++        }
+         try {
+             int flags = parser.getAttributeInt(
+                     /* namespace= */ null,
+diff --git a/services/devicepolicy/java/com/android/server/devicepolicy/PackageSetPolicySerializer.java b/services/devicepolicy/java/com/android/server/devicepolicy/PackageSetPolicySerializer.java
+index c4da029c6..151ee4cc5 100644
+--- a/services/devicepolicy/java/com/android/server/devicepolicy/PackageSetPolicySerializer.java
++++ b/services/devicepolicy/java/com/android/server/devicepolicy/PackageSetPolicySerializer.java
+@@ -26,6 +26,8 @@ import com.android.modules.utils.TypedXmlPullParser;
+ import com.android.modules.utils.TypedXmlSerializer;
+ 
+ import java.io.IOException;
++import java.util.Arrays;
++import java.util.HashSet;
+ import java.util.Objects;
+ import java.util.Set;
+ 
+@@ -48,7 +50,11 @@ final class PackageSetPolicySerializer extends PolicySerializer<Set<String>> {
+             Log.e(DevicePolicyEngine.TAG, "Error parsing PackageSet policy value.");
+             return null;
+         }
+-        Set<String> values = Set.of(valuesStr.split(ATTR_VALUES_SEPARATOR));
++        String[] valuesArray = valuesStr.split(ATTR_VALUES_SEPARATOR);
++        Set<String> values = new HashSet<>(Arrays.asList(valuesArray));
++        if (values.size() != valuesArray.length) {
++            Log.e(DevicePolicyEngine.TAG, "Duplicate values found in PackageSet policy");
++        }
+         return new PackageSetPolicyValue(values);
+     }
+ }
+-- 
+2.56.0
+

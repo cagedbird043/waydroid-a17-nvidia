@@ -1,0 +1,78 @@
+From 5e60caa7c9ea8bc1e607922fd9c3414bc98285c0 Mon Sep 17 00:00:00 2001
+From: Chris Li <lihongyu@google.com>
+Date: Fri, 17 Jul 2026 06:21:30 +0000
+Subject: [PATCH 26/45] =?utf-8?q?=E6=92=A4=E9=94=80=E9=BB=98=E8=AE=A4=20Ap?=
+ =?utf-8?q?pOp=20=E4=B8=8B=E6=97=A0=E9=9D=99=E6=80=81=E6=9D=83=E9=99=90?=
+ =?utf-8?q?=E7=9A=84=E6=82=AC=E6=B5=AE=E7=AA=97?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+When a temporary OP_SYSTEM_ALERT_WINDOW grant (e.g. from MediaProjection)
+ends, the AppOp mode reverts to MODE_DEFAULT. WindowState.updateAppOpsState()
+should check if the app has the static SYSTEM_ALERT_WINDOW permission
+when the mode is MODE_DEFAULT. If it does not, visibility should be revoked.
+
+Previously, updateAppOpsState() treated MODE_DEFAULT as allowed,
+allowing unprivileged overlays to remain visible after the temporary
+grant expired.
+
+Bug: 523171206
+Test: atest WmTests:WindowStateTests
+Flag: EXEMPT CVE_FIX
+
+TAG=agy
+CONV=fde7ae22-eecb-40fc-8adf-365e8e59f3bf
+
+Merged-In: I6d3b0e8f7eb01afe858bd9091b7dc616dfcf5aaa
+Change-Id: I6d3b0e8f7eb01afe858bd9091b7dc616dfcf5aaa
+
+(cherry picked from commit 8e58fb21f67998161b377242ff432f286e8b78a7)
+---
+ .../java/com/android/server/wm/WindowState.java  | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/services/core/java/com/android/server/wm/WindowState.java b/services/core/java/com/android/server/wm/WindowState.java
+index b3dbfd1eb..90d1d6d44 100644
+--- a/services/core/java/com/android/server/wm/WindowState.java
++++ b/services/core/java/com/android/server/wm/WindowState.java
+@@ -19,6 +19,7 @@ package com.android.server.wm;
+ import static android.app.ActivityTaskManager.INVALID_TASK_ID;
+ import static android.app.AppOpsManager.MODE_ALLOWED;
+ import static android.app.AppOpsManager.MODE_DEFAULT;
++import static android.app.AppOpsManager.OP_SYSTEM_ALERT_WINDOW;
+ import static android.app.AppOpsManager.OP_NONE;
+ import static android.app.WindowConfiguration.ACTIVITY_TYPE_DREAM;
+ import static android.app.WindowConfiguration.ACTIVITY_TYPE_HOME;
+@@ -184,6 +185,7 @@ import static com.android.server.wm.WindowStateAnimator.HAS_DRAWN;
+ import static com.android.server.wm.WindowStateAnimator.PRESERVED_SURFACE_LAYER;
+ import static com.android.server.wm.WindowStateAnimator.READY_TO_SHOW;
+ 
++import android.Manifest;
+ import android.annotation.CallSuper;
+ import android.annotation.NonNull;
+ import android.annotation.Nullable;
+@@ -3318,8 +3320,18 @@ class WindowState extends WindowContainer<WindowState> implements WindowManagerP
+         if (mAppOpVisibility) {
+             // There is a race between the check and the finish calls but this is fine
+             // as this would mean we will get another change callback and will reconcile.
+-            int mode = mWmService.mAppOps.checkOpNoThrow(mAppOp, uid, packageName);
+-            if (mode != MODE_ALLOWED && mode != MODE_DEFAULT) {
++            // OP_SYSTEM_ALERT_WINDOW defaults to MODE_DEFAULT. If the app has the static
++            // SYSTEM_ALERT_WINDOW permission, it is allowed to draw overlays. Otherwise,
++            // we must revoke visibility (e.g. when a temporary grant like MediaProjection ends
++            // and the AppOp reverts to MODE_DEFAULT).
++            final int mode = mWmService.mAppOps.checkOpNoThrow(mAppOp, uid, packageName);
++            final boolean allowed = (mode == MODE_ALLOWED)
++                    || (mAppOp != OP_SYSTEM_ALERT_WINDOW && mode == MODE_DEFAULT)
++                    || (mAppOp == OP_SYSTEM_ALERT_WINDOW && mode == MODE_DEFAULT
++                            && mWmService.mContext.checkPermission(
++                                    Manifest.permission.SYSTEM_ALERT_WINDOW, getPid(), uid)
++                            == PackageManager.PERMISSION_GRANTED);
++            if (!allowed) {
+                 mWmService.mAppOps.finishOp(mAppOp, uid, packageName, null /* featureId */);
+                 setAppOpVisibilityLw(false);
+             }
+-- 
+2.56.0
+

@@ -1,0 +1,114 @@
+From a3057d41917b84ee8000438f94adaaa3ed357784 Mon Sep 17 00:00:00 2001
+From: Yuri Ufimtsev <yufimtsev@google.com>
+Date: Mon, 10 Aug 2026 10:04:29 +0000
+Subject: [PATCH 2/2] =?utf-8?q?=E9=99=90=E5=88=B6=E5=86=85=E5=AE=B9?=
+ =?utf-8?q?=E4=BF=9D=E6=8A=A4=E5=BC=80=E5=85=B3=E4=BB=85=E7=94=B1=E7=AE=A1?=
+ =?utf-8?q?=E7=90=86=E5=91=98=E4=BF=AE=E6=94=B9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Test: manual, atest SettingsRoboTests
+Bug: 518350737
+Flag: EXEMPT BUGFIX
+NO_IFTTT=`ContentProtectionScreenApi` already implements the check, no other changes required
+
+(cherry picked from commit bb861e10980b041dcc27e38a70f209eded28f6f7)
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:b82448970e33e89ca6744c19545c940a00ce9bc7
+Merged-In: I7ff9e94ad53aaf843a32a31ff1bee27af5686f6e
+Change-Id: I7ff9e94ad53aaf843a32a31ff1bee27af5686f6e
+
+(cherry picked from commit 2f16bfe2c784623a324350cd19dae7f6066e2cfb)
+---
+ ...tProtectionTogglePreferenceController.java |  6 ++++
+ ...tectionTogglePreferenceControllerTest.java | 32 +++++++++++++++++--
+ 2 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/src/com/android/settings/security/ContentProtectionTogglePreferenceController.java b/src/com/android/settings/security/ContentProtectionTogglePreferenceController.java
+index 11e7708f56b..6a4f3619062 100644
+--- a/src/com/android/settings/security/ContentProtectionTogglePreferenceController.java
++++ b/src/com/android/settings/security/ContentProtectionTogglePreferenceController.java
+@@ -103,6 +103,12 @@ public class ContentProtectionTogglePreferenceController extends TogglePreferenc
+                         != DevicePolicyManager.CONTENT_PROTECTION_NOT_CONTROLLED_BY_POLICY) {
+             return false;
+         }
++
++        final UserManager userManager = mContext.getSystemService(UserManager.class);
++        if (userManager == null || !userManager.isAdminUser()) {
++            return false;
++        }
++
+         Settings.Global.putInt(
+                 mContentResolver, KEY_CONTENT_PROTECTION_PREFERENCE, isChecked ? 1 : -1);
+         return true;
+diff --git a/tests/robotests/src/com/android/settings/security/ContentProtectionTogglePreferenceControllerTest.java b/tests/robotests/src/com/android/settings/security/ContentProtectionTogglePreferenceControllerTest.java
+index 02428a2dd7e..12e1630b598 100644
+--- a/tests/robotests/src/com/android/settings/security/ContentProtectionTogglePreferenceControllerTest.java
++++ b/tests/robotests/src/com/android/settings/security/ContentProtectionTogglePreferenceControllerTest.java
+@@ -25,20 +25,18 @@ import static com.google.common.truth.Truth.assertThat;
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.Mockito.never;
+ import static org.mockito.Mockito.verify;
+-import static org.mockito.Mockito.mock;
+ import static org.mockito.Mockito.when;
+ 
+ import android.app.admin.DevicePolicyIdentifiers;
+ import android.app.admin.DevicePolicyManager;
+-import android.app.admin.PolicyEnforcementInfo;
+ import android.app.admin.EnforcingAdmin;
++import android.app.admin.PolicyEnforcementInfo;
+ import android.app.admin.UnknownAuthority;
+ import android.content.ComponentName;
+ import android.content.Context;
+ import android.os.UserHandle;
+ import android.platform.test.flag.junit.SetFlagsRule;
+ import android.provider.Settings;
+-import java.util.List;
+ 
+ import androidx.annotation.Nullable;
+ import androidx.preference.PreferenceScreen;
+@@ -61,6 +59,8 @@ import org.mockito.junit.MockitoRule;
+ import org.robolectric.RobolectricTestRunner;
+ import org.robolectric.annotation.Config;
+ 
++import java.util.List;
++
+ @RunWith(RobolectricTestRunner.class)
+ @Config(shadows = {ShadowUtils.class,
+                    ShadowUserManager.class,
+@@ -522,6 +522,32 @@ public class ContentProtectionTogglePreferenceControllerTest {
+         assertThat(getContentProtectionGlobalSetting()).isEqualTo(-1);
+     }
+ 
++    @Test
++    public void onSwitchChanged_switchChecked_nonAdminUser_doesNotChangeSetting() {
++        Settings.Global.putInt(
++                mContext.getContentResolver(), KEY_CONTENT_PROTECTION_PREFERENCE, 0);
++        mShadowUserManager.setIsAdminUser(false);
++        int initialSetting = getContentProtectionGlobalSetting();
++
++        boolean result = mController.setChecked(true);
++
++        assertThat(result).isFalse();
++        assertThat(getContentProtectionGlobalSetting()).isEqualTo(initialSetting);
++    }
++
++    @Test
++    public void onSwitchChanged_switchUnchecked_nonAdminUser_doesNotChangeSetting() {
++        Settings.Global.putInt(
++                mContext.getContentResolver(), KEY_CONTENT_PROTECTION_PREFERENCE, 1);
++        mShadowUserManager.setIsAdminUser(false);
++        int initialSetting = getContentProtectionGlobalSetting();
++
++        boolean result = mController.setChecked(false);
++
++        assertThat(result).isFalse();
++        assertThat(getContentProtectionGlobalSetting()).isEqualTo(initialSetting);
++    }
++
+     private void setUpEnforcingAdmin() {
+         mShadowDevicePolicyManager.setPolicyEnforcementInfoForPolicy(
+                 DevicePolicyIdentifiers.CONTENT_PROTECTION_POLICY,
+-- 
+2.56.0
+

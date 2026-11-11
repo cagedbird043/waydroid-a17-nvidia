@@ -1,0 +1,233 @@
+From 4a1194d6eddc69982a9b6b68da89142b5bcc4f4b Mon Sep 17 00:00:00 2001
+From: Duy Truong <duytruong@google.com>
+Date: Thu, 18 Jun 2026 05:45:27 +0000
+Subject: [PATCH 4/4] =?utf-8?q?=E4=BF=AE=E5=A4=8D=E8=BE=93=E5=85=A5?=
+ =?utf-8?q?=E5=88=86=E5=8F=91=E5=99=A8=E6=B8=85=E7=90=86=E4=BC=A0=E6=84=9F?=
+ =?utf-8?q?=E5=99=A8=E9=98=9F=E5=88=97=E7=9A=84=E8=B6=8A=E7=95=8C=E4=B8=8E?=
+ =?utf-8?q?=E9=87=8A=E6=94=BE=E5=90=8E=E4=BD=BF=E7=94=A8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Bug: 514737201
+
+(cherry picked from commit a96adf2c6e62dbb22299cd83bbb9ea4bc569e985)
+Change-Id: Iced12d7eb43529c281598dbf4581705f26795d68
+---
+ .../dispatcher/InputDispatcher.cpp            | 22 +++---
+ .../tests/FakeInputDispatcherPolicy.cpp       | 13 +++-
+ .../tests/FakeInputDispatcherPolicy.h         | 12 ++++
+ .../tests/InputDispatcher_test.cpp            | 70 +++++++++++++++++++
+ .../inputflinger/tests/TestEventMatchers.h    | 13 ++++
+ 5 files changed, 121 insertions(+), 9 deletions(-)
+
+diff --git a/services/inputflinger/dispatcher/InputDispatcher.cpp b/services/inputflinger/dispatcher/InputDispatcher.cpp
+index 162a544..e852c08 100644
+--- a/services/inputflinger/dispatcher/InputDispatcher.cpp
++++ b/services/inputflinger/dispatcher/InputDispatcher.cpp
+@@ -2160,14 +2160,20 @@ bool InputDispatcher::flushSensor(int deviceId, InputDeviceSensorType sensorType
+             << ", sensorType=" << ftl::enum_string(sensorType).c_str();
+     { // acquire lock
+         std::scoped_lock _l(mLock);
+-
+-        for (auto it = mInboundQueue.begin(); it != mInboundQueue.end(); it++) {
+-            std::shared_ptr<const EventEntry> entry = *it;
+-            if (entry->type == EventEntry::Type::SENSOR) {
+-                it = mInboundQueue.erase(it);
+-                releaseInboundEventLocked(entry);
+-            }
+-        }
++        std::erase_if(mInboundQueue,
++                      [this, deviceId, sensorType](const std::shared_ptr<const EventEntry>& entry)
++                              REQUIRES(mLock) {
++                                  if (entry->type != EventEntry::Type::SENSOR) {
++                                      return false;
++                                  }
++                                  const auto& sensorEntry = static_cast<const SensorEntry&>(*entry);
++                                  if (sensorEntry.deviceId != deviceId ||
++                                      sensorEntry.sensorType != sensorType) {
++                                      return false;
++                                  }
++                                  releaseInboundEventLocked(entry);
++                                  return true;
++                              });
+     }
+     return true;
+ }
+diff --git a/services/inputflinger/tests/FakeInputDispatcherPolicy.cpp b/services/inputflinger/tests/FakeInputDispatcherPolicy.cpp
+index 7949933..e0b0723 100644
+--- a/services/inputflinger/tests/FakeInputDispatcherPolicy.cpp
++++ b/services/inputflinger/tests/FakeInputDispatcherPolicy.cpp
+@@ -68,6 +68,13 @@ void FakeInputDispatcherPolicy::assertFilterInputEventWasNotCalled() {
+     ASSERT_EQ(nullptr, mFilteredEvent);
+ }
+ 
++std::optional<FakeInputDispatcherPolicy::SensorEvent> FakeInputDispatcherPolicy::getSensorEvent(
++        std::chrono::nanoseconds timeout) {
++    std::unique_lock lock(mLock);
++    base::ScopedLockAssertion assumeLocked(mLock);
++    return getItemFromStorageLockedInterruptible(timeout, mSensorEvents, lock, mNotifySensorEvent);
++}
++
+ void FakeInputDispatcherPolicy::assertNotifySwitchWasCalled(const NotifySwitchArgs& args) {
+     std::scoped_lock lock(mLock);
+     ASSERT_TRUE(mLastNotifySwitch);
+@@ -454,7 +461,11 @@ void FakeInputDispatcherPolicy::notifySensorEvent(DeviceId deviceId,
+                                                   InputDeviceSensorType sensorType,
+                                                   InputDeviceSensorAccuracy accuracy,
+                                                   nsecs_t timestamp,
+-                                                  const std::vector<float>& values) {}
++                                                  const std::vector<float>& values) {
++    std::scoped_lock lock(mLock);
++    mSensorEvents.push({deviceId, sensorType, accuracy, timestamp, values});
++    mNotifySensorEvent.notify_all();
++}
+ 
+ void FakeInputDispatcherPolicy::notifySensorAccuracy(DeviceId deviceId,
+                                                      InputDeviceSensorType sensorType,
+diff --git a/services/inputflinger/tests/FakeInputDispatcherPolicy.h b/services/inputflinger/tests/FakeInputDispatcherPolicy.h
+index 677e1f0..f171fee 100644
+--- a/services/inputflinger/tests/FakeInputDispatcherPolicy.h
++++ b/services/inputflinger/tests/FakeInputDispatcherPolicy.h
+@@ -48,6 +48,14 @@ public:
+     FakeInputDispatcherPolicy() = default;
+     virtual ~FakeInputDispatcherPolicy() = default;
+ 
++    struct SensorEvent {
++        DeviceId deviceId;
++        InputDeviceSensorType sensorType;
++        InputDeviceSensorAccuracy accuracy;
++        nsecs_t timestamp;
++        std::vector<float> values;
++    };
++
+     struct AnrResult {
+         sp<IBinder> token{};
+         std::optional<gui::Pid> pid{};
+@@ -142,9 +150,13 @@ public:
+     void assertNoKeysConsumedByPolicy();
+     void assertInterceptKeyBeforeQueueingWasCalled(const ::testing::Matcher<KeyEvent>& matcher);
+ 
++    std::optional<SensorEvent> getSensorEvent(std::chrono::nanoseconds timeout);
++
+ private:
+     std::mutex mLock;
+     std::unique_ptr<InputEvent> mFilteredEvent GUARDED_BY(mLock);
++    std::queue<SensorEvent> mSensorEvents GUARDED_BY(mLock);
++    std::condition_variable mNotifySensorEvent;
+     sp<IBinder> mOnPointerDownToken GUARDED_BY(mLock);
+     std::optional<NotifySwitchArgs> mLastNotifySwitch GUARDED_BY(mLock);
+ 
+diff --git a/services/inputflinger/tests/InputDispatcher_test.cpp b/services/inputflinger/tests/InputDispatcher_test.cpp
+index f5ea1ca..d428a0f 100644
+--- a/services/inputflinger/tests/InputDispatcher_test.cpp
++++ b/services/inputflinger/tests/InputDispatcher_test.cpp
+@@ -64,8 +64,10 @@ using android::os::InputEventInjectionSync;
+ namespace android::inputdispatcher {
+ 
+ using namespace ftl::flag_operators;
++using android::WithSensorEvent;
+ using testing::AllOf;
+ using testing::Not;
++using testing::Optional;
+ using testing::Pointee;
+ using testing::UnorderedElementsAre;
+ 
+@@ -16723,4 +16725,72 @@ INSTANTIATE_TEST_SUITE_P(
+             return std::string{std::get<0>(p.param)};
+         });
+ 
++TEST_F(InputDispatcherTest, FlushSensor_EraseTailElement) {
++    std::shared_ptr<FakeApplicationHandle> application = std::make_shared<FakeApplicationHandle>();
++    sp<FakeWindowHandle> window =
++            sp<FakeWindowHandle>::make(application, mDispatcher, "Test Window",
++                                       ui::LogicalDisplayId::DEFAULT);
++    mDispatcher->setFocusedApplication(ui::LogicalDisplayId::DEFAULT, application);
++    window->setFocusable(true);
++    mDispatcher->onWindowInfosChanged({{*window->getInfo()}, {}, 0, 0});
++    setFocusedWindow(window);
++    window->consumeFocusEvent(true);
++
++    // Freeze dispatch to ensure the events stay in the queue and get processed together when
++    // the 'flushSensor' call is issued.
++    mDispatcher->setInputDispatchMode(/*enabled=*/true, /*frozen=*/true);
++    // Notify key event at head of queue
++    mDispatcher->notifyKey(
++            KeyArgsBuilder(AKEY_EVENT_ACTION_DOWN, AINPUT_SOURCE_KEYBOARD).deviceId(1).build());
++    // Notify sensor event at tail of queue
++    NotifySensorArgs sensorArgs(/*id=*/2, /*eventTime=*/20, /*deviceId=*/1, AINPUT_SOURCE_SENSOR,
++                                InputDeviceSensorType::ACCELEROMETER,
++                                InputDeviceSensorAccuracy::HIGH, /*accuracyChanged=*/false,
++                                /*hwTimestamp=*/20, {1.0f, 2.0f, 3.0f});
++    mDispatcher->notifySensor(sensorArgs);
++    // Erasing the tail sensor element
++    mDispatcher->flushSensor(/*deviceId=*/1, InputDeviceSensorType::ACCELEROMETER);
++    // Now we can unfreeze dispatch so that the dispatcher can process these.
++    mDispatcher->setInputDispatchMode(/*enabled=*/true, /*frozen=*/false);
++
++    // Verify the sensor event was flushed and NOT dispatched to policy
++    std::optional<FakeInputDispatcherPolicy::SensorEvent> sensorEvent =
++            mFakePolicy->getSensorEvent(10ms);
++    ASSERT_THAT(sensorEvent,
++                Not(Optional(
++                        WithSensorEvent(/*deviceId=*/1, InputDeviceSensorType::ACCELEROMETER))));
++    // Verify the key event was preserved and dispatched to the window
++    window->consumeKeyDown(ui::LogicalDisplayId::DEFAULT);
++}
++
++TEST_F(InputDispatcherTest, FlushSensor_OnlyErasesMatchingDeviceIdAndSensorType) {
++    // Freeze dispatch to ensure the events stay in the queue and get processed together when
++    // the 'flushSensor' call is issued.
++    mDispatcher->setInputDispatchMode(/*enabled=*/true, /*frozen=*/true);
++    // Device 1, GYROSCOPE (Different sensorType)
++    NotifySensorArgs args3(/*id=*/3, /*eventTime=*/30, /*deviceId=*/1, AINPUT_SOURCE_SENSOR,
++                           InputDeviceSensorType::GYROSCOPE, InputDeviceSensorAccuracy::HIGH,
++                           /*accuracyChanged=*/false,
++                           /*hwTimestamp=*/30, {1.0f, 2.0f, 3.0f});
++    mDispatcher->notifySensor(args3);
++    mDispatcher->flushSensor(/*deviceId=*/1, InputDeviceSensorType::ACCELEROMETER);
++    // Now we can unfreeze dispatch so that the dispatcher can process these.
++    mDispatcher->setInputDispatchMode(/*enabled=*/true, /*frozen=*/false);
++    std::optional<FakeInputDispatcherPolicy::SensorEvent> sensorEvent =
++            mFakePolicy->getSensorEvent(5s);
++    ASSERT_THAT(sensorEvent, Optional(WithSensorEvent(1, InputDeviceSensorType::GYROSCOPE)));
++
++    mDispatcher->setInputDispatchMode(/*enabled=*/true, /*frozen=*/true);
++    // Device 2, ACCELEROMETER (Different deviceId)
++    NotifySensorArgs args2(/*id=*/2, /*eventTime=*/20, /*deviceId=*/2, AINPUT_SOURCE_SENSOR,
++                           InputDeviceSensorType::ACCELEROMETER, InputDeviceSensorAccuracy::HIGH,
++                           /*accuracyChanged=*/false,
++                           /*hwTimestamp=*/20, {1.0f, 2.0f, 3.0f});
++    mDispatcher->notifySensor(args2);
++    mDispatcher->flushSensor(/*deviceId=*/1, InputDeviceSensorType::ACCELEROMETER);
++    mDispatcher->setInputDispatchMode(/*enabled=*/true, /*frozen=*/false);
++    sensorEvent = mFakePolicy->getSensorEvent(5s);
++    ASSERT_THAT(sensorEvent, Optional(WithSensorEvent(2, InputDeviceSensorType::ACCELEROMETER)));
++}
++
+ } // namespace android::inputdispatcher
+diff --git a/services/inputflinger/tests/TestEventMatchers.h b/services/inputflinger/tests/TestEventMatchers.h
+index 4a5a4dd..18405d0 100644
+--- a/services/inputflinger/tests/TestEventMatchers.h
++++ b/services/inputflinger/tests/TestEventMatchers.h
+@@ -1073,4 +1073,17 @@ MATCHER_P(WithCaptureEnable, isEnable,
+     return arg.request.isEnable() == isEnable;
+ }
+ 
++// --- FakeInputDispatcherPolicy::SensorEvent ---
++
++MATCHER_P2(WithSensorEvent, expectedDeviceId, expectedSensorType,
++           "SensorEvent with specified deviceId and sensorType") {
++    bool match = arg.deviceId == expectedDeviceId && arg.sensorType == expectedSensorType;
++    if (!match) {
++        *result_listener << "expected deviceId " << expectedDeviceId << " and sensorType "
++                         << ftl::enum_string(expectedSensorType) << ", but got deviceId "
++                         << arg.deviceId << " and sensorType " << ftl::enum_string(arg.sensorType);
++    }
++    return match;
++}
++
+ } // namespace android
+-- 
+2.56.0
+

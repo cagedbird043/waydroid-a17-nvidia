@@ -1,0 +1,32 @@
+From 63351cc745327106cc3a16bfad7cb62036723cc9 Mon Sep 17 00:00:00 2001
+From: Michael Bestas <mkbestas@lineageos.org>
+Date: Tue, 3 Nov 2026 02:13:28 +0200
+Subject: [PATCH 2/3] =?utf-8?q?=E4=B8=BA=E5=8D=81=E4=B8=80=E6=9C=88?=
+ =?utf-8?q?=E5=AE=89=E5=85=A8=E6=9B=B4=E6=96=B0=E5=88=87=E6=8D=A2=20gsid?=
+ =?utf-8?q?=20=E6=BA=90=E4=BB=93=E5=BA=93?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit 066d774)
+Change-Id: I3f084d100beaf99f72a3bb8668e5740814e3f160
+---
+ default.xml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/default.xml b/default.xml
+index cab5e13..995267d 100644
+--- a/default.xml
++++ b/default.xml
+@@ -947,7 +947,7 @@
+   <project path="system/fs/casefolding_remover" name="platform/system/fs/casefolding_remover" groups="pdk" remote="aosp" />
+   <project path="system/fs/fs_mgr" name="LineageOS/android_system_fs_fs_mgr" groups="pdk" />
+   <project path="system/gatekeeper" name="platform/system/gatekeeper" groups="pdk" remote="aosp" />
+-  <project path="system/gsid" name="platform/system/gsid" groups="pdk" remote="aosp" />
++  <project path="system/gsid" name="LineageOS/android_system_gsid" groups="pdk" />
+   <project path="system/hardware/interfaces" name="platform/system/hardware/interfaces" groups="pdk,sysui-studio" remote="aosp" />
+   <project path="system/hwservicemanager" name="platform/system/hwservicemanager" groups="pdk" remote="aosp" />
+   <project path="system/incremental_delivery" name="platform/system/incremental_delivery" groups="pdk" remote="aosp" />
+-- 
+2.56.0
+

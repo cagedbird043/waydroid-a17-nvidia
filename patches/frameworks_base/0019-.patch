@@ -1,0 +1,597 @@
+From 62e39945917ff144a93c775d535fd56619bf5560 Mon Sep 17 00:00:00 2001
+From: Valentin Iftime <valiiftime@google.com>
+Date: Fri, 26 Jun 2026 16:52:02 +0200
+Subject: [PATCH 19/45] =?utf-8?q?=E9=99=90=E5=88=B6=E9=80=9A=E7=9F=A5?=
+ =?utf-8?q?=E7=9B=91=E5=90=AC=E5=99=A8=E6=8C=89=E5=BA=94=E7=94=A8=E5=88=9B?=
+ =?utf-8?q?=E5=BB=BA=E9=80=9A=E9=81=93=E7=9A=84=E6=95=B0=E9=87=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Adds a maximum nuber of channels that a NLS can create for a specific package, in addition to the existing global maximum channels limit.
+
+Flag: EXEMPT BUGFIX
+Test: atest NotificationListenerStatsTest
+Bug: 497237282
+
+Change-Id: Ib20da16b8be735d959649a19c6da693b17acbcfe
+(cherry picked from commit 373a48df524e8b5026ef736738ba1e49f414cc91)
+
+(cherry picked from commit 77003ca27f7c99ba82a00412e049e73770896028)
+---
+ .../NotificationListenerStats.java            | 138 +++++++++++--
+ .../NotificationManagerService.java           |   4 +-
+ .../NotificationListenerStatsTest.java        | 188 ++++++++++++++++++
+ .../NotificationManagerServiceTest.java       |  75 ++++++-
+ .../NotificationManagerServiceZenTest.java    |   3 +-
+ 5 files changed, 382 insertions(+), 26 deletions(-)
+ create mode 100644 services/tests/uiservicestests/src/com/android/server/notification/NotificationListenerStatsTest.java
+
+diff --git a/services/core/java/com/android/server/notification/NotificationListenerStats.java b/services/core/java/com/android/server/notification/NotificationListenerStats.java
+index 3584e3176..d62f9e5a1 100644
+--- a/services/core/java/com/android/server/notification/NotificationListenerStats.java
++++ b/services/core/java/com/android/server/notification/NotificationListenerStats.java
+@@ -16,7 +16,8 @@
+ 
+ package com.android.server.notification;
+ 
+-import android.util.SparseIntArray;
++import android.util.ArrayMap;
++import android.util.SparseArray;
+ 
+ import com.android.internal.annotations.GuardedBy;
+ import com.android.internal.annotations.VisibleForTesting;
+@@ -40,39 +41,98 @@ class NotificationListenerStats {
+      */
+     private static final int MAX_CHANNELS = 5_000;
+ 
++    /**
++     * Maximum number of channels that a single NLS is allowed to create <em>per package</em>.
++     * Each package can have a total of {@link PreferencesHelper#NOTIFICATION_CHANNEL_COUNT_LIMIT}
++     * channels. This constrains the subset of those that can be conversations added by an NLS,
++     * so that it doesn't fill up the entire channel allocation. Prevents legitimate, app-requested
++     * channel creations being blocked.
++     *
++     * @see PreferencesHelper#NOTIFICATION_CHANNEL_COUNT_LIMIT
++     */
++    private static final int MAX_CHANNELS_PER_PKG = 1_000;
++
+     private static final String TAG_STATS = "nlsStats";
+     private static final String TAG_NLS = "nls";
+     private static final String ATT_UID = "uid";
+     private static final String ATT_OWNED_CHANNEL_COUNT = "channelCount";
++    private static final String TAG_PKG = "pkg";
++    private static final String ATT_PKG_NAME = "name";
++    private static final String ATT_PKG_CHANNEL_COUNT = "channelCount";
+ 
+     private final Object mLock = new Object();
+ 
+-    // nlsUid => count of channels created by that (privileged) NLS.
++    // nlsUid => {total, packageName => count }
+     @GuardedBy("mLock")
+-    private final SparseIntArray mChannelsCreated = new SparseIntArray();
++    private final SparseArray<ChannelCount> mChannelsCreated = new SparseArray<>();
++
++    record ChannelCount(int total, ArrayMap<String, Integer> pkgMap) {
++        private ChannelCount withRemovedPackage(String packageName) {
++            if (pkgMap != null) {
++                Integer count = pkgMap.remove(packageName);
++                if (count != null && count > 0) {
++                    return new ChannelCount(Math.max(0, total - count), pkgMap);
++                }
++            }
++            return this;
++        }
++
++        private ChannelCount withCreatedChannels(String packageName, int increase) {
++            ArrayMap<String, Integer> map = pkgMap;
++            if (map == null) {
++                map = new ArrayMap<>();
++            }
++            int prevPkgCreated = map.getOrDefault(packageName, 0);
++            map.put(packageName, prevPkgCreated + increase);
++
++            return new ChannelCount(total + increase, map);
++        }
++    }
+ 
+     private final int mMaxChannelsAllowed;
++    private final int mMaxChannelsPerPkgAllowed;
+ 
+     NotificationListenerStats() {
+-        this(MAX_CHANNELS);
++        this(MAX_CHANNELS, MAX_CHANNELS_PER_PKG);
+     }
+ 
+     @VisibleForTesting
+-    NotificationListenerStats(int maxChannelsAllowed) {
++    NotificationListenerStats(int maxChannelsAllowed, int maxChannelsPerPkgAllowed) {
+         mMaxChannelsAllowed = maxChannelsAllowed;
++        mMaxChannelsPerPkgAllowed = maxChannelsPerPkgAllowed;
+     }
+ 
+-    boolean isAllowedToCreateChannel(ManagedServiceInfo nls) {
++    boolean isAllowedToCreateChannel(ManagedServiceInfo nls, String pkg) {
+         synchronized (mLock) {
+-            int numCreated = mChannelsCreated.get(nls.uid);
+-            return numCreated < mMaxChannelsAllowed;
++            ChannelCount channelCount = mChannelsCreated.get(nls.uid);
++            if (channelCount == null) {
++                return true;
++            }
++
++            int numCreated = channelCount.total;
++            if (numCreated >= mMaxChannelsAllowed) {
++                return false;
++            }
++
++            ArrayMap<String, Integer> pkgMap = channelCount.pkgMap;
++            if (pkgMap != null) {
++                int numPkgCreated = pkgMap.getOrDefault(pkg, 0);
++                return numPkgCreated < mMaxChannelsPerPkgAllowed;
++            }
+         }
++        return true;
+     }
+ 
+-    void logCreatedChannels(ManagedServiceInfo nls, int increase) {
++    void logCreatedChannels(ManagedServiceInfo nls, String pkg, int increase) {
+         synchronized (mLock) {
+-            int prevCreated = mChannelsCreated.get(nls.uid);
+-            mChannelsCreated.put(nls.uid, prevCreated + increase);
++            ChannelCount channelCount = mChannelsCreated.get(nls.uid);
++            if (channelCount != null) {
++                mChannelsCreated.put(nls.uid, channelCount.withCreatedChannels(pkg, increase));
++            } else {
++                ArrayMap<String, Integer> pkgMap = new ArrayMap<>();
++                pkgMap.put(pkg, increase);
++                mChannelsCreated.put(nls.uid, new ChannelCount(increase, pkgMap));
++            }
+         }
+     }
+ 
+@@ -80,6 +140,14 @@ class NotificationListenerStats {
+         // If the uninstalled package was an NLS, drop its stats.
+         synchronized (mLock) {
+             mChannelsCreated.delete(uid);
++
++            // If the uninstalled package was a target package, we should also clean it up
++            // from other NLSs' stats, and update their total counts.
++            for (int i = 0; i < mChannelsCreated.size(); i++) {
++                int nlsUid = mChannelsCreated.keyAt(i);
++                mChannelsCreated.put(nlsUid,
++                        mChannelsCreated.get(nlsUid).withRemovedPackage(packageName));
++            }
+         }
+     }
+ 
+@@ -91,9 +159,20 @@ class NotificationListenerStats {
+         out.startTag(null, TAG_STATS);
+         synchronized (mLock) {
+             for (int i = 0; i < mChannelsCreated.size(); i++) {
++                int uid = mChannelsCreated.keyAt(i);
+                 out.startTag(null, TAG_NLS);
+-                out.attributeInt(null, ATT_UID, mChannelsCreated.keyAt(i));
+-                out.attributeInt(null, ATT_OWNED_CHANNEL_COUNT, mChannelsCreated.valueAt(i));
++                out.attributeInt(null, ATT_UID, uid);
++                out.attributeInt(null, ATT_OWNED_CHANNEL_COUNT, mChannelsCreated.valueAt(i).total);
++
++                ArrayMap<String, Integer> pkgMap = mChannelsCreated.get(uid).pkgMap;
++                if (pkgMap != null) {
++                    for (int j = 0; j < pkgMap.size(); j++) {
++                        out.startTag(null, TAG_PKG);
++                        out.attribute(null, ATT_PKG_NAME, pkgMap.keyAt(j));
++                        out.attributeInt(null, ATT_PKG_CHANNEL_COUNT, pkgMap.valueAt(j));
++                        out.endTag(null, TAG_PKG);
++                    }
++                }
+                 out.endTag(null, TAG_NLS);
+             }
+         }
+@@ -107,6 +186,7 @@ class NotificationListenerStats {
+         if (!TAG_STATS.equals(tag)) return;
+ 
+         synchronized (mLock) {
++            ArrayMap<String, Integer> currentPkgMap = null;
+             while ((type = parser.next()) != XmlPullParser.END_DOCUMENT) {
+                 tag = parser.getName();
+                 if (type == XmlPullParser.END_TAG && TAG_STATS.equals(tag)) {
+@@ -114,9 +194,24 @@ class NotificationListenerStats {
+                 }
+                 if (type == XmlPullParser.START_TAG) {
+                     if (TAG_NLS.equals(tag)) {
+-                        int uid = parser.getAttributeInt(null, ATT_UID, 0);
++                        int currentUid = parser.getAttributeInt(null, ATT_UID, 0);
+                         int channelCount = parser.getAttributeInt(null, ATT_OWNED_CHANNEL_COUNT, 0);
+-                        mChannelsCreated.put(uid, channelCount);
++                        currentPkgMap = new ArrayMap<>();
++                        mChannelsCreated.put(currentUid,
++                                new ChannelCount(channelCount, currentPkgMap));
++                    } else if (TAG_PKG.equals(tag)) {
++                        if (currentPkgMap != null) {
++                            String pkgName = parser.getAttributeValue(null, ATT_PKG_NAME);
++                            int channelCount = parser.getAttributeInt(
++                                    null, ATT_PKG_CHANNEL_COUNT, 0);
++                            if (pkgName != null) {
++                                currentPkgMap.put(pkgName, channelCount);
++                            }
++                        }
++                    }
++                } else if (type == XmlPullParser.END_TAG) {
++                    if (TAG_NLS.equals(tag)) {
++                        currentPkgMap = null;
+                     }
+                 }
+             }
+@@ -126,8 +221,17 @@ class NotificationListenerStats {
+     void dump(PrintWriter pw, String prefix) {
+         synchronized (mLock) {
+             for (int i = 0; i < mChannelsCreated.size(); i++) {
+-                pw.println(prefix + "NLS with uid " + mChannelsCreated.keyAt(i));
+-                pw.println(prefix + "  created channel count: " + mChannelsCreated.valueAt(i));
++                int uid = mChannelsCreated.keyAt(i);
++                ChannelCount count = mChannelsCreated.get(uid);
++                pw.println(prefix + "NLS with uid " + uid);
++                pw.println(prefix + "  created channel count: " + count.total);
++                if (count.pkgMap != null) {
++                    pw.println(prefix + "  per package:");
++                    for (int j = 0; j < count.pkgMap.size(); j++) {
++                        pw.println(prefix + "    " + count.pkgMap.keyAt(j)
++                                + ": " + count.pkgMap.valueAt(j));
++                    }
++                }
+             }
+         }
+     }
+diff --git a/services/core/java/com/android/server/notification/NotificationManagerService.java b/services/core/java/com/android/server/notification/NotificationManagerService.java
+index c7997ff26..409bc8dfc 100644
+--- a/services/core/java/com/android/server/notification/NotificationManagerService.java
++++ b/services/core/java/com/android/server/notification/NotificationManagerService.java
+@@ -7742,7 +7742,7 @@ public class NotificationManagerService extends SystemService {
+             ManagedServiceInfo nlsInfo = verifyPrivilegedListener(token, user, true);
+             if (!nlsInfo.isSystemUi()
+                     && !isNotificationAssistant(nlsInfo.service)
+-                    && !mNotificationListenerStats.isAllowedToCreateChannel(nlsInfo)) {
++                    && !mNotificationListenerStats.isAllowedToCreateChannel(nlsInfo, pkg)) {
+                 Slog.e(TAG, "NLS " + nlsInfo + " has created too many channels already! "
+                         + "Rejecting " + pkg + "/" + user + "/" + parentId + "/" + conversationId);
+                 return null;
+@@ -7778,7 +7778,7 @@ public class NotificationManagerService extends SystemService {
+             NotificationChannel created = mPreferencesHelper.getConversationNotificationChannel(
+                     pkg, uid, parentId, conversationId, false, false);
+             if (created != null) {
+-                mNotificationListenerStats.logCreatedChannels(nlsInfo, /* increase= */ 1);
++                mNotificationListenerStats.logCreatedChannels(nlsInfo, pkg, /* increase= */ 1);
+                 handleSavePolicyFile();
+             }
+ 
+diff --git a/services/tests/uiservicestests/src/com/android/server/notification/NotificationListenerStatsTest.java b/services/tests/uiservicestests/src/com/android/server/notification/NotificationListenerStatsTest.java
+new file mode 100644
+index 000000000..70d24679d
+--- /dev/null
++++ b/services/tests/uiservicestests/src/com/android/server/notification/NotificationListenerStatsTest.java
+@@ -0,0 +1,188 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.server.notification;
++
++import static com.google.common.truth.Truth.assertThat;
++
++import static org.mockito.Mockito.mock;
++
++import android.util.Xml;
++
++import androidx.test.ext.junit.runners.AndroidJUnit4;
++
++import com.android.modules.utils.TypedXmlPullParser;
++import com.android.modules.utils.TypedXmlSerializer;
++import com.android.server.UiServiceTestCase;
++import com.android.server.notification.ManagedServices.ManagedServiceInfo;
++
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.nio.charset.StandardCharsets;
++
++@RunWith(AndroidJUnit4.class)
++public class NotificationListenerStatsTest extends UiServiceTestCase {
++
++    private NotificationListenerStats mStats;
++    private ManagedServiceInfo mNls1;
++    private ManagedServiceInfo mNls2;
++
++    @Before
++    public void setUp() {
++        mStats = new NotificationListenerStats(10, 5); // Max 10 total, Max 5 per pkg
++        mNls1 = mock(ManagedServiceInfo.class);
++        mNls1.uid = 101;
++        mNls2 = mock(ManagedServiceInfo.class);
++        mNls2.uid = 102;
++    }
++
++    @Test
++    public void testLogCreatedChannels() {
++        mStats.logCreatedChannels(mNls1, "pkg1", 2);
++        mStats.logCreatedChannels(mNls1, "pkg2", 3);
++        mStats.logCreatedChannels(mNls2, "pkg1", 4);
++
++        // NLS1 total: 5, pkg1: 2, pkg2: 3. Limits: 10 total, 5 per pkg. Allowed.
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg1")).isTrue();
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg2")).isTrue();
++
++        mStats.logCreatedChannels(mNls1, "pkg2", 5); // NLS1 total now 10.
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg1")).isFalse(); // Reached total limit
++    }
++
++    @Test
++    public void testMaxChannelsPerPkgLimit() {
++        // Limits: 10 total, 5 per pkg.
++        mStats.logCreatedChannels(mNls1, "pkg1", 4);
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg1")).isTrue();
++
++        mStats.logCreatedChannels(mNls1, "pkg1", 1);
++        // Not allowed for pkg1
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg1")).isFalse();
++
++        // Still allowed for pkg2 because total is 5 < 10
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg2")).isTrue();
++
++        mStats.logCreatedChannels(mNls1, "pkg2", 5); // Total now 10
++        // Reached total limit
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg2")).isFalse();
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg3")).isFalse();
++    }
++
++    @Test
++    public void testOnPackageRemoved_NlsRemoved() {
++        mStats.logCreatedChannels(mNls1, "pkg1", 5);
++        mStats.logCreatedChannels(mNls2, "pkg1", 3);
++
++        // Remove NLS1
++        mStats.onPackageRemoved(mNls1.uid, "some.nls.package");
++
++        // NLS1 stats should be gone, so it should be allowed to create channels again.
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg1")).isTrue();
++
++        // NLS2 should be unaffected. It has 3 channels for pkg1. Limit is 5.
++        // If we add 7 more, total becomes 10 (reaches limit).
++        mStats.logCreatedChannels(mNls2, "pkg1", 7);
++        assertThat(mStats.isAllowedToCreateChannel(mNls2, "pkg1")).isFalse();
++    }
++
++    @Test
++    public void testOnPackageRemoved_TargetPackageRemoved() {
++        mStats.logCreatedChannels(mNls1, "pkg1", 5);
++        mStats.logCreatedChannels(mNls1, "pkg2", 3);
++        mStats.logCreatedChannels(mNls2, "pkg1", 4);
++
++        // UID of target package doesn't matter for target removal
++        mStats.onPackageRemoved(999, "pkg1");
++
++        // NLS1 should have lost "pkg1" stats (5 channels), total should be 3 (pkg2).
++        // NLS2 should have lost "pkg1" stats (4 channels), total should be 0.
++
++        // We can verify by adding more and checking limits.
++        // NLS1 total limit is 10. It has 3 (pkg2). pkg2 limit is 5. It has 3.
++        // We can add 1 more to pkg2. Total 4, pkg2 4. Allowed.
++        mStats.logCreatedChannels(mNls1, "pkg2", 1);
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg2")).isTrue();
++
++        // Add 1 more to pkg2. Total 5, pkg2 5. Not allowed for pkg2 (reached pkg limit).
++        mStats.logCreatedChannels(mNls1, "pkg2", 1);
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg2")).isFalse();
++        // But allowed for pkg3 (pkg3 has 0, total is 5 < 10).
++        assertThat(mStats.isAllowedToCreateChannel(mNls1, "pkg3")).isTrue();
++
++        // Also check that NLS2 was cleaned up
++        mStats.logCreatedChannels(mNls2, "pkg1", 5);
++        assertThat(mStats.isAllowedToCreateChannel(mNls2, "pkg2")).isTrue();
++    }
++
++    @Test
++    public void testXmlSerialization() throws Exception {
++        mStats.logCreatedChannels(mNls1, "pkg1", 2);
++        mStats.logCreatedChannels(mNls1, "pkg2", 3);
++        mStats.logCreatedChannels(mNls2, "pkg1", 4);
++
++        // Write to XML
++        ByteArrayOutputStream baos = new ByteArrayOutputStream();
++        TypedXmlSerializer serializer = Xml.newFastSerializer();
++        serializer.setOutput(baos, StandardCharsets.UTF_8.name());
++        serializer.startDocument(null, true);
++        mStats.writeXml(serializer);
++        serializer.endDocument();
++        serializer.flush();
++
++        // Read from XML (restore with same limits: 10 total, 5 per pkg)
++        NotificationListenerStats restoredStats = new NotificationListenerStats(10, 5);
++        ByteArrayInputStream bais = new ByteArrayInputStream(baos.toByteArray());
++        TypedXmlPullParser parser = Xml.resolvePullParser(bais);
++
++        // Find start tag
++        int type;
++        while ((type = parser.next()) != TypedXmlPullParser.END_DOCUMENT) {
++            if (type == TypedXmlPullParser.START_TAG
++                    && NotificationListenerStats.isXmlTag(parser.getName())) {
++                restoredStats.readXml(parser);
++                break;
++            }
++        }
++
++        // Verify restored stats
++        // NLS1 has: pkg1 (2), pkg2 (3). Total 5.
++        // NLS2 has: pkg1 (4). Total 4.
++
++        // Add 2 to NLS2 pkg1 -> NLS2 pkg1 becomes 6 (exceeds 5).
++        restoredStats.logCreatedChannels(mNls2, "pkg1", 2);
++        // Reached pkg limit
++        assertThat(restoredStats.isAllowedToCreateChannel(mNls2, "pkg1")).isFalse();
++        // Total is 6 < 10, so pkg2 allowed
++        assertThat(restoredStats.isAllowedToCreateChannel(mNls2, "pkg2")).isTrue();
++
++        // Also verify that package stats were restored by removing a package and checking
++        // if quota is reclaimed.
++        restoredStats.onPackageRemoved(999, "pkg1");
++        // NLS1 had: pkg1 (2), pkg2 (3). Total 5.
++        // After removing pkg1, NLS1 should have: pkg2 (3). Total 3.
++        // pkg2 limit is 5. It has 3. We can add 2. Total 5, pkg2 5.
++        restoredStats.logCreatedChannels(mNls1, "pkg2", 2);
++        // Reached pkg limit
++        assertThat(restoredStats.isAllowedToCreateChannel(mNls1, "pkg2")).isFalse();
++        // Total is 5 < 10, so pkg3 allowed
++        assertThat(restoredStats.isAllowedToCreateChannel(mNls1, "pkg3")).isTrue();
++    }
++}
+diff --git a/services/tests/uiservicestests/src/com/android/server/notification/NotificationManagerServiceTest.java b/services/tests/uiservicestests/src/com/android/server/notification/NotificationManagerServiceTest.java
+index ef0f577ee..ff009c17d 100644
+--- a/services/tests/uiservicestests/src/com/android/server/notification/NotificationManagerServiceTest.java
++++ b/services/tests/uiservicestests/src/com/android/server/notification/NotificationManagerServiceTest.java
+@@ -405,6 +405,7 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
+     private static final String REDACTED_TEXT = "redacted text";
+ 
+     private static final int MAX_CHANNELS_CREATED_BY_NLS_FOR_TESTING = 10;
++    private static final int MAX_CHANNELS_PER_PKG_CREATED_BY_NLS_FOR_TESTING = 6;
+ 
+     private final NotificationChannel mParentChannel =
+             new NotificationChannel(PARENT_CHANNEL_ID, "parentName", IMPORTANCE_DEFAULT);
+@@ -917,7 +918,8 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
+                 mToastRateLimiter, mPermissionHelper, mock(UsageStatsManagerInternal.class),
+                 mTelecomManager, mLogger, mTestFlagResolver, mPermissionManager, mPowerManager,
+                 mPostNotificationTrackerFactory, mUiEventLogger, mBitmapOffloader,
+-                new NotificationListenerStats(MAX_CHANNELS_CREATED_BY_NLS_FOR_TESTING),
++                new NotificationListenerStats(MAX_CHANNELS_CREATED_BY_NLS_FOR_TESTING,
++                        MAX_CHANNELS_PER_PKG_CREATED_BY_NLS_FOR_TESTING),
+                 mNotificationRecordLogger, mNotificationInstanceIdSequence,
+                 new TestPreferencesHelperFactory());
+ 
+@@ -5877,23 +5879,43 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
+     @RequiresFlagsEnabled(FLAG_NOTIFICATION_CONVERSATION_CHANNEL_MANAGEMENT)
+     public void createConversationChannelForPkgFromPrivilegedListener_tooManyChannels_ignored()
+             throws Exception {
++        when(mPackageManager.getPackageUid(eq(PKG_O), anyLong(),  anyInt())).thenReturn(UID_O);
+         NotificationChannel parentChannel = mTestNotificationChannel.copy();
+-        mService.mPreferencesHelper.createNotificationChannel(mPkg, mUid, parentChannel, true,
++        mService.mPreferencesHelper.createNotificationChannel(PKG_O, UID_O, parentChannel, true,
+                 false, mUid, false);
+         when(mCompanionMgr.getAssociations(mPkg, mUserId))
+                 .thenReturn(singletonList(mock(AssociationInfo.class)));
+ 
+-        for (int i = 1; i <= MAX_CHANNELS_CREATED_BY_NLS_FOR_TESTING; i++) {
++        // Add 6 channels for PKG_O
++        for (int i = 1; i <= MAX_CHANNELS_PER_PKG_CREATED_BY_NLS_FOR_TESTING; i++) {
+             NotificationChannel createdConversation = mBinderService
+                     .createConversationNotificationChannelForPackageFromPrivilegedListener(
+-                            mListener, mPkg, mUser, parentChannel.getId(), "conversation #" + i);
++                            mListener, PKG_O, mUser, parentChannel.getId(), "conversation #" + i);
+             assertThat(createdConversation).isNotNull();
+             assertThat(createdConversation.getParentChannelId()).isEqualTo(parentChannel.getId());
+         }
+         ParceledListSlice<NotificationChannel> packageChannels =
+-                mService.mPreferencesHelper.getNotificationChannels(mPkg, mUid, false, false);
++                mService.mPreferencesHelper.getNotificationChannels(PKG_O, UID_O, false, false);
++        assertThat(packageChannels.getList().stream().filter(c -> c.isConversation()))
++                .hasSize(MAX_CHANNELS_PER_PKG_CREATED_BY_NLS_FOR_TESTING);
++
++        // Now add 4 channels for mPkg
++        final int numChannelsLeftForNLS = MAX_CHANNELS_CREATED_BY_NLS_FOR_TESTING
++                - MAX_CHANNELS_PER_PKG_CREATED_BY_NLS_FOR_TESTING;
++        mService.mPreferencesHelper.createNotificationChannel(mPkg, mUid, parentChannel, true,
++                false, mUid, false);
++        for (int i = 1; i <= numChannelsLeftForNLS; i++) {
++            NotificationChannel createdConversation = mBinderService
++                    .createConversationNotificationChannelForPackageFromPrivilegedListener(
++                        mListener, mPkg, mUser, parentChannel.getId(), "conversation #" + i);
++            assertThat(createdConversation).isNotNull();
++            assertThat(createdConversation.getParentChannelId()).isEqualTo(parentChannel.getId());
++        }
++        packageChannels = mService.mPreferencesHelper.getNotificationChannels(mPkg, mUid, false,
++                false);
++        // one convo is created in setup, and numChannelsLeftForNLS
+         assertThat(packageChannels.getList().stream().filter(c -> c.isConversation()))
+-                .hasSize(MAX_CHANNELS_CREATED_BY_NLS_FOR_TESTING);
++                .hasSize(numChannelsLeftForNLS + 1);
+ 
+         // And finally, monsieur, a wafer-thin mint.
+         NotificationChannel oneTooMany = mBinderService
+@@ -5906,6 +5928,47 @@ public class NotificationManagerServiceTest extends UiServiceTestCase {
+         assertThat(unchangedPackageChannels.getList()).isEqualTo(packageChannels.getList());
+     }
+ 
++    @Test
++    @EnableFlags({FLAG_NOTIFICATION_CONVERSATION_CHANNEL_MANAGEMENT})
++    public void createConversationChannelForPkgFromPrivilegedListener_tooManyChannelsPerPkg_fails()
++            throws Exception {
++        when(mPackageManager.getPackageUid(eq(PKG_O), anyLong(),  anyInt())).thenReturn(UID_O);
++        NotificationChannel parentChannel = mTestNotificationChannel.copy();
++        mService.mPreferencesHelper.createNotificationChannel(mPkg, mUid, parentChannel, true,
++                false, mUid, false);
++        mService.mPreferencesHelper.createNotificationChannel(PKG_O, UID_O, parentChannel, true,
++                false, UID_O, false);
++        when(mCompanionMgr.getAssociations(anyString(), eq(mUserId)))
++                .thenReturn(singletonList(mock(AssociationInfo.class)));
++
++        for (int i = 1; i <= MAX_CHANNELS_PER_PKG_CREATED_BY_NLS_FOR_TESTING; i++) {
++            NotificationChannel createdConversation = mBinderService
++                    .createConversationNotificationChannelForPackageFromPrivilegedListener(
++                        mListener, mPkg, mUser, parentChannel.getId(), "conversation #" + i);
++            assertThat(createdConversation).isNotNull();
++            assertThat(createdConversation.getParentChannelId()).isEqualTo(parentChannel.getId());
++        }
++        ParceledListSlice<NotificationChannel> packageChannels =
++                mService.mPreferencesHelper.getNotificationChannels(mPkg, mUid, false, false);
++        // one convo is created in setup, and MAX_CHANNELS_PER_PKG_CREATED_BY_NLS_FOR_TESTING
++        assertThat(packageChannels.getList().stream().filter(c -> c.isConversation()))
++                .hasSize(MAX_CHANNELS_PER_PKG_CREATED_BY_NLS_FOR_TESTING + 1);
++
++        NotificationChannel oneTooMany = mBinderService
++                .createConversationNotificationChannelForPackageFromPrivilegedListener(
++                    mListener, mPkg, mUser, parentChannel.getId(), "another conversation");
++
++        assertThat(oneTooMany).isNull();
++        ParceledListSlice<NotificationChannel> unchangedPackageChannels =
++                mService.mPreferencesHelper.getNotificationChannels(mPkg, mUid, false, false);
++        assertThat(unchangedPackageChannels.getList()).isEqualTo(packageChannels.getList());
++
++        NotificationChannel otherPkgConversation = mBinderService
++                .createConversationNotificationChannelForPackageFromPrivilegedListener(
++                    mListener, PKG_O, mUser, parentChannel.getId(), "other conversation");
++        assertThat(otherPkgConversation).isNotNull();
++    }
++
+     @Test
+     @RequiresFlagsEnabled(FLAG_NOTIFICATION_CONVERSATION_CHANNEL_MANAGEMENT)
+     public void createConversationChannelForPkgFromPrivilegedListener_noParentChannel_ignored()
+diff --git a/services/tests/uiservicestests/src/com/android/server/notification/NotificationManagerServiceZenTest.java b/services/tests/uiservicestests/src/com/android/server/notification/NotificationManagerServiceZenTest.java
+index 052c245f1..041f462bd 100644
+--- a/services/tests/uiservicestests/src/com/android/server/notification/NotificationManagerServiceZenTest.java
++++ b/services/tests/uiservicestests/src/com/android/server/notification/NotificationManagerServiceZenTest.java
+@@ -580,7 +580,8 @@ public class NotificationManagerServiceZenTest extends UiServiceTestCase {
+                 mToastRateLimiter, mPermissionHelper, mock(UsageStatsManagerInternal.class),
+                 mTelecomManager, mLogger, mTestFlagResolver, mPermissionManager, mPowerManager,
+                 mock(PostNotificationTrackerFactory.class), mUiEventLogger, mBitmapOffloader,
+-                new NotificationListenerStats(MAX_CHANNELS_CREATED_BY_NLS_FOR_TESTING),
++                new NotificationListenerStats(MAX_CHANNELS_CREATED_BY_NLS_FOR_TESTING,
++                        MAX_CHANNELS_CREATED_BY_NLS_FOR_TESTING),
+                 mNotificationRecordLogger,
+                 mNotificationInstanceIdSequence, new TestPreferencesHelperFactory());
+ 
+-- 
+2.56.0
+

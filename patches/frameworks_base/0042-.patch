@@ -1,0 +1,54 @@
+From 094b3857dd61733c058565a7df9b37ebdb534c48 Mon Sep 17 00:00:00 2001
+From: Achim Thesmann <achim@google.com>
+Date: Wed, 22 Jul 2026 05:29:34 +0000
+Subject: [PATCH 42/45] =?utf-8?q?=E9=98=BB=E6=AD=A2=E7=94=BB=E4=B8=AD?=
+ =?utf-8?q?=E7=94=BB=E7=AA=97=E5=8F=A3=E7=BB=95=E8=BF=87=E6=B2=99=E7=AE=B1?=
+ =?utf-8?q?=E5=90=8E=E5=8F=B0=E5=90=AF=E5=8A=A8=E9=99=90=E5=88=B6?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Untrusted applications could bypass Background Activity Launch (BAL) restrictions by entering Picture-in-Picture (PiP) mode and launching an activity through their SDK Sandbox or Private Compute Core (PCC).
+
+This commit updates BackgroundActivityStartController to use hasActiveVisibleNotPinnedWindow() in SDK Sandbox and PCC visibility checks.
+
+TAG=agy
+CONV=d05c04fd-f15d-4691-82bb-7a004945e342
+
+Bug: 527036109
+Test: atest WmTests:BackgroundActivityStartControllerTests
+Flag: EXEMPT BUGFIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:27cab264853b4387fc60fea13a0e3c904aae4008
+Merged-In: Id96246a0a03dfaef8aa457d6c0ddc40a30b76b4f
+Change-Id: Id96246a0a03dfaef8aa457d6c0ddc40a30b76b4f
+
+(cherry picked from commit 910f1d1565692363984cf13eb17cc7c0763e7c12)
+---
+ .../android/server/wm/BackgroundActivityStartController.java  | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/services/core/java/com/android/server/wm/BackgroundActivityStartController.java b/services/core/java/com/android/server/wm/BackgroundActivityStartController.java
+index 867fd1263..929ce3549 100644
+--- a/services/core/java/com/android/server/wm/BackgroundActivityStartController.java
++++ b/services/core/java/com/android/server/wm/BackgroundActivityStartController.java
+@@ -894,7 +894,7 @@ public class BackgroundActivityStartController {
+                     Process.getAppUidForSdkSandboxUid(state.mRealCallingUid);
+             // realCallingSdkSandboxUidToAppUid should probably just be used instead (or in addition
+             // to realCallingUid when calculating resultForRealCaller below.
+-            if (getService().hasActiveVisibleWindow(realCallingSdkSandboxUidToAppUid)) {
++            if (getService().hasActiveVisibleNotPinnedWindow(realCallingSdkSandboxUidToAppUid)) {
+                 state.setResultForRealCaller(new BalVerdict(BAL_ALLOW_SDK_SANDBOX,
+                         "uid in SDK sandbox has visible (non-toast) window").allowNewTask());
+                 return allowBasedOnRealCaller(state);
+@@ -908,7 +908,7 @@ public class BackgroundActivityStartController {
+                     getService().mContext.getPackageManager()
+                             .getAppUidForPrivateComputeCoreUid(state.mRealCallingUid);
+ 
+-            if (getService().hasActiveVisibleWindow(realCallingAppUid)) {
++            if (getService().hasActiveVisibleNotPinnedWindow(realCallingAppUid)) {
+                 state.setResultForRealCaller(new BalVerdict(
+                         BAL_ALLOW_PCC_DEFINING_APP_HAS_VISIBLE_WINDOW,
+                         "PCC process's parent app has visible (non-toast) window")
+-- 
+2.56.0
+

@@ -1,0 +1,54 @@
+From 2dfa1f017f1ca0c61c5f320c9795c460b92e0347 Mon Sep 17 00:00:00 2001
+From: Songyue Han <songyueh@google.com>
+Date: Wed, 20 May 2026 23:55:53 +0000
+Subject: [PATCH 2/5] =?utf-8?q?=E6=A0=A1=E9=AA=8C=E5=9B=BE=E5=83=8F?=
+ =?utf-8?q?=E8=A7=A3=E7=A0=81=E8=BE=93=E5=87=BA=E7=9A=84=E8=A3=81=E5=89=AA?=
+ =?utf-8?q?=E5=B0=BA=E5=AF=B8=E4=B8=8E=E6=AD=A5=E5=B9=85?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Check before converting int32_t to size_t.
+
+Bug: 498426107
+Test: atest MediaMetadataRetrieverTest ImageReaderDecoderTest
+Flag: EXEMPT BUGFIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:7d328ec5b7320f067d38955a3a0e23b7c16d8dfd
+Merged-In: Ie4fec9bc89d332cd56f5818a86cf83ee282a19b2
+Change-Id: Ie4fec9bc89d332cd56f5818a86cf83ee282a19b2
+
+(cherry picked from commit 85db27436f49fc47e61027db99c398e1d12b9875)
+---
+ media/libstagefright/FrameDecoder.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/media/libstagefright/FrameDecoder.cpp b/media/libstagefright/FrameDecoder.cpp
+index 7613ed2906..4bcb96136d 100644
+--- a/media/libstagefright/FrameDecoder.cpp
++++ b/media/libstagefright/FrameDecoder.cpp
+@@ -1356,6 +1356,22 @@ status_t MediaImageDecoder::onOutputReceived(
+         height = slice_height;
+     }
+ 
++    if (crop_left < 0 || crop_top < 0 || crop_right < crop_left || crop_bottom < crop_top
++            || width <= 0 || height <= 0 || crop_bottom >= height || crop_right >= width
++            || stride < 0) {
++        ALOGE("Invalid crop, width and height in outputFormat. crop_left: %d, crop_right: %d,"
++                " crop_top: %d, crop_bottom: %d, width: %d, height: %d", crop_left, crop_right,
++                crop_top, crop_bottom, width, height);
++        return ERROR_MALFORMED;
++    }
++    if (stride < 0 || (stride & 1) != 0) {
++        // stride could be zero and must be even.
++        // If the client set the stride to zero,
++        // the BitmapParams constructor calculates it based on width and bpp.
++        ALOGE("Invalid stride in outputFormat: %d", stride);
++        return ERROR_MALFORMED;
++    }
++
+     int32_t crop_width, crop_height;
+     crop_width = crop_right - crop_left + 1;
+     crop_height = crop_bottom - crop_top + 1;
+-- 
+2.56.0
+

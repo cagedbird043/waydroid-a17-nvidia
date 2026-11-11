@@ -1,0 +1,336 @@
+From 6941ff71dffe474b5c977ee8dec19626ad5fa79c Mon Sep 17 00:00:00 2001
+From: Gaetano Alboreto <galboreto@google.com>
+Date: Fri, 7 Aug 2026 10:03:10 +0000
+Subject: [PATCH 31/45] =?utf-8?q?=E9=99=90=E5=88=B6=E8=AE=BE=E5=A4=87?=
+ =?utf-8?q?=E7=AD=96=E7=95=A5=E5=BA=94=E7=94=A8=E9=99=90=E5=88=B6=E7=9A=84?=
+ =?utf-8?q?=E5=85=A8=E5=B1=80=E6=95=B0=E9=87=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Adds validation in DevicePolicyManagerService to ensure that the total
+number of application restrictions set on a device cannot exceed 1000
+packages.
+This limit is enforced globally across all admins combined by using
+`getLocalPolicyKeysSetByAllAdmins`, ensuring that multiple Profile Owners
+or Delegated Apps cannot bypass the cap.
+Also includes comprehensive unit test coverage to validate the
+enforcement for both single-admin and multi-admin configurations.
+
+NO_JAVA_FORMAT=Not relevant to this change, existing and untouched lines.
+
+Bug: b/281543351
+Test: atest com.android.server.devicepolicy.DevicePolicyManagerTest
+Tested: ab/I43100010583082947
+Flag: EXEMPT BUGFIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:c9c04f595d904aff21ebdd67986b5a9250d6406a
+Merged-In: I8e13de9db9ef85f930958a88bb237648b36767c2
+Change-Id: I8e13de9db9ef85f930958a88bb237648b36767c2
+
+(cherry picked from commit 41b6c64737a3c615b551e5cfb99e1d8d748a23cd)
+---
+ .../app/admin/DevicePolicyManager.java        |   2 +
+ .../DevicePolicyManagerService.java           |  51 ++++-
+ .../devicepolicy/DevicePolicyManagerTest.java | 182 ++++++++++++++++++
+ 3 files changed, 226 insertions(+), 9 deletions(-)
+
+diff --git a/core/java/android/app/admin/DevicePolicyManager.java b/core/java/android/app/admin/DevicePolicyManager.java
+index 3ba160b37..04fb2b8ab 100644
+--- a/core/java/android/app/admin/DevicePolicyManager.java
++++ b/core/java/android/app/admin/DevicePolicyManager.java
+@@ -11224,6 +11224,8 @@ public class DevicePolicyManager {
+      * @param settings A {@link Bundle} to be parsed by the receiving application, conveying a new
+      *            set of active restrictions.
+      * @throws SecurityException if {@code admin} is not a device or profile owner.
++     * @throws IllegalStateException if the maximum number of packages with active application
++     *     restrictions across all admins for the user has been reached.
+      * @see #setDelegatedScopes
+      * @see #DELEGATION_APP_RESTRICTIONS
+      * @see UserManager#KEY_RESTRICTIONS_PENDING
+diff --git a/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyManagerService.java b/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyManagerService.java
+index 0cb6b68eb..79cf83a2b 100644
+--- a/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyManagerService.java
++++ b/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyManagerService.java
+@@ -777,6 +777,15 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub
+      */
+     private static final int UNATTENDED_MANAGED_KIOSK_MS = 30000;
+ 
++    /**
++     * The maximum number of packages that can have active application restrictions simultaneously.
++     * This limit is enforced globally per-user, meaning it applies cumulatively across
++     * all admins for a given user.
++     * In addition, different admins setting restrictions on the same target app will be considered
++     * independent entries for this limit.
++     */
++    private static final int MAX_PACKAGES_WITH_APP_RESTRICTIONS = 1000;
++
+     /**
+      * Strings logged with {@link
+      * MetricsProto.MetricsEvent#PROVISIONING_ENTRY_POINT_ADB},
+@@ -11275,6 +11284,22 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub
+         return delegatePackages.size() > 0 ? delegatePackages.get(0) : null;
+     }
+ 
++    private void enforceMaxRestrictedPackagesForEngine(
++            EnforcingAdmin admin, int userId, String packageName, Bundle restrictions) {
++        if (restrictions == null || restrictions.isEmpty()) {
++            return;
++        }
++        Set<PolicyKey> restrictedPackages = mDevicePolicyEngine.getLocalPolicyKeysSetByAllAdmins(
++                PolicyDefinition.GENERIC_APPLICATION_RESTRICTIONS, userId);
++        if (restrictedPackages.size() >= MAX_PACKAGES_WITH_APP_RESTRICTIONS
++                && !restrictedPackages.contains(new PackagePolicyKey(
++                        DevicePolicyIdentifiers.APPLICATION_RESTRICTIONS_POLICY, packageName))) {
++            throw new IllegalStateException("Cannot set application restrictions on more than "
++                    + MAX_PACKAGES_WITH_APP_RESTRICTIONS + " packages");
++        }
++    }
++
++
+     @Override
+     public boolean isCallerApplicationRestrictionsManagingPackage(String callerPackage) {
+         return isCallerDelegate(callerPackage, getCallerIdentity().getUid(),
+@@ -11315,15 +11340,23 @@ public class DevicePolicyManagerService extends IDevicePolicyManager.Stub
+         }
+         EnforcingAdmin enforcingAdmin = getEnforcingAdmin(caller);
+ 
+-        mDevicePolicyEngine.setOrRemoveLocalPolicy(
+-                PolicyDefinition.APPLICATION_RESTRICTIONS(packageName), enforcingAdmin,
+-                affectedUserId, BundlePolicyValue.createIfNotNullOrEmpty(restrictions))
+-                .thenAccept((result) -> {
+-                    if (com.android.internal.telephony.flags.Flags.secureAccessToRestrictedRcsMessages()
+-                            && (result == RESULT_POLICY_SET || result == RESULT_POLICY_CLEARED)) {
+-                        mRcsArchivalAppTracker.onRestrictionsChanged(packageName, affectedUserId);
+-                    }
+-                });
++        synchronized (getLockObject()) {
++            enforceMaxRestrictedPackagesForEngine(
++                    enforcingAdmin, affectedUserId, packageName, restrictions);
++
++            mDevicePolicyEngine.setOrRemoveLocalPolicy(
++                    PolicyDefinition.APPLICATION_RESTRICTIONS(packageName), enforcingAdmin,
++                    affectedUserId, BundlePolicyValue.createIfNotNullOrEmpty(restrictions))
++                    .thenAccept((result) -> {
++                        if (com.android.internal.telephony.flags.Flags
++                                .secureAccessToRestrictedRcsMessages()
++                                && (result == RESULT_POLICY_SET
++                                        || result == RESULT_POLICY_CLEARED)) {
++                            mRcsArchivalAppTracker.onRestrictionsChanged(
++                                    packageName, affectedUserId);
++                        }
++                    });
++        }
+ 
+         DevicePolicyEventLogger
+                 .createEvent(DevicePolicyEnums.SET_APPLICATION_RESTRICTIONS)
+diff --git a/services/tests/servicestests/src/com/android/server/devicepolicy/DevicePolicyManagerTest.java b/services/tests/servicestests/src/com/android/server/devicepolicy/DevicePolicyManagerTest.java
+index 5adb5aad5..33d33c5c0 100644
+--- a/services/tests/servicestests/src/com/android/server/devicepolicy/DevicePolicyManagerTest.java
++++ b/services/tests/servicestests/src/com/android/server/devicepolicy/DevicePolicyManagerTest.java
+@@ -141,6 +141,7 @@ import android.os.Bundle;
+ import android.os.IpcDataCache;
+ import android.os.PersistableBundle;
+ import android.os.Process;
++import android.os.SystemClock;
+ import android.os.UserHandle;
+ import android.os.UserManager;
+ import android.platform.test.annotations.DisableFlags;
+@@ -204,7 +205,11 @@ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ /**
+  * Tests for DevicePolicyManager( and DevicePolicyManagerService).
+@@ -1743,6 +1748,183 @@ public class DevicePolicyManagerTest extends DpmTestBase {
+         assertThat(dpm.getApplicationRestrictions(admin1, "pkg2").size()).isEqualTo(0);
+     }
+ 
++    @Test
++    public void testSetApplicationRestrictions_maxRestrictions_concurrent() throws Exception {
++        setAsProfileOwner(admin1);
++        mContext.packageName = admin1.getPackageName();
++
++        int totalThreads = 1010;
++        int expectedFailures = 10;
++        int expectedSuccesses = 1000;
++
++        ExecutorService executor = Executors.newFixedThreadPool(50);
++        CountDownLatch latch = new CountDownLatch(1);
++        CountDownLatch doneLatch = new CountDownLatch(totalThreads);
++        AtomicInteger successCount = new AtomicInteger();
++        AtomicInteger failureCount = new AtomicInteger();
++
++        for (int i = 0; i < totalThreads; i++) {
++            final String pkgName = "pkg" + i;
++            executor.execute(
++                    () -> {
++                        try {
++                            latch.await();
++                            boolean done = false;
++                            while (!done) {
++                                try {
++                                    Bundle rest = new Bundle();
++                                    rest.putString("KEY", "VALUE");
++                                    dpm.setApplicationRestrictions(admin1, pkgName, rest);
++                                    successCount.incrementAndGet();
++                                    done = true;
++                                } catch (IllegalStateException e) {
++                                    if (e.getMessage() != null
++                                            && e.getMessage()
++                                                    .contains(
++                                                            "Cannot set application restrictions on"
++                                                                    + " more than")) {
++                                        failureCount.incrementAndGet();
++                                        done = true;
++                                    } else {
++                                        SystemClock.sleep(10);
++                                    }
++                                } catch (Exception e) {
++                                    // Retry on Mockito/SQLite exceptions
++                                    SystemClock.sleep(10);
++                                }
++                            }
++                        } catch (Exception e) {
++                            // Ignore await interruptions
++                        } finally {
++                            doneLatch.countDown();
++                        }
++                    });
++        }
++
++        latch.countDown();
++        boolean completed = doneLatch.await(120, TimeUnit.SECONDS);
++        executor.shutdownNow();
++
++        if (!completed) {
++            fail(
++                    "Test timed out! Threads stuck. Success count so far: "
++                            + successCount.get()
++                            + ", Failures so far: "
++                            + failureCount.get());
++        }
++
++        assertThat(successCount.get()).isEqualTo(expectedSuccesses);
++        assertThat(failureCount.get()).isEqualTo(expectedFailures);
++    }
++
++    @Test
++    public void testSetApplicationRestrictions_maxRestrictions_singleAdmin() {
++        setAsProfileOwner(admin1);
++        mContext.packageName = admin1.getPackageName();
++
++        // Profile owner sets restrictions for 1000 packages
++        for (int i = 0; i < 1000; i++) {
++            Bundle rest = new Bundle();
++            rest.putString("KEY", "VALUE");
++            dpm.setApplicationRestrictions(admin1, "pkg" + i, rest);
++        }
++
++        // Setting one more package restriction should throw IllegalStateException
++        Bundle rest = new Bundle();
++        rest.putString("KEY", "VALUE");
++        assertExpectException(
++                IllegalStateException.class,
++                "Cannot set application restrictions on more than",
++                () -> dpm.setApplicationRestrictions(admin1, "pkg1000", rest));
++    }
++
++    @Test
++    public void testSetApplicationRestrictions_maxRestrictions_delegatedApp() throws Exception {
++        setAsProfileOwner(admin1);
++        mContext.packageName = admin1.getPackageName();
++
++        // Profile owner sets restrictions for 500 packages
++        for (int i = 0; i < 500; i++) {
++            Bundle rest = new Bundle();
++            rest.putString("KEY", "VALUE");
++            dpm.setApplicationRestrictions(admin1, "po_pkg_" + i, rest);
++        }
++
++        final String delegatePackage = "com.google.app.restrictions.manager";
++        final int delegateAppId = 20987;
++        final int delegateUid = setupPackageInPackageManager(delegatePackage, delegateAppId);
++        dpm.setApplicationRestrictionsManagingPackage(admin1, delegatePackage);
++
++        mContext.binder.callingUid = delegateUid;
++        mContext.packageName = delegatePackage;
++
++        // Delegate sets restrictions for 500 packages, reaching the 1000 limit combined
++        for (int i = 0; i < 500; i++) {
++            Bundle rest = new Bundle();
++            rest.putString("KEY", "VALUE");
++            dpm.setApplicationRestrictions(null, "delegate_pkg_" + i, rest);
++        }
++
++        // Setting one more package restriction should throw IllegalStateException
++        Bundle rest = new Bundle();
++        rest.putString("KEY", "VALUE");
++        assertExpectException(
++                IllegalStateException.class,
++                "Cannot set application restrictions on more than",
++                () -> dpm.setApplicationRestrictions(null, "delegate_pkg_501", rest));
++    }
++
++    @Test
++    public void testSetApplicationRestrictions_maxRestrictions_multipleAdmins() throws Exception {
++        // Profile owner in CALLER_USER_HANDLE (admin2)
++        setAsProfileOwner(admin2);
++
++        // A fake role holder in CALLER_USER_HANDLE
++        String roleHolderPackage = "com.fake.role.holder";
++        doReturn(Arrays.asList(roleHolderPackage))
++                .when(getServices().roleManagerForMock)
++                .getRoleHoldersAsUser(
++                        RoleManager.ROLE_DEVICE_POLICY_MANAGEMENT,
++                        UserHandle.of(DpmMockContext.CALLER_USER_HANDLE));
++
++        // Mock the UID for the role holder
++        int roleHolderUid = UserHandle.getUid(DpmMockContext.CALLER_USER_HANDLE, 10555);
++        doReturn(roleHolderUid)
++                .when(getServices().packageManagerInternal)
++                .getPackageUid(
++                        eq(roleHolderPackage), anyLong(), eq(DpmMockContext.CALLER_USER_HANDLE));
++        getServices().addTestPackageUid(roleHolderPackage, roleHolderUid);
++
++        // Profile owner sets restrictions for 500 packages
++        // setAsProfileOwner automatically restores the calling identity, so we must set it back
++        mContext.binder.callingUid = DpmMockContext.CALLER_UID;
++        mContext.packageName = admin2.getPackageName();
++        for (int i = 0; i < 500; i++) {
++            Bundle rest = new Bundle();
++            rest.putString("KEY", "VALUE");
++            dpm.setApplicationRestrictions(admin2, "po_pkg_" + i, rest);
++        }
++
++        // Role holder sets restrictions for 500 packages
++        mContext.binder.callingUid = roleHolderUid;
++        mContext.packageName = roleHolderPackage;
++        for (int i = 0; i < 500; i++) {
++            Bundle rest = new Bundle();
++            rest.putString("KEY", "VALUE");
++            dpm.setApplicationRestrictions(null, "rh_pkg_" + i, rest);
++        }
++
++        // Now we restrict the 1001st package via Profile Owner, should throw limit reached
++        mContext.binder.callingUid = DpmMockContext.CALLER_UID;
++        mContext.packageName = admin2.getPackageName();
++        Bundle rest = new Bundle();
++        rest.putString("KEY", "VALUE");
++        assertExpectException(
++                IllegalStateException.class,
++                "Cannot set application restrictions on more than",
++                () -> dpm.setApplicationRestrictions(admin2, "po_pkg_extra", rest));
++    }
++
+     @Test
+     @RequiresFlagsEnabled(FLAG_SECURE_ACCESS_TO_RESTRICTED_RCS_MESSAGES)
+     public void testMessagesArchivalApp_grantAndRevokeReadRestrictedMessagesAppOp()
+-- 
+2.56.0
+

@@ -1,0 +1,117 @@
+From 55f1bff3cf529fdc82c87b3863c53394f42e557b Mon Sep 17 00:00:00 2001
+From: Aseem Kumar <aseemk@google.com>
+Date: Wed, 15 Jul 2026 13:46:50 -0700
+Subject: [PATCH 1/2] =?utf-8?q?=E9=98=BB=E6=AD=A2=E6=B7=BB=E5=8A=A0?=
+ =?utf-8?q?=E8=B4=A6=E5=8F=B7=E7=95=8C=E9=9D=A2=E7=9A=84=E5=90=8E=E5=8F=B0?=
+ =?utf-8?q?=E6=B4=BB=E5=8A=A8=E5=90=AF=E5=8A=A8=E7=BB=95=E8=BF=87?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Use MODE_BACKGROUND_ACTIVITY_START_ALLOW_IF_VISIBLE instead of
+MODE_BACKGROUND_ACTIVITY_START_DENIED to allow legitimate foreground
+usage of AddAccountSettings while blocking background exploits.
+The previous fix (ag/40655215) broke the foreground use case (b/530008611)
+because DENIED acts as a total opt-out for all BAL exemptions.
+ALLOW_IF_VISIBLE enforces visibility checks but skips privileged UID
+exemptions, thus blocking background bypasses while allowing normal
+foreground usage.
+
+Test with 3 authenticators: 1) BypassBAL POC (2) Google (3) Tiktok
+Flows tested:
+1. BypassBAL POC app when clicked launches MainActivity, but SecondActivity launch is blocked. In Settings, when BypassBAL authenticator is selected, Settings wait for 30 seconds then shows the SecondActivity.
+2. Google and Tiktok open their login page when selected in Settings.
+3. Google apps (Drive, Gmail) open login page through OneGoogle.
+
+Bug: 313418699
+Test: build
+Flag: EXEMPT BUGFIX
+Change-Id: I3540801a5fbe4b2ef158d68bdb07777e68638be7
+(cherry picked from commit d3534b7d0f7fc61bcaeb0f47f0001d201a81707e)
+
+(cherry picked from commit 8fadd15bd34dbcbf2c54758a1a18e767c026b1ee)
+---
+ .../settings/accounts/AddAccountSettings.java | 32 +++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/src/com/android/settings/accounts/AddAccountSettings.java b/src/com/android/settings/accounts/AddAccountSettings.java
+index 85e942b1990..34f87f1a352 100644
+--- a/src/com/android/settings/accounts/AddAccountSettings.java
++++ b/src/com/android/settings/accounts/AddAccountSettings.java
+@@ -16,6 +16,7 @@
+ 
+ package com.android.settings.accounts;
+ 
++import static android.app.ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOW_IF_VISIBLE;
+ import static android.content.Intent.EXTRA_USER;
+ 
+ import android.accounts.AccountManager;
+@@ -24,6 +25,7 @@ import android.accounts.AccountManagerFuture;
+ import android.accounts.AuthenticatorException;
+ import android.accounts.OperationCanceledException;
+ import android.app.Activity;
++import android.app.ActivityOptions;
+ import android.app.PendingIntent;
+ import android.content.ComponentName;
+ import android.content.Context;
+@@ -94,6 +96,12 @@ public class AddAccountSettings extends Activity {
+                 //bundle.keySet();
+                 Intent intent = (Intent) bundle.get(AccountManager.KEY_INTENT);
+                 if (intent != null) {
++                    if (!mIsVisible) {
++                        Log.w(TAG, "Activity is not visible, dropping AddAccount intent launch.");
++                        return;
++                    } else {
++                        Log.v(TAG, "Activity is visible, launching AddAccount intent launch.");
++                    }
+                     done = false;
+                     Bundle addAccountOptions = new Bundle();
+                     addAccountOptions.putParcelable(KEY_CALLER_IDENTITY, mPendingIntent);
+@@ -103,8 +111,13 @@ public class AddAccountSettings extends Activity {
+                     intent.putExtras(addAccountOptions)
+                             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK);
+-                    startActivityForResultAsUser(
+-                            new Intent(intent), ADD_ACCOUNT_REQUEST, mUserHandle);
++                    ActivityOptions options = ActivityOptions.makeBasic()
++                            .setPendingIntentCreatorBackgroundActivityStartMode(
++                                     MODE_BACKGROUND_ACTIVITY_START_ALLOW_IF_VISIBLE)
++                            .setPendingIntentBackgroundActivityStartMode(
++                                    MODE_BACKGROUND_ACTIVITY_START_ALLOW_IF_VISIBLE);
++                    startActivityForResultAsUser(new Intent(intent), ADD_ACCOUNT_REQUEST,
++                            options.toBundle(), mUserHandle);
+                 } else {
+                     setResult(RESULT_OK);
+                     if (mPendingIntent != null) {
+@@ -130,6 +143,7 @@ public class AddAccountSettings extends Activity {
+ 
+     private boolean mAddAccountCalled = false;
+     private UserHandle mUserHandle;
++    private boolean mIsVisible = false;
+ 
+     @Override
+     public void onCreate(Bundle savedInstanceState) {
+@@ -176,6 +190,20 @@ public class AddAccountSettings extends Activity {
+         }
+     }
+ 
++    @Override
++    protected void onStart() {
++        super.onStart();
++        Log.v(TAG, "onStart");
++        mIsVisible = true;
++    }
++
++    @Override
++    protected void onStop() {
++        super.onStop();
++        Log.v(TAG, "onStop");
++        mIsVisible = false;
++    }
++
+     @Override
+     public void onActivityResult(int requestCode, int resultCode, Intent data) {
+         switch (requestCode) {
+-- 
+2.56.0
+

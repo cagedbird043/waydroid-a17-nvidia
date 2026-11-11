@@ -1,0 +1,152 @@
+From 46bb417a2d20439f2ee53a62d36e3666a6bdf0c5 Mon Sep 17 00:00:00 2001
+From: Duy Truong <duytruong@google.com>
+Date: Thu, 18 Jun 2026 04:41:19 +0000
+Subject: [PATCH 10/45] =?utf-8?q?=E8=A1=A5=E5=85=A8=E5=AA=92=E4=BD=93?=
+ =?utf-8?q?=E8=B4=A8=E9=87=8F=E6=9C=8D=E5=8A=A1=E8=AF=BB=E6=93=8D=E4=BD=9C?=
+ =?utf-8?q?=E6=9D=83=E9=99=90=E6=A0=A1=E9=AA=8C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Missing permission checks in MediaQualityService Binder methods allowed unprivileged applications to read signature-gated TYPE_SYSTEM picture and sound profiles. This could leak sensitive device configuration parameters and unique UUIDs.
+
+This commit adds MANAGE_GLOBAL_PICTURE_QUALITY_SERVICE and MANAGE_GLOBAL_SOUND_QUALITY_SERVICE permission checks (via `hasGlobalPictureQualityServicePermission` and `hasGlobalSoundQualityServicePermission`) to several Binder methods in `MediaQualityService`. If an unauthorized caller attempts to access these profiles, the service now logs an error, sends an error notification, and returns safe default values (such as an empty list, `-1`, or `null`) to prevent the information leak.
+
+Bug: 514738573
+Flag: EXEMPT BUGFIX
+Test: gambit
+
+Change-Id: Ic8d9f4472b4a1c114aa105491c4f7182e5c47de9
+
+(cherry picked from commit cd2700182d5102c63976a6ecc0cc3f13594f64c7)
+---
+ .../media/quality/MediaQualityService.java    | 64 +++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+
+diff --git a/services/core/java/com/android/server/media/quality/MediaQualityService.java b/services/core/java/com/android/server/media/quality/MediaQualityService.java
+index 34655ba4f..efc6bd804 100644
+--- a/services/core/java/com/android/server/media/quality/MediaQualityService.java
++++ b/services/core/java/com/android/server/media/quality/MediaQualityService.java
+@@ -592,6 +592,14 @@ public class MediaQualityService extends SystemService {
+         @Override
+         public void changeStreamStatus(
+                 @NonNull String profileId, @NonNull String newStatus, int userId) {
++            int callingUid = Binder.getCallingUid();
++            int callingPid = Binder.getCallingPid();
++            if (!hasGlobalPictureQualityServicePermission(callingUid, callingPid)) {
++                mMqManagerNotifier.notifyOnPictureProfileError(
++                        null, PictureProfile.ERROR_NO_PERMISSION, callingUid, callingPid);
++                Slog.e(TAG, "changeStreamStatus: no permission");
++                return;
++            }
+             Long dbId = null;
+             synchronized (mPictureProfileLock) {
+                 dbId = mPictureProfileTempIdMap.getKey(profileId);
+@@ -909,6 +917,14 @@ public class MediaQualityService extends SystemService {
+         @GuardedBy("mPictureProfileLock")
+         @Override
+         public List<PictureProfileHandle> getPictureProfileHandle(String[] ids, int userId) {
++            int callingUid = Binder.getCallingUid();
++            int callingPid = Binder.getCallingPid();
++            if (!hasGlobalPictureQualityServicePermission(callingUid, callingPid)) {
++                mMqManagerNotifier.notifyOnPictureProfileError(
++                        null, PictureProfile.ERROR_NO_PERMISSION, callingUid, callingPid);
++                Slog.e(TAG, "getPictureProfileHandle: no permission");
++                return new ArrayList<>();
++            }
+             List<PictureProfileHandle> toReturn = new ArrayList<>();
+             synchronized (mPictureProfileLock) {
+                 for (String id : ids) {
+@@ -926,6 +942,14 @@ public class MediaQualityService extends SystemService {
+         @GuardedBy("mPictureProfileLock")
+         @Override
+         public List<PictureProfileHandle> getPictureProfileHandles(String[] ids, int userId) {
++            int callingUid = Binder.getCallingUid();
++            int callingPid = Binder.getCallingPid();
++            if (!hasGlobalPictureQualityServicePermission(callingUid, callingPid)) {
++                mMqManagerNotifier.notifyOnPictureProfileError(
++                        null, PictureProfile.ERROR_NO_PERMISSION, callingUid, callingPid);
++                Slog.e(TAG, "getPictureProfileHandles: no permission");
++                return new ArrayList<>();
++            }
+             List<PictureProfileHandle> toReturn = new ArrayList<>();
+             synchronized (mPictureProfileLock) {
+                 for (String id : ids) {
+@@ -1033,6 +1057,14 @@ public class MediaQualityService extends SystemService {
+             if (DEBUG) {
+                 Slog.d(TAG, "getPictureProfileForTvInput for id " + inputId);
+             }
++            int callingUid = Binder.getCallingUid();
++            int callingPid = Binder.getCallingPid();
++            if (!hasGlobalPictureQualityServicePermission(callingUid, callingPid)) {
++                mMqManagerNotifier.notifyOnPictureProfileError(
++                        null, PictureProfile.ERROR_NO_PERMISSION, callingUid, callingPid);
++                Slog.e(TAG, "getPictureProfileForTvInput: no permission");
++                return -1;
++            }
+             // TODO: cache profiles
+             String[] columns = {BaseParameters.PARAMETER_ID};
+             String selection = BaseParameters.PARAMETER_TYPE + " = ? AND ("
+@@ -1087,6 +1119,14 @@ public class MediaQualityService extends SystemService {
+             if (DEBUG) {
+                 Slog.d(TAG, "getCurrentPictureProfileHandleForTvInput for id " + inputId);
+             }
++            int callingUid = Binder.getCallingUid();
++            int callingPid = Binder.getCallingPid();
++            if (!hasGlobalPictureQualityServicePermission(callingUid, callingPid)) {
++                mMqManagerNotifier.notifyOnPictureProfileError(
++                        null, PictureProfile.ERROR_NO_PERMISSION, callingUid, callingPid);
++                Slog.e(TAG, "getCurrentPictureProfileHandleForTvInput: no permission");
++                return PictureProfileHandle.NONE;
++            }
+             // TODO: cache profiles
+             String[] columns = {BaseParameters.PARAMETER_ID};
+             String selection = BaseParameters.PARAMETER_TYPE + " = ? AND ("
+@@ -1141,6 +1181,14 @@ public class MediaQualityService extends SystemService {
+             if (DEBUG) {
+                 Slog.d(TAG, "getCurrentPictureProfileForTvInput");
+             }
++            int callingUid = Binder.getCallingUid();
++            int callingPid = Binder.getCallingPid();
++            if (!hasGlobalPictureQualityServicePermission(callingUid, callingPid)) {
++                mMqManagerNotifier.notifyOnPictureProfileError(
++                        null, PictureProfile.ERROR_NO_PERMISSION, callingUid, callingPid);
++                Slog.e(TAG, "getCurrentPictureProfileForTvInput: no permission");
++                return null;
++            }
+             long profileHandle = getPictureProfileForTvInput(inputId, userId);
+             if (profileHandle == -1) {
+                 return null;
+@@ -1197,6 +1245,14 @@ public class MediaQualityService extends SystemService {
+             if (DEBUG) {
+                 Slog.d(TAG, "getSoundProfileHandle");
+             }
++            int callingUid = Binder.getCallingUid();
++            int callingPid = Binder.getCallingPid();
++            if (!hasGlobalSoundQualityServicePermission(callingUid, callingPid)) {
++                mMqManagerNotifier.notifyOnSoundProfileError(
++                        null, SoundProfile.ERROR_NO_PERMISSION, callingUid, callingPid);
++                Slog.e(TAG, "getSoundProfileHandle: no permission");
++                return new ArrayList<>();
++            }
+             List<SoundProfileHandle> toReturn = new ArrayList<>();
+             synchronized (mSoundProfileLock) {
+                 for (String id : ids) {
+@@ -1218,6 +1274,14 @@ public class MediaQualityService extends SystemService {
+             if (DEBUG) {
+                 Slog.d(TAG, "getSoundProfileHandles");
+             }
++            int callingUid = Binder.getCallingUid();
++            int callingPid = Binder.getCallingPid();
++            if (!hasGlobalSoundQualityServicePermission(callingUid, callingPid)) {
++                mMqManagerNotifier.notifyOnSoundProfileError(
++                        null, SoundProfile.ERROR_NO_PERMISSION, callingUid, callingPid);
++                Slog.e(TAG, "getSoundProfileHandles: no permission");
++                return new ArrayList<>();
++            }
+             List<SoundProfileHandle> toReturn = new ArrayList<>();
+             synchronized (mSoundProfileLock) {
+                 for (String id : ids) {
+-- 
+2.56.0
+

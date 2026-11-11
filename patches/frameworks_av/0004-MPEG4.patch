@@ -1,0 +1,75 @@
+From d648a7cf06a75c6bfb95fd62f4beccd3b8bdd4bd Mon Sep 17 00:00:00 2001
+From: Venkatarama Avadhani <venkataramaa@google.com>
+Date: Mon, 1 Jun 2026 11:07:04 +0530
+Subject: [PATCH 4/5] =?utf-8?q?=E9=99=90=E5=88=B6=20MPEG4=20=E5=88=86?=
+ =?utf-8?q?=E7=89=87=E8=A7=A3=E6=9E=90=E9=80=92=E5=BD=92=E6=B7=B1=E5=BA=A6?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+MPEG4Source::parseChunk processed nested boxes (like moof->traf->moof)
+recursively but did not track recursion depth. An attacker could craft
+an MP4 file containing excessively nested boxes, leading to stack
+exhaustion and a crash in mediaserver.
+
+This change implements a recursion depth guard in MPEG4Source::parseChunk
+similar to the one already present in MPEG4Extractor::parseChunk.
+
+Bug: 503554506
+Test: m libmp4extractor
+Flag: EXEMPT CVE_FIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:4a06c37022b130d3b9a45ea4781e6e142105c0b9
+Merged-In: I4f856dcf88ba7a097382995e4e7fa8fe8a3dbebd
+Change-Id: I4f856dcf88ba7a097382995e4e7fa8fe8a3dbebd
+
+(cherry picked from commit c1e944ccdb4f1d7587aa4f3fef4fba106e5a9ffc)
+---
+ media/module/extractors/mp4/MPEG4Extractor.cpp | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/media/module/extractors/mp4/MPEG4Extractor.cpp b/media/module/extractors/mp4/MPEG4Extractor.cpp
+index 0396fe797a..b9e29207a5 100644
+--- a/media/module/extractors/mp4/MPEG4Extractor.cpp
++++ b/media/module/extractors/mp4/MPEG4Extractor.cpp
+@@ -201,7 +201,7 @@ private:
+     uint64_t mElstInitialEmptyEditTicks;
+ 
+     size_t parseNALSize(const uint8_t *data) const;
+-    status_t parseChunk(off64_t *offset);
++    status_t parseChunk(off64_t *offset, int depth = 0);
+     status_t parseTrackFragmentHeader(off64_t offset, off64_t size);
+     status_t parseTrackFragmentRun(off64_t offset, off64_t size);
+     status_t parseSampleAuxiliaryInformationSizes(off64_t offset, off64_t size);
+@@ -5903,7 +5903,10 @@ media_status_t MPEG4Source::stop() {
+     return AMEDIA_OK;
+ }
+ 
+-status_t MPEG4Source::parseChunk(off64_t *offset) {
++status_t MPEG4Source::parseChunk(off64_t *offset, int depth) {
++    if (depth > 100) {
++        return ERROR_MALFORMED;
++    }
+     uint32_t hdr[2];
+     if (mDataSource->readAt(*offset, hdr, 8) < 8) {
+         return ERROR_IO;
+@@ -5944,7 +5947,7 @@ status_t MPEG4Source::parseChunk(off64_t *offset) {
+                 mCurrentMoofSize = chunk_data_size;
+             }
+             while (*offset < stop_offset) {
+-                status_t err = parseChunk(offset);
++                status_t err = parseChunk(offset, depth + 1);
+                 if (err != OK) {
+                     return err;
+                 }
+@@ -5982,7 +5985,7 @@ status_t MPEG4Source::parseChunk(off64_t *offset) {
+                         mNextMoofOffset = *offset;
+                         break;
+                     } else if (chunk_type == FOURCC("mdat") && chunk_size > 0) {
+-                        status_t err = parseChunk(offset);
++                        status_t err = parseChunk(offset, depth + 1);
+                         if (err != OK) {
+                             return err;
+                         }
+-- 
+2.56.0
+

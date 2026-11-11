@@ -1,0 +1,365 @@
+From 460e1eb3f1d5e9e8b2112844c28f0e1fc11d5f71 Mon Sep 17 00:00:00 2001
+From: Devin Moore <devinmoore@google.com>
+Date: Fri, 26 Jun 2026 22:26:48 +0000
+Subject: [PATCH 2/4] =?utf-8?q?=E4=BF=AE=E5=A4=8D=20Trusty=20Binder=20?=
+ =?utf-8?q?=E5=87=BA=E5=90=91=E8=BF=9E=E6=8E=A5=E6=96=AD=E5=BC=80=E5=90=8E?=
+ =?utf-8?q?=E7=9A=84=E4=BC=9A=E8=AF=9D=E6=B8=85=E7=90=86?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Bug: 514745329
+
+(cherry picked from commit 5d7f7d614543c87cb9ada6463d4b919f41d4f1c6)
+Change-Id: I67254d968b338f382aee8af31b75e46594c05900
+---
+ libs/binder/RpcServer.cpp                     |  24 +++-
+ libs/binder/RpcSession.cpp                    |  28 +++--
+ libs/binder/include/binder/RpcServer.h        |   4 +-
+ libs/binder/include/binder/RpcSession.h       |   5 +-
+ libs/binder/tests/binderRpcTest.cpp           | 112 ++++++++++++++++++
+ libs/binder/trusty/RpcServerTrusty.cpp        |  26 ++--
+ .../trusty/include/binder/RpcServerTrusty.h   |   1 +
+ 7 files changed, 176 insertions(+), 24 deletions(-)
+
+diff --git a/libs/binder/RpcServer.cpp b/libs/binder/RpcServer.cpp
+index 999b080..1917103 100644
+--- a/libs/binder/RpcServer.cpp
++++ b/libs/binder/RpcServer.cpp
+@@ -352,7 +352,8 @@ status_t RpcServer::acceptConnection(
+         RpcMutexLockGuard _l(mLock);
+         RpcMaybeThread thread =
+                 RpcMaybeThread(&RpcServer::establishConnection, sp<RpcServer>::fromExisting(this),
+-                               std::move(clientFd), addr, addrLen, std::move(joinFn));
++                               std::move(clientFd), addr, addrLen, std::move(joinFn),
++                               /* incomingSetupFn */ nullptr);
+         auto& threadRef = mConnectingThreads[thread.get_id()];
+         threadRef = std::move(thread);
+         rpcJoinIfSingleThreaded(threadRef);
+@@ -430,7 +431,8 @@ size_t RpcServer::numUninitializedSessions() {
+ void RpcServer::establishConnection(
+         sp<RpcServer>&& server, RpcTransportFd clientFd, std::array<uint8_t, kRpcAddressSize> addr,
+         size_t addrLen,
+-        std::function<void(sp<RpcSession>&&, RpcSession::PreJoinSetupResult&&)>&& joinFn) {
++        std::function<void(sp<RpcSession>&&, RpcSession::PreJoinSetupResult&&)>&& joinFn,
++        std::function<void(sp<RpcSession>&&, RpcSession::PreJoinSetupResult&&)>&& incomingSetupFn) {
+     // mShutdownTrigger can only be cleared once connection threads have joined.
+     // It must be set before this thread is started
+     LOG_ALWAYS_FATAL_IF(server->mShutdownTrigger == nullptr);
+@@ -609,8 +611,22 @@ void RpcServer::establishConnection(
+         }
+ 
+         if (incoming) {
+-            LOG_ALWAYS_FATAL_IF(OK != session->addOutgoingConnection(std::move(client), true),
+-                                "server state must already be initialized");
++            sp<RpcSession::RpcConnection> connection;
++            status_t incomingStatus =
++                    session->addOutgoingConnection(std::move(client), true, &connection);
++            if (incomingStatus == DEAD_OBJECT) {
++                ALOGE("Connection request to a dead session. Rejecting connection.");
++                return;
++            }
++            LOG_ALWAYS_FATAL_IF(OK != incomingStatus, "Adding outgoing connection failed with %s",
++                                statusToString(incomingStatus).c_str());
++            if (incomingSetupFn) {
++                incomingSetupFn(std::move(session),
++                                RpcSession::PreJoinSetupResult{
++                                        .connection = std::move(connection),
++                                        .status = OK,
++                                });
++            }
+             return;
+         }
+ 
+diff --git a/libs/binder/RpcSession.cpp b/libs/binder/RpcSession.cpp
+index 87bf7ea..501b6d6 100644
+--- a/libs/binder/RpcSession.cpp
++++ b/libs/binder/RpcSession.cpp
+@@ -780,23 +780,35 @@ status_t RpcSession::initShutdownTrigger() {
+     return OK;
+ }
+ 
+-status_t RpcSession::addOutgoingConnection(std::unique_ptr<RpcTransport> rpcTransport, bool init) {
++status_t RpcSession::addOutgoingConnection(std::unique_ptr<RpcTransport> rpcTransport, bool init,
++                                           sp<RpcConnection>* outConnection) {
+     sp<RpcConnection> connection = sp<RpcConnection>::make();
+-    {
+-        RpcMutexLockGuard _l(mMutex);
+-        connection->rpcTransport = std::move(rpcTransport);
+-        connection->exclusiveTid = binder::os::GetThreadId();
+-        mConnections.mOutgoing.push_back(connection);
+-    }
++    connection->rpcTransport = std::move(rpcTransport);
++    connection->exclusiveTid = binder::os::GetThreadId();
+ 
+     status_t status = OK;
+     if (init) {
+         status = mRpcBinderState->sendConnectionInit(*connection, *this);
++        if (status != OK) {
++            if (outConnection != nullptr) {
++                *outConnection = nullptr;
++            }
++            return status;
++        }
++    }
++
++    {
++        RpcMutexLockGuard _l(mMutex);
++        mConnections.mOutgoing.push_back(connection);
+     }
+ 
+     clearConnectionTid(connection);
+ 
+-    return status;
++    if (outConnection != nullptr) {
++        *outConnection = connection;
++    }
++
++    return OK;
+ }
+ 
+ bool RpcSession::setForServer(const wp<RpcServer>& server, const wp<EventListener>& eventListener,
+diff --git a/libs/binder/include/binder/RpcServer.h b/libs/binder/include/binder/RpcServer.h
+index 9655fb1..89f2090 100644
+--- a/libs/binder/include/binder/RpcServer.h
++++ b/libs/binder/include/binder/RpcServer.h
+@@ -260,7 +260,9 @@ private:
+     static void establishConnection(
+             sp<RpcServer>&& server, RpcTransportFd clientFd,
+             std::array<uint8_t, kRpcAddressSize> addr, size_t addrLen,
+-            std::function<void(sp<RpcSession>&&, RpcSession::PreJoinSetupResult&&)>&& joinFn);
++            std::function<void(sp<RpcSession>&&, RpcSession::PreJoinSetupResult&&)>&& joinFn,
++            std::function<void(sp<RpcSession>&&, RpcSession::PreJoinSetupResult&&)>&&
++                    incomingSetupFn = nullptr);
+     static status_t acceptSocketConnection(const RpcServer& server, RpcTransportFd* out);
+     static status_t recvmsgSocketConnection(const RpcServer& server, RpcTransportFd* out);
+ 
+diff --git a/libs/binder/include/binder/RpcSession.h b/libs/binder/include/binder/RpcSession.h
+index 66471d9..a21316e 100644
+--- a/libs/binder/include/binder/RpcSession.h
++++ b/libs/binder/include/binder/RpcSession.h
+@@ -319,14 +319,15 @@ private:
+                                                 bool incoming);
+     [[nodiscard]] status_t addIncomingConnection(std::unique_ptr<RpcTransport> rpcTransport);
+     [[nodiscard]] status_t addOutgoingConnection(std::unique_ptr<RpcTransport> rpcTransport,
+-                                                 bool init);
++                                                 bool init,
++                                                 sp<RpcConnection>* outConnection = nullptr);
++    [[nodiscard]] bool removeIncomingConnection(const sp<RpcConnection>& connection);
+     [[nodiscard]] bool setForServer(const wp<RpcServer>& server,
+                                     const wp<RpcSession::EventListener>& eventListener,
+                                     const std::vector<uint8_t>& sessionId,
+                                     const sp<IBinder>& sessionSpecificRoot);
+     sp<RpcConnection> assignIncomingConnectionToThisThread(
+             std::unique_ptr<RpcTransport> rpcTransport);
+-    [[nodiscard]] bool removeIncomingConnection(const sp<RpcConnection>& connection);
+     void clearConnectionTid(const sp<RpcConnection>& connection);
+ 
+     [[nodiscard]] status_t initShutdownTrigger();
+diff --git a/libs/binder/tests/binderRpcTest.cpp b/libs/binder/tests/binderRpcTest.cpp
+index b6b40ee..1c20770 100644
+--- a/libs/binder/tests/binderRpcTest.cpp
++++ b/libs/binder/tests/binderRpcTest.cpp
+@@ -2952,6 +2952,118 @@ INSTANTIATE_TEST_SUITE_P(
+         RpcTransportTlsKeyTest::PrintParamInfo);
+ #endif // BINDER_RPC_TO_TRUSTY_TEST
+ 
++#ifdef BINDER_RPC_TO_TRUSTY_TEST
++TEST_P(BinderRpc, IncomingConnectionDos) {
++    if (socketType() != SocketType::TIPC) {
++        GTEST_SKIP() << "TIPC only test";
++    }
++
++    std::string port = trustyIpcPort(RPC_WIRE_PROTOCOL_VERSION);
++
++    // 1. Open TIPC channel A
++    unique_fd fdA(tipc_connect(kTrustyIpcDevice, port.c_str()));
++    ASSERT_TRUE(fdA.ok());
++
++    // 2. Standard new-session handshake on A (sessionIdSize = 0)
++    RpcConnectionHeader header;
++    header.version = RPC_WIRE_PROTOCOL_VERSION;
++    header.options = 0; // outgoing for client, incoming for server
++    header.fileDescriptorTransportMode =
++            static_cast<uint8_t>(RpcSession::FileDescriptorTransportMode::TRUSTY);
++    memset(header.reservered, 0, sizeof(header.reservered));
++    header.sessionIdSize = 0;
++
++    ASSERT_EQ(write(fdA.get(), &header, sizeof(header)), (ssize_t)sizeof(header));
++    RpcNewSessionResponse resp;
++    ASSERT_EQ(read(fdA.get(), &resp, sizeof(resp)), (ssize_t)sizeof(resp));
++
++    RpcOutgoingConnectionInit init;
++    memset(&init, 0, sizeof(init));
++    memcpy(init.msg, RPC_CONNECTION_INIT_OKAY, 4);
++    ASSERT_EQ(write(fdA.get(), &init, sizeof(init)), (ssize_t)sizeof(init));
++
++    // 3. Send RPC_SPECIAL_TRANSACT_GET_SESSION_ID on A
++    RpcWireHeader wireHeader;
++    memset(&wireHeader, 0, sizeof(wireHeader));
++    wireHeader.command = RPC_COMMAND_TRANSACT;
++    wireHeader.bodySize = sizeof(RpcWireTransaction);
++
++    RpcWireTransaction wireTx = {}; // zero initialize
++    wireTx.address.options = 0;
++    wireTx.address.address = RPC_SPECIAL_TRANSACTION_ADDRESS;
++    wireTx.code = RPC_SPECIAL_TRANSACT_GET_SESSION_ID;
++    wireTx.flags = 0;
++    wireTx.asyncNumber = 0;
++    wireTx.parcelDataSize = 0;
++
++    uint8_t msgA[sizeof(RpcWireHeader) + sizeof(RpcWireTransaction)];
++    memcpy(msgA, &wireHeader, sizeof(RpcWireHeader));
++    memcpy(msgA + sizeof(RpcWireHeader), &wireTx, sizeof(RpcWireTransaction));
++    ASSERT_EQ(write(fdA.get(), msgA, sizeof(msgA)), (ssize_t)sizeof(msgA));
++
++    // Read the entire reply message at once (TIPC is message-based)
++    uint8_t replyBuf[256];
++    ssize_t bytesRead = read(fdA.get(), replyBuf, sizeof(replyBuf));
++    ASSERT_GT(bytesRead, 0) << "read failed: " << strerror(errno);
++    ASSERT_GE((size_t)bytesRead,
++              sizeof(RpcWireHeader) + RpcWireReply::wireSize(RPC_WIRE_PROTOCOL_VERSION));
++
++    RpcWireHeader* replyHeader = reinterpret_cast<RpcWireHeader*>(replyBuf);
++    ASSERT_EQ(replyHeader->command, RPC_COMMAND_REPLY);
++
++    RpcWireReply* replyInfo = reinterpret_cast<RpcWireReply*>(replyBuf + sizeof(RpcWireHeader));
++    ASSERT_EQ(replyInfo->status, OK);
++
++    size_t replyWireSize = RpcWireReply::wireSize(RPC_WIRE_PROTOCOL_VERSION);
++    size_t dataSize = replyHeader->bodySize - replyWireSize;
++    ASSERT_EQ((size_t)bytesRead, sizeof(RpcWireHeader) + replyWireSize + dataSize);
++
++    // The session ID is the byte array in the parcel.
++    // In Android Parcel, a byte vector is written as:
++    // int32_t size (32 bytes)
++    // 32 bytes data.
++    // So session ID starts at offset 4.
++    uint8_t* parcelData = replyBuf + sizeof(RpcWireHeader) + replyWireSize;
++    ASSERT_GE(dataSize, 4u + 32u);
++    std::vector<uint8_t> sessionId(parcelData + 4, parcelData + 4 + 32);
++
++    // 4. Repeatedly open INCOMING connections and holding onto some of them
++    // to make sure this pattern works as expected.
++    // Then close the connectios after KEEP_FDS_NUM.
++    // The service should be resilient and accept new tipc_connect requests
++    // even though it will refuse to add more incoming connections
++    constexpr int KEEP_FDS_NUM = 5;
++    constexpr int CONN_ITERATIONS = 500;
++    std::vector<unique_fd> fds;
++    fds.reserve(KEEP_FDS_NUM);
++    for (int i = 0; i < CONN_ITERATIONS; i++) {
++        unique_fd fdB(tipc_connect(kTrustyIpcDevice, port.c_str()));
++        EXPECT_TRUE(fdB.ok()) << "Failed to connect on loop " << i;
++        if (!fdB.ok()) {
++            continue;
++        }
++
++        RpcConnectionHeader header2;
++        header2.version = RPC_WIRE_PROTOCOL_VERSION;
++        header2.options = RPC_CONNECTION_OPTION_INCOMING;
++        header2.fileDescriptorTransportMode =
++                static_cast<uint8_t>(RpcSession::FileDescriptorTransportMode::TRUSTY);
++        memset(header2.reservered, 0, sizeof(header2.reservered));
++        header2.sessionIdSize = sessionId.size();
++
++        uint8_t msgB[sizeof(RpcConnectionHeader) + 32];
++        memcpy(msgB, &header2, sizeof(RpcConnectionHeader));
++        memcpy(msgB + sizeof(RpcConnectionHeader), sessionId.data(), 32);
++        EXPECT_EQ(write(fdB.get(), msgB, sizeof(msgB)), (ssize_t)sizeof(msgB));
++
++        // Keep a few FDs, close the rest to trigger the leak!
++        if (i < KEEP_FDS_NUM) {
++            fds.push_back(std::move(fdB));
++        }
++    }
++}
++#endif // BINDER_RPC_TO_TRUSTY_TEST
++
+ } // namespace android
+ 
+ int main(int argc, char** argv) {
+diff --git a/libs/binder/trusty/RpcServerTrusty.cpp b/libs/binder/trusty/RpcServerTrusty.cpp
+index 4f0ccea..c90a9e0 100644
+--- a/libs/binder/trusty/RpcServerTrusty.cpp
++++ b/libs/binder/trusty/RpcServerTrusty.cpp
+@@ -219,7 +219,8 @@ int RpcServerTrusty::handleConnectInternal(RpcServer* rpcServer, handle_t chan,
+     rpcServer->mConnectingThreads[rpc_this_thread::get_id()] = RpcMaybeThread();
+ 
+     int rc = NO_ERROR;
+-    auto joinFn = [&](sp<RpcSession>&& session, RpcSession::PreJoinSetupResult&& result) {
++    auto setupChannelContext = [&](sp<RpcSession>&& session,
++                                   RpcSession::PreJoinSetupResult&& result, bool isIncoming) {
+         if (result.status != OK) {
+             rc = statusToTrusty(result.status);
+             return;
+@@ -234,10 +235,19 @@ int RpcServerTrusty::handleConnectInternal(RpcServer* rpcServer, handle_t chan,
+ 
+         channelContext->session = std::move(session);
+         channelContext->connection = std::move(result.connection);
++        channelContext->isIncoming = isIncoming;
+ 
+         *ctx_p = channelContext;
+     };
+ 
++    auto joinFn = [&](sp<RpcSession>&& session, RpcSession::PreJoinSetupResult&& result) {
++        setupChannelContext(std::move(session), std::move(result), true);
++    };
++
++    auto incomingSetupFn = [&](sp<RpcSession>&& session, RpcSession::PreJoinSetupResult&& result) {
++        setupChannelContext(std::move(session), std::move(result), false);
++    };
++
+     // We need to duplicate the channel handle here because the tipc library
+     // owns the original handle and closes is automatically on channel cleanup.
+     // We use dup() because Trusty does not have fcntl().
+@@ -255,7 +265,7 @@ int RpcServerTrusty::handleConnectInternal(RpcServer* rpcServer, handle_t chan,
+     }
+     memcpy(addr.data(), &peer, peer_len);
+     RpcServer::establishConnection(sp<RpcServer>::fromExisting(rpcServer), std::move(transportFd),
+-                                   addr, peer_len, joinFn);
++                                   addr, peer_len, joinFn, incomingSetupFn);
+ 
+     return rc;
+ }
+@@ -290,9 +300,6 @@ void RpcServerTrusty::handleDisconnect(const tipc_port* /*port*/, handle_t /*cha
+ void RpcServerTrusty::handleDisconnectInternal(void* ctx) {
+     auto* channelContext = reinterpret_cast<ChannelContext*>(ctx);
+     if (channelContext == nullptr) {
+-        // Connections marked "incoming" (outgoing from the server's side)
+-        // do not have a valid channel context because joinFn does not get
+-        // called for them. We ignore them here.
+         return;
+     }
+ 
+@@ -306,10 +313,11 @@ void RpcServerTrusty::handleChannelCleanup(void* ctx) {
+         return;
+     }
+ 
+-    auto& session = channelContext->session;
+-    auto& connection = channelContext->connection;
+-    LOG_ALWAYS_FATAL_IF(!session->removeIncomingConnection(connection),
+-                        "bad state: connection object guaranteed to be in list");
++    if (channelContext->isIncoming) {
++        LOG_ALWAYS_FATAL_IF(!channelContext->session->removeIncomingConnection(
++                                    channelContext->connection),
++                            "bad state: connection object guaranteed to be in list");
++    }
+ 
+     delete channelContext;
+ }
+diff --git a/libs/binder/trusty/include/binder/RpcServerTrusty.h b/libs/binder/trusty/include/binder/RpcServerTrusty.h
+index f137344..119d38e 100644
+--- a/libs/binder/trusty/include/binder/RpcServerTrusty.h
++++ b/libs/binder/trusty/include/binder/RpcServerTrusty.h
+@@ -142,6 +142,7 @@ private:
+     struct ChannelContext {
+         sp<RpcSession> session;
+         sp<RpcSession::RpcConnection> connection;
++        bool isIncoming = true;
+     };
+ 
+     static int handleConnect(const tipc_port* port, handle_t chan, const trusty_peer_id* peer,
+-- 
+2.56.0
+

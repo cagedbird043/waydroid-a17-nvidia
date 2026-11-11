@@ -1,0 +1,79 @@
+From 767c0a9c8c0b53e988eec727d4bbd66dc23d2d3b Mon Sep 17 00:00:00 2001
+From: Chris Li <lihongyu@google.com>
+Date: Thu, 16 Jul 2026 11:50:41 +0000
+Subject: [PATCH 17/45] =?utf-8?q?=E6=8C=89=E8=B0=83=E7=94=A8=E8=80=85?=
+ =?utf-8?q?=E6=9D=83=E9=99=90=E8=84=B1=E6=95=8F=E4=BB=BB=E5=8A=A1=E4=BF=A1?=
+ =?utf-8?q?=E6=81=AF?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+AppTaskImpl.getTaskInfo() previously bypassed permission checks
+and hardcoded getTasksAllowed=true when fetching task info. This
+allowed callers of AppTaskImpl to view top activity details even
+when topActivityUid differed from the task's effectiveUid.
+
+This change:
+1. Enforces mService.isGetTasksAllowed(callingPid, callingUid)
+   inside AppTaskImpl.getTaskInfo().
+2. Redacts pictureInPictureParams, mTopActivityLocusId, and
+   taskDescription in Task.trimIneffectiveInfo() when top activity
+   UID differs from task effectiveUid and getTasksAllowed is false.
+
+Flag: EXEMPT BUGFIX
+Bug: 527037031
+Test: atest WmTests:AppTaskImplTests WmTests:TaskTests
+TAG=agy
+CONV=66230edf-f2c8-4750-9691-231050737ce2
+
+Merged-In: I78a6fa8331ebaef246f1f4d1e9f0e32dd9db0639
+Change-Id: I78a6fa8331ebaef246f1f4d1e9f0e32dd9db0639
+
+(cherry picked from commit a015ea786c9a145205b3e34323995bcbebf8aacc)
+---
+ services/core/java/com/android/server/wm/AppTaskImpl.java | 6 +++++-
+ services/core/java/com/android/server/wm/Task.java        | 3 +++
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/services/core/java/com/android/server/wm/AppTaskImpl.java b/services/core/java/com/android/server/wm/AppTaskImpl.java
+index faaf6912b..68cb9697e 100644
+--- a/services/core/java/com/android/server/wm/AppTaskImpl.java
++++ b/services/core/java/com/android/server/wm/AppTaskImpl.java
+@@ -146,6 +146,8 @@ class AppTaskImpl extends IAppTask.Stub {
+         checkCallerOrSystemOrRoot();
+ 
+         synchronized (mService.mGlobalLock) {
++            final int callingPid = Binder.getCallingPid();
++            final int callingUid = Binder.getCallingUid();
+             final long origId = Binder.clearCallingIdentity();
+             try {
+                 Task task = mService.mRootWindowContainer.anyTaskForId(mTaskId,
+@@ -154,8 +156,10 @@ class AppTaskImpl extends IAppTask.Stub {
+                     Slog.w(TAG, "Unable to find task ID " + mTaskId);
+                     return null;
+                 }
++                final boolean getTasksAllowed = mService.isGetTasksAllowed(
++                        "getTaskInfo", callingPid, callingUid);
+                 return mService.getRecentTasks().createRecentTaskInfo(task,
+-                        false /* stripExtras */, true /* getTasksAllowed */);
++                        false /* stripExtras */, getTasksAllowed);
+             } finally {
+                 Binder.restoreCallingIdentity(origId);
+             }
+diff --git a/services/core/java/com/android/server/wm/Task.java b/services/core/java/com/android/server/wm/Task.java
+index 726c52c00..23c7366cb 100644
+--- a/services/core/java/com/android/server/wm/Task.java
++++ b/services/core/java/com/android/server/wm/Task.java
+@@ -3624,6 +3624,9 @@ class Task extends TaskFragment {
+             info.topActivityInfo.applicationInfo.taskAffinity = "";
+             info.topActivityInfo.applicationInfo.name = "";
+             info.topActivityInfo.applicationInfo.packageName = "";
++            info.pictureInPictureParams = null;
++            info.mTopActivityLocusId = null;
++            info.taskDescription = new ActivityManager.TaskDescription();
+         }
+ 
+         if (task.effectiveUid != baseActivityUid) {
+-- 
+2.56.0
+

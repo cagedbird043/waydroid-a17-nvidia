@@ -1,0 +1,51 @@
+From d073d9c52c03e58f1dfe3ff8f4527d25a97fce4b Mon Sep 17 00:00:00 2001
+From: Jon Spivack <spivack@google.com>
+Date: Tue, 30 Jun 2026 18:53:24 -0700
+Subject: [PATCH 24/45] =?utf-8?q?=E7=A6=81=E6=AD=A2=E4=BD=BF=E7=94=A8?=
+ =?utf-8?q?=E6=97=B6=E9=95=BF=E5=9B=9E=E8=B0=83=E4=BB=8E=E5=90=8E=E5=8F=B0?=
+ =?utf-8?q?=E5=90=AF=E5=8A=A8=E5=89=8D=E5=8F=B0=E6=9C=8D=E5=8A=A1?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+By explicitly setting MODE_BACKGROUND_ACTIVITY_START_DENIED in the PendingIntent sent from AppTimeTracker, we can prevent an exploit wherein apps could start foreground services from the background. See the bug for more details.
+
+Bug: 478861451
+Test: Manual (repro steps in bug)
+Flag: EXEMPT BUGFIX
+TAG=agy
+CONV=067ca68d-06b9-46b3-a962-5cf3f33a691d
+Change-Id: I69666bf1a7b0b3ef4beb77ff39ac75325dac88b9
+
+(cherry picked from commit 077474f453846c1b02462c0b58577b8350bb344b)
+---
+ .../java/com/android/server/am/AppTimeTracker.java   | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/services/core/java/com/android/server/am/AppTimeTracker.java b/services/core/java/com/android/server/am/AppTimeTracker.java
+index 2da6a33d2..07e5331ef 100644
+--- a/services/core/java/com/android/server/am/AppTimeTracker.java
++++ b/services/core/java/com/android/server/am/AppTimeTracker.java
+@@ -90,8 +90,18 @@ public class AppTimeTracker {
+         extras.putBundle(ActivityOptions.EXTRA_USAGE_TIME_REPORT_PACKAGES, pkgs);
+         Intent fillinIntent = new Intent();
+         fillinIntent.putExtras(extras);
++        ActivityOptions options = ActivityOptions.makeBasic();
++        options.setPendingIntentBackgroundActivityStartMode(
++                ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_DENIED);
+         try {
+-            mReceiver.send(context, 0, fillinIntent);
++            mReceiver.send(
++                    context,
++                    /* code= */ 0,
++                    fillinIntent,
++                    /* onFinished= */ null,
++                    /* handler= */ null,
++                    /* requiredPermission= */ null,
++                    options.toBundle());
+         } catch (PendingIntent.CanceledException e) {
+         }
+     }
+-- 
+2.56.0
+

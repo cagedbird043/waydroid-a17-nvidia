@@ -1,0 +1,106 @@
+From c049c12312c1376a1b08cf26fe598fd31be10054 Mon Sep 17 00:00:00 2001
+From: Josh Hou <joshhou@google.com>
+Date: Wed, 1 Jul 2026 01:46:21 -0700
+Subject: [PATCH 32/45] =?utf-8?q?=E5=85=BC=E5=AE=B9=E6=9C=AA=E5=AE=89?=
+ =?utf-8?q?=E8=A3=85=E5=BA=94=E7=94=A8=E7=9A=84=E8=A6=86=E7=9B=96=E8=AF=AD?=
+ =?utf-8?q?=E8=A8=80=E9=85=8D=E7=BD=AE=E6=9F=A5=E8=AF=A2?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+When getOverrideLocaleConfig is called for a package that is not installed
+for the target user, it previously threw an IllegalArgumentException because
+isPackageOwnedByCaller checked the package UID and threw if it was < 0.
+
+This caused crashes in Settings (which calls getOverrideLocaleConfig via
+LocaleConfig constructor to check if apps support locales) when it queried
+packages that were not installed in the current user profile (e.g. test packages
+only installed in user 0 but queried in user 10).
+
+This change adds a package existence check at the beginning of
+getOverrideLocaleConfig, returning null immediately if the package is not found,
+restoring the previous behavior and preventing crashes.
+
+Bug: 495409704
+Bug: 529474515
+Test: atest FrameworksServicesTests:LocaleManagerServiceTest
+Flag: EXEMPT BUGFIX
+Change-Id: I12dea12f5dc790edb45091bc3eaca59748f3b273
+
+(cherry picked from commit 3ee6771f2a38de2a4386b0981a522383a645c093)
+---
+ .../server/locales/LocaleManagerService.java  |  4 ++
+ .../locales/LocaleManagerServiceTest.java     | 39 ++++++++++++++++---
+ 2 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/services/core/java/com/android/server/locales/LocaleManagerService.java b/services/core/java/com/android/server/locales/LocaleManagerService.java
+index 1e34f7ab1..9715c1f15 100644
+--- a/services/core/java/com/android/server/locales/LocaleManagerService.java
++++ b/services/core/java/com/android/server/locales/LocaleManagerService.java
+@@ -769,6 +769,10 @@ public class LocaleManagerService extends SystemService {
+                 false /* allowAll */, ActivityManagerInternal.ALLOW_NON_FULL,
+                 "getOverrideLocaleConfig", /* callerPackage= */ null);
+ 
++        if (getPackageUid(appPackageName, userId) < 0) {
++            return null;
++        }
++
+         if (!isPackageOwnedByCaller(appPackageName, userId, null, null)
+                 && !isCallerInstaller(appPackageName, userId)
+                 && !(isCallerFromCurrentInputMethod(userId)
+diff --git a/services/tests/servicestests/src/com/android/server/locales/LocaleManagerServiceTest.java b/services/tests/servicestests/src/com/android/server/locales/LocaleManagerServiceTest.java
+index 968058265..8da8ef5f8 100644
+--- a/services/tests/servicestests/src/com/android/server/locales/LocaleManagerServiceTest.java
++++ b/services/tests/servicestests/src/com/android/server/locales/LocaleManagerServiceTest.java
+@@ -410,14 +410,43 @@ public class LocaleManagerServiceTest {
+         }
+     }
+ 
+-    @Test(expected = IllegalArgumentException.class)
+-    public void testGetOverrideLocaleConfig_pathTraversal_fails() throws Exception {
+-        String traversalPackageName = "../../10/locale_configs/com.victim";
++    @Test
++    public void testGetOverrideLocaleConfig_packageNotFound_returnsNull() throws Exception {
++        String unknownPackage = "com.unknown.package";
+         doThrow(new PackageManager.NameNotFoundException("Mock"))
+-                .when(mMockPackageManager).getPackageUidAsUser(eq(traversalPackageName), any(),
++                .when(mMockPackageManager).getPackageUidAsUser(eq(unknownPackage), any(),
+                         anyInt());
+ 
+-        mLocaleManagerService.getOverrideLocaleConfig(traversalPackageName, DEFAULT_USER_ID);
++        assertNull(mLocaleManagerService.getOverrideLocaleConfig(
++                unknownPackage, DEFAULT_USER_ID));
++    }
++
++    @Test
++    public void testGetOverrideLocaleConfig_packageExists_noConfig_returnsNull() throws Exception {
++        doReturn(DEFAULT_UID).when(mMockPackageManager)
++                .getPackageUidAsUser(eq(DEFAULT_PACKAGE_NAME), any(), anyInt());
++        setUpPassingPermissionCheckFor(Manifest.permission.READ_APP_SPECIFIC_LOCALES);
++
++        assertNull(mLocaleManagerService.getOverrideLocaleConfig(
++                DEFAULT_PACKAGE_NAME, DEFAULT_USER_ID));
++    }
++
++    @Test
++    public void testGetOverrideLocaleConfig_otherUser_unauthorized_throwsSecurityException()
++            throws Exception {
++        String unknownPackage = "com.unknown.package";
++        int otherUserId = 10;
++        doThrow(new SecurityException("Mock"))
++                .when(mMockActivityManager).handleIncomingUser(
++                        anyInt(), anyInt(), eq(otherUserId), anyBoolean(), anyInt(), anyString(),
++                        any());
++
++        try {
++            mLocaleManagerService.getOverrideLocaleConfig(unknownPackage, otherUserId);
++            fail("Expected SecurityException");
++        } catch (SecurityException e) {
++            // expected
++        }
+     }
+ 
+     @Test
+-- 
+2.56.0
+

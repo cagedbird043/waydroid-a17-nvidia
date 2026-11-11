@@ -1,0 +1,93 @@
+From cee396102144784e813a0c53a1ef96b1247063dd Mon Sep 17 00:00:00 2001
+From: Karthick M J <karthickmj@google.com>
+Date: Mon, 6 Jul 2026 06:43:54 -0700
+Subject: [PATCH 04/45] =?utf-8?q?=E6=A0=A1=E9=AA=8C=20MMS=20=E5=86=85?=
+ =?utf-8?q?=E5=AE=B9=E7=B1=BB=E5=9E=8B=E9=95=BF=E5=BA=A6=E9=98=B2=E6=AD=A2?=
+ =?utf-8?q?=E6=95=B4=E6=95=B0=E4=B8=8B=E6=BA=A2?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Problem:
+A negative value-length in PduParser.parseContentType bypasses the bounds check, leading to an integer underflow and a massive array allocation (new byte[2GiB]) which causes an OutOfMemoryError in com.android.phone.
+
+Fix details:
+Added a bounds check `if (length < 0 || length > startPos)` in `PduParser.parseContentType` to reject negative lengths.
+
+Bug: 517378147
+Flag: EXEMPT BUGFIX
+Test: atest TelephonyCommonTests:com.google.android.mms.pdu.test.PduParserTest
+TAG=agy
+CONV=0ecc5045-71ce-4e1d-a344-332cbbd9a407
+Change-Id: I531242bfd3036da856c3e5b9737d48f17bb3b15e
+
+(cherry picked from commit b4d69c821e1e8b8025c0d41e0029de92cd96cc23)
+---
+ telephony/common/com/google/android/mms/pdu/PduParser.java  | 2 +-
+ .../src/com/google/android/mms/pdu/PduParserTest.java       | 6 +-----
+ 2 files changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/telephony/common/com/google/android/mms/pdu/PduParser.java b/telephony/common/com/google/android/mms/pdu/PduParser.java
+index 3ad9cb93f..080ee9186 100644
+--- a/telephony/common/com/google/android/mms/pdu/PduParser.java
++++ b/telephony/common/com/google/android/mms/pdu/PduParser.java
+@@ -1610,7 +1610,7 @@ public class PduParser {
+         if (cur < TEXT_MIN) {
+             int length = parseValueLength(pduDataStream);
+             int startPos = pduDataStream.available();
+-            if (length > startPos) {
++            if (length < 0 || length > startPos) {
+                 Log.e(LOG_TAG, "parseContentType: Invalid length " + length
+                         + " when available bytes are " + startPos);
+                 return (PduContentTypes.contentTypes[0]).getBytes(); //"*/*"
+diff --git a/tests/TelephonyCommonTests/src/com/google/android/mms/pdu/PduParserTest.java b/tests/TelephonyCommonTests/src/com/google/android/mms/pdu/PduParserTest.java
+index b963b3088..ff41634a1 100644
+--- a/tests/TelephonyCommonTests/src/com/google/android/mms/pdu/PduParserTest.java
++++ b/tests/TelephonyCommonTests/src/com/google/android/mms/pdu/PduParserTest.java
+@@ -26,10 +26,10 @@ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ 
+ @RunWith(AndroidJUnit4.class)
++@SmallTest
+ public class PduParserTest {
+ 
+     @Test
+-    @SmallTest
+     public void testParse_malformedHugeHeaderLength_doesNotOOM() {
+         byte[] pduData = new byte[] {
+             // Headers (Send-Req)
+@@ -53,7 +53,6 @@ public class PduParserTest {
+     }
+ 
+     @Test
+-    @SmallTest
+     public void testParse_invalidContentTypeIndex_doesNotThrowAIOOBE() {
+         byte[] pduData = new byte[] {
+             // Headers (Send-Req)
+@@ -73,7 +72,6 @@ public class PduParserTest {
+     }
+ 
+     @Test
+-    @SmallTest
+     public void testParse_elementDescriptorWithParams_doesNotThrowNPE() {
+         byte[] pduData = new byte[] {
+             // Headers (Send-Req)
+@@ -100,7 +98,6 @@ public class PduParserTest {
+     }
+ 
+     @Test
+-    @SmallTest
+     public void testParse_emptyCharset_doesNotThrowNPE() {
+         byte[] pduData = new byte[] {
+             // Headers (Send-Req)
+@@ -125,7 +122,6 @@ public class PduParserTest {
+     }
+ 
+     @Test
+-    @SmallTest
+     public void testPduParserUnderflowOOM() {
+         // CONTENT_TYPE (0x84), LENGTH_QUOTE (0x1F), uintvar for Integer.MIN_VALUE,
+         // well-known type (0x83)
+-- 
+2.56.0
+

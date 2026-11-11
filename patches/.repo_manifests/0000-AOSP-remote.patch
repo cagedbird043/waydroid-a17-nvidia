@@ -1,0 +1,30 @@
+From 1f2526d28c207b628fe90c07d15478ae282a868a Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Sat, 24 Oct 2026 03:13:11 +0800
+Subject: [PATCH] =?utf-8?q?AOSP=20remote=20=E4=BD=BF=E7=94=A8=E6=B8=85?=
+ =?utf-8?q?=E5=8D=8E=E9=95=9C=E5=83=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Change-Id: Iadea8ee71c5c845ccb2722f9d3f0c115329593cd
+---
+ default.xml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/default.xml b/default.xml
+index 81fd2b3..0b4ace0 100644
+--- a/default.xml
++++ b/default.xml
+@@ -9,7 +9,7 @@
+            fetch="ssh://git@github.com" />
+ 
+   <remote  name="aosp"
+-           fetch="https://android.googlesource.com"
++           fetch="https://mirrors.tuna.tsinghua.edu.cn/git/AOSP"
+            review="android-review.googlesource.com"
+            revision="refs/tags/android-17.0.0_r1" />
+ 
+-- 
+2.56.0
+

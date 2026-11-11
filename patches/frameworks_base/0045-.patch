@@ -1,0 +1,81 @@
+From 7f5e546d7cd3853fe4264398f813d2ee8f888d04 Mon Sep 17 00:00:00 2001
+From: cagedbird043 <cagedbird043@gmail.com>
+Date: Wed, 11 Nov 2026 21:28:38 +0800
+Subject: [PATCH 45/45] =?utf-8?q?=E4=BF=AE=E5=A4=8D=E9=80=92=E5=BD=92?=
+ =?utf-8?q?=E5=8D=95=E9=80=89=E7=BB=84=E5=AE=89=E5=85=A8=E8=A1=A5=E4=B8=81?=
+ =?utf-8?q?=E7=BB=84=E5=90=88=E5=90=8E=E7=9A=84=E7=9B=91=E5=90=AC=E5=99=A8?=
+ =?utf-8?q?=E6=B8=85=E7=90=86=E5=9B=9E=E9=80=80?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+递归清除所有 CompoundButton 监听器，不以可覆盖的 tag 决定是否清除；嵌套回归测试移动真实目标按钮并确认状态改变，避免重复 ID 使断言空跑。
+
+上游来源：3d9b2db09f10ef638622e1695034d7caaccbfcb2、5a1b34c130723eeae2af27b4488322aa3c95e8c9。
+---
+ core/java/android/widget/RemoteViews.java     |  7 +-----
+ .../src/android/widget/RemoteViewsTest.java   | 23 ++++++++++++-------
+ 2 files changed, 16 insertions(+), 14 deletions(-)
+
+diff --git a/core/java/android/widget/RemoteViews.java b/core/java/android/widget/RemoteViews.java
+index d61ff0b45..5c208d661 100644
+--- a/core/java/android/widget/RemoteViews.java
++++ b/core/java/android/widget/RemoteViews.java
+@@ -5941,12 +5941,7 @@ public class RemoteViews implements Parcelable, Filter {
+             RadioGroup group = (RadioGroup) target;
+ 
+             // Temporarily unset all checked change listeners across the entire subtree while we check the group.
+-            forAllCompoundButtons(group, cb -> {
+-                Object tag = cb.getTag(R.id.remote_checked_change_listener_tag);
+-                if (tag instanceof OnCheckedChangeListener) {
+-                    cb.setOnCheckedChangeListener(null);
+-                }
+-            });
++            forAllCompoundButtons(group, cb -> cb.setOnCheckedChangeListener(null));
+             group.check(mCheckedId);
+ 
+             // Restore checked change listeners across the entire subtree.
+diff --git a/core/tests/coretests/src/android/widget/RemoteViewsTest.java b/core/tests/coretests/src/android/widget/RemoteViewsTest.java
+index 8a9cbccb9..2db79f4d0 100644
+--- a/core/tests/coretests/src/android/widget/RemoteViewsTest.java
++++ b/core/tests/coretests/src/android/widget/RemoteViewsTest.java
+@@ -794,13 +794,7 @@ public class RemoteViewsTest {
+     @Test
+     public void setRadioGroupChecked_doesNotFireListenerOnNestedChildWhenClobbered()
+             throws Exception {
+-        RemoteViews views = new RemoteViews(mPackage, R.layout.radiogroup_checkedchild);
+-        RemoteViews nestedContainer = new RemoteViews(mPackage, R.layout.remote_view_host);
+-        RemoteViews nestedRadio = createRemoteViewsWithClobberedCheckedListener(
+-                R.layout.radiogroup_checkedchild);
+-        nestedContainer.addView(R.id.container, nestedRadio);
+-        views.addView(R.id.group, nestedContainer);
+-        views.setRadioGroupChecked(R.id.group, R.id.value_two);
++        RemoteViews views = createRemoteViewsWithClobberedCheckedListener();
+ 
+         boolean[] interactionFired = new boolean[1];
+         RemoteViews.InteractionHandler handler = (view, pendingIntent, response) -> {
+@@ -808,7 +802,20 @@ public class RemoteViewsTest {
+             return true;
+         };
+ 
+-        views.apply(mContext, mContainer, handler);
++        View inflated = views.apply(mContext, mContainer, handler);
++        RadioGroup group = inflated.findViewById(R.id.group);
++        RadioButton button = inflated.findViewById(R.id.value_two);
++        assertFalse(button.isChecked());
++        group.removeView(button);
++        LinearLayout nestedContainer = new LinearLayout(mContext);
++        nestedContainer.addView(button);
++        group.addView(nestedContainer);
++
++        RemoteViews update = new RemoteViews(mPackage, R.layout.radiogroup_checkedchild);
++        update.setRadioGroupChecked(R.id.group, R.id.value_two);
++        update.reapply(mContext, inflated, handler);
++
++        assertTrue("The nested target must actually be checked", button.isChecked());
+ 
+         assertFalse("Interaction should not have been fired on nested RadioGroup check!",
+                 interactionFired[0]);
+-- 
+2.56.0
+

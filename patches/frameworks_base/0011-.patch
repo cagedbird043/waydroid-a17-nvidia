@@ -1,0 +1,75 @@
+From 9ab390f46f3650d1111df1930050a51a61679836 Mon Sep 17 00:00:00 2001
+From: Diya Bera <diyab@google.com>
+Date: Mon, 29 Jun 2026 18:01:11 +0000
+Subject: [PATCH 11/45] =?utf-8?q?=E9=AA=8C=E8=AF=81=E7=94=9F=E7=89=A9?=
+ =?utf-8?q?=E8=AF=86=E5=88=AB=E5=87=AD=E6=8D=AE=E7=A1=AE=E8=AE=A4=E5=AE=A2?=
+ =?utf-8?q?=E6=88=B7=E7=AB=AF=E8=BA=AB=E4=BB=BD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Add an additional check for settings package to determine if the caller
+is CDCA
+
+Bug: 517378646
+NO_IFTTT=CDCA package check applies to SystemUI only; System Server Utils.isBackground does not track class names.
+Test: N/A
+Flag: EXEMPT CVE_FIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:76b15a24c4c674f96b38bdeaacceb33da3124dda
+Merged-In: I64189a73ba9028b67574496e4e2772387027459a
+Change-Id: I64189a73ba9028b67574496e4e2772387027459a
+
+(cherry picked from commit c3a5f9327c31e106ffe170663b5cb29dcb64db99)
+---
+ .../java/android/hardware/biometrics/PromptInfo.java |  3 ++-
+ .../src/com/android/systemui/biometrics/Utils.kt     | 12 +++++++++++-
+ 2 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/core/java/android/hardware/biometrics/PromptInfo.java b/core/java/android/hardware/biometrics/PromptInfo.java
+index 0207f1db9..0a16eeb0e 100644
+--- a/core/java/android/hardware/biometrics/PromptInfo.java
++++ b/core/java/android/hardware/biometrics/PromptInfo.java
+@@ -177,7 +177,8 @@ public class PromptInfo implements Parcelable {
+             return true;
+         } else if (mShowEmergencyCallButton) {
+             return true;
+-        } else if (mRealCallerForConfirmDeviceCredentialActivity != null) {
++        } else if (mRealCallerForConfirmDeviceCredentialActivity != null
++                || mClassNameIfItIsConfirmDeviceCredentialActivity != null) {
+             return true;
+         }
+         return false;
+diff --git a/packages/SystemUI/shared/biometrics/src/com/android/systemui/biometrics/Utils.kt b/packages/SystemUI/shared/biometrics/src/com/android/systemui/biometrics/Utils.kt
+index 5d118f187..b53d55648 100644
+--- a/packages/SystemUI/shared/biometrics/src/com/android/systemui/biometrics/Utils.kt
++++ b/packages/SystemUI/shared/biometrics/src/com/android/systemui/biometrics/Utils.kt
+@@ -121,6 +121,14 @@ object Utils {
+         return hasPermission && "android" == clientPackage
+     }
+ 
++    @JvmStatic
++    fun isSettings(context: Context, clientPackage: String?): Boolean {
++        val hasPermission =
++            (context.checkCallingOrSelfPermission(Manifest.permission.USE_BIOMETRIC_INTERNAL) ==
++                PackageManager.PERMISSION_GRANTED)
++        return hasPermission && "com.android.settings" == clientPackage
++    }
++
+     @JvmStatic
+     fun getNavbarInsets(context: Context) = getInsetsOf(context, WindowInsets.Type.navigationBars())
+ 
+@@ -184,8 +192,10 @@ object Utils {
+         val topActivity = tasks[0].topActivity
+         val isSystemApp = isSystem(context, clientPackage)
+         val topPackageEqualsToClient = topActivity!!.packageName == clientPackage
++
+         val isClientConfirmDeviceCredentialActivity =
+-            clientClassNameIfItIsConfirmDeviceCredentialActivity != null
++            clientClassNameIfItIsConfirmDeviceCredentialActivity != null &&
++                isSettings(context, clientPackage)
+ 
+         if (
+             !isClientInBackgroundOrNotVisible(
+-- 
+2.56.0
+

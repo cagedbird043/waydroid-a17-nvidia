@@ -1,0 +1,32 @@
+From 20193e3c1cc02fae0afbf591cf86a7e50e42e660 Mon Sep 17 00:00:00 2001
+From: Nolen Johnson <johnsonnolen@gmail.com>
+Date: Sat, 31 Oct 2026 14:25:17 -0400
+Subject: [PATCH 3/3] =?utf-8?q?=E5=88=87=E6=8D=A2=20Broadcom=20WLAN=20?=
+ =?utf-8?q?=E7=9A=84=20Lineage=20=E7=BB=B4=E6=8A=A4=E6=BA=90=E4=BB=93?=
+ =?utf-8?q?=E5=BA=93?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+(cherry picked from commit e4b7106)
+Change-Id: I76c9fe9bf7d93c5396542aff748d03ef2ef6a28a
+---
+ default.xml | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/default.xml b/default.xml
+index 995267d..a31cc07 100644
+--- a/default.xml
++++ b/default.xml
+@@ -653,7 +653,7 @@
+   <project path="frameworks/rs" name="platform/frameworks/rs" groups="pdk" remote="aosp" />
+   <project path="frameworks/wilhelm" name="platform/frameworks/wilhelm" groups="pdk-cw-fs,pdk-fs" remote="aosp" />
+   <project path="hardware/broadcom/libbt" name="LineageOS/android_hardware_broadcom_libbt" groups="pdk" />
+-  <project path="hardware/broadcom/wlan" name="platform/hardware/broadcom/wlan" groups="pdk,broadcom_wlan" remote="aosp" />
++  <project path="hardware/broadcom/wlan" name="LineageOS/android_hardware_broadcom_wlan" groups="pdk,broadcom_wlan" />
+   <project path="hardware/google/apf" name="platform/hardware/google/apf" groups="pdk" remote="aosp" />
+   <project path="hardware/google/av" name="platform/hardware/google/av" groups="pdk" remote="aosp" />
+   <project path="hardware/google/camera" name="LineageOS/android_hardware_google_camera" groups="pdk" />
+-- 
+2.56.0
+

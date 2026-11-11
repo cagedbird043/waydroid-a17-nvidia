@@ -1,0 +1,58 @@
+From 36c10efe1467d756fd7031258ff9c17c08f1386b Mon Sep 17 00:00:00 2001
+From: Iustin Ventaniuc <iustiniv@google.com>
+Date: Thu, 30 Jul 2026 03:39:50 -0700
+Subject: [PATCH 35/45] =?utf-8?q?=E9=9A=94=E7=A6=BB=E5=8D=95=E9=A1=B9?=
+ =?utf-8?q?=E8=AE=BE=E5=A4=87=E7=AD=96=E7=95=A5=E8=A7=A3=E6=9E=90=E5=A4=B1?=
+ =?utf-8?q?=E8=B4=A5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Catch IllegalArgumentException per-policy in readPoliciesInner rather
+than per-file in readFromFileLocked.
+
+Test: none
+Bug: 515039631
+Flag: EXEMPT BUGFIX
+
+TAG=agy
+CONV=9a527269-d864-49a9-8dd6-1fffebca18ec
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:5a6da90eafbffaa512795292791bf880e95e216f
+Merged-In: Idd9d8469e4256945342e178d9498ef90a43230e3
+Change-Id: Idd9d8469e4256945342e178d9498ef90a43230e3
+
+(cherry picked from commit ea2dacaad9c9944d4b063cc013505e3e33e4ef48)
+---
+ .../android/server/devicepolicy/DevicePolicyEngine.java  | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyEngine.java b/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyEngine.java
+index e67c8147c..fcbb9753c 100644
+--- a/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyEngine.java
++++ b/services/devicepolicy/java/com/android/server/devicepolicy/DevicePolicyEngine.java
+@@ -2585,8 +2585,7 @@ final class DevicePolicyEngine {
+ 
+                 readInnerLocked(parser);
+ 
+-            } catch (XmlPullParserException | IOException | ClassNotFoundException
+-                    | IllegalArgumentException e) {
++            } catch (XmlPullParserException | IOException | ClassNotFoundException e) {
+                 Slogf.wtf(TAG, "Error parsing resources file", e);
+             } finally {
+                 IoUtils.closeQuietly(input);
+@@ -2645,7 +2644,11 @@ final class DevicePolicyEngine {
+                         if (policyDefinition == null) {
+                             Slogf.w(TAG, "Skipping policy state - unknown policy definition");
+                         } else {
+-                            policyState = PolicyState.readFromXml(policyDefinition, parser);
++                            try {
++                                policyState = PolicyState.readFromXml(policyDefinition, parser);
++                            } catch (IllegalArgumentException e) {
++                                Slogf.wtf(TAG, "Error parsing policy state", e);
++                            }
+                         }
+                         break;
+                     default:
+-- 
+2.56.0
+

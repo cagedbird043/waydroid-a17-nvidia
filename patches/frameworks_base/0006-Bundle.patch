@@ -1,0 +1,487 @@
+From 6890ddcae28dde17cd70cd88dda2c83bef2a94ba Mon Sep 17 00:00:00 2001
+From: Eduard Dumitrescul <dveduard@google.com>
+Date: Fri, 26 Jun 2026 13:01:36 +0000
+Subject: [PATCH 06/45] =?utf-8?q?=E6=A0=A1=E9=AA=8C=E8=AE=BE=E5=A4=87?=
+ =?utf-8?q?=E7=AD=96=E7=95=A5=20Bundle=20=E7=9A=84=E5=80=BC=E7=B1=BB?=
+ =?utf-8?q?=E5=9E=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+The new `BundlePolicyTypeVerifier.java` ensures that `BundlePolicyValue`
+only contains supported value types.
+`BundlePolicySerializer` is updated to thrown an exception when it
+encounters an unsupported value type, as an extra safety measure.
+
+Bug: 515038894
+Flag: EXEMPT CVE_FIX
+Test: atest BundlePolicySerializerTest
+Test: atest PolicyValueTest
+Test: atest ApplicationRestrictionsTest#setApplicationRestrictions_invalidBundleType_throwsIllegalArgumentException
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:4439c37ea4d31b1cfdd99d2f7b90efe000019fb5
+Merged-In: I447390fa4821c6f9352ff496b9756bfad82d875f
+Change-Id: I447390fa4821c6f9352ff496b9756bfad82d875f
+
+(cherry picked from commit 8604eab4ba46816f3f8c19eb840214d88ba12f5b)
+---
+ .../app/admin/BundlePolicyTypeVerifier.java   |  83 +++++++++
+ .../android/app/admin/BundlePolicyValue.java  |   1 +
+ .../devicepolicy/BundlePolicySerializer.java  |   7 +-
+ .../BundlePolicySerializerTest.kt             | 121 +++++++++++++
+ .../server/devicepolicy/PolicyValueTest.kt    | 165 ++++++++++++------
+ 5 files changed, 324 insertions(+), 53 deletions(-)
+ create mode 100644 core/java/android/app/admin/BundlePolicyTypeVerifier.java
+ create mode 100644 services/tests/servicestests/src/com/android/server/devicepolicy/BundlePolicySerializerTest.kt
+
+diff --git a/core/java/android/app/admin/BundlePolicyTypeVerifier.java b/core/java/android/app/admin/BundlePolicyTypeVerifier.java
+new file mode 100644
+index 000000000..d1014de01
+--- /dev/null
++++ b/core/java/android/app/admin/BundlePolicyTypeVerifier.java
+@@ -0,0 +1,83 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.app.admin;
++
++import android.annotation.Hide;
++import android.os.Bundle;
++import android.os.Parcelable;
++
++import java.util.ArrayDeque;
++import java.util.Queue;
++
++/**
++ * Utility class containing methods to verify that types inside a Bundle are the permitted ones.
++ */
++@Hide
++public class BundlePolicyTypeVerifier {
++
++    /**
++     * Throw if bundle contains any value that is not of a permitted type.
++     * Permitted types are: Boolean, Integer, String, String[], Bundle, and Parcelable[]
++     * (containing only Bundles).
++     */
++    public static void enforceValidTypes(Bundle bundle) {
++        Queue<Bundle> queue = new ArrayDeque<>();
++        queue.add(bundle);
++
++        while (!queue.isEmpty()) {
++            Bundle current = queue.remove();
++            for (String key : current.keySet()) {
++                Object value = getUntypedValue(current, key);
++
++                if (value == null
++                        || value instanceof Boolean
++                        || value instanceof Integer
++                        || value instanceof String
++                        || value instanceof String[]) {
++                    continue;
++                } else if (value instanceof Bundle b) {
++                    queue.add(b);
++                } else if (value instanceof Parcelable[] parcelableArray) {
++                    for (Parcelable parcelable : parcelableArray) {
++                        if (!(parcelable instanceof Bundle)) {
++                            throw new IllegalArgumentException("bundle-array can only hold "
++                                    + "Bundles, found: "
++                                    + (parcelable == null
++                                        ? "null"
++                                        : parcelable.getClass().getName()));
++                        }
++                        queue.add((Bundle) parcelable);
++                    }
++                } else {
++                    throw new IllegalArgumentException("Invalid type inside Bundle: "
++                            + value.getClass().getName() + " for key: " + key);
++                }
++            }
++        }
++    }
++
++    /**
++     * Safely retrieves an untyped object from a Bundle.
++     * <p>
++     * Note: {@link Bundle#get(String)} is deprecated in favor of type-safe getters, but this
++     * verifier needs the raw value in order to inspect its type.
++     */
++    @SuppressWarnings("deprecation")
++    private static Object getUntypedValue(Bundle bundle, String key) {
++        return bundle.get(key);
++    }
++}
+diff --git a/core/java/android/app/admin/BundlePolicyValue.java b/core/java/android/app/admin/BundlePolicyValue.java
+index 23a7a9a6c..05a43d70a 100644
+--- a/core/java/android/app/admin/BundlePolicyValue.java
++++ b/core/java/android/app/admin/BundlePolicyValue.java
+@@ -38,6 +38,7 @@ public final class BundlePolicyValue extends PolicyValue<Bundle> {
+ 
+     public BundlePolicyValue(Bundle value) {
+         super(value);
++        BundlePolicyTypeVerifier.enforceValidTypes(value);
+         PolicySizeVerifier.enforceMaxBundleFieldsLength(value);
+     }
+ 
+diff --git a/services/devicepolicy/java/com/android/server/devicepolicy/BundlePolicySerializer.java b/services/devicepolicy/java/com/android/server/devicepolicy/BundlePolicySerializer.java
+index a65c7e187..72ec2b8a8 100644
+--- a/services/devicepolicy/java/com/android/server/devicepolicy/BundlePolicySerializer.java
++++ b/services/devicepolicy/java/com/android/server/devicepolicy/BundlePolicySerializer.java
+@@ -129,6 +129,7 @@ final class BundlePolicySerializer extends PolicySerializer<Bundle> {
+             throws IOException {
+         for (String key : restrictions.keySet()) {
+             Object value = restrictions.get(key);
++
+             serializer.startTag(null, TAG_ENTRY);
+             serializer.attribute(null, ATTR_KEY, key);
+ 
+@@ -156,7 +157,7 @@ final class BundlePolicySerializer extends PolicySerializer<Bundle> {
+                     writeBundle((Bundle) parcelable, serializer);
+                     serializer.endTag(null, TAG_ENTRY);
+                 }
+-            } else {
++            } else if (value instanceof String[]) {
+                 serializer.attribute(null, ATTR_VALUE_TYPE, ATTR_TYPE_STRING_ARRAY);
+                 String[] values = (String[]) value;
+                 serializer.attributeInt(null, ATTR_MULTIPLE, values.length);
+@@ -165,7 +166,11 @@ final class BundlePolicySerializer extends PolicySerializer<Bundle> {
+                     serializer.text(choice != null ? choice : "");
+                     serializer.endTag(null, TAG_VALUE);
+                 }
++            } else {
++                throw new IllegalArgumentException("Unsupported type in Bundle for key '"
++                        + key + "': " + value.getClass().getName());
+             }
++
+             serializer.endTag(null, TAG_ENTRY);
+         }
+     }
+diff --git a/services/tests/servicestests/src/com/android/server/devicepolicy/BundlePolicySerializerTest.kt b/services/tests/servicestests/src/com/android/server/devicepolicy/BundlePolicySerializerTest.kt
+new file mode 100644
+index 000000000..32bac6a13
+--- /dev/null
++++ b/services/tests/servicestests/src/com/android/server/devicepolicy/BundlePolicySerializerTest.kt
+@@ -0,0 +1,121 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.server.devicepolicy
++
++import android.content.Intent
++import android.os.Bundle
++import android.util.Xml
++import com.google.common.truth.Truth.assertThat
++import org.junit.Assert.assertThrows
++import org.junit.Test
++import org.junit.experimental.runners.Enclosed
++import org.junit.runner.RunWith
++import org.junit.runners.Parameterized
++import java.io.ByteArrayOutputStream
++import java.nio.charset.StandardCharsets
++
++@RunWith(Enclosed::class)
++class BundlePolicySerializerTest {
++
++    @RunWith(Parameterized::class)
++    class UnsupportedTypesTest(
++        private val ignoredTestName: String,
++        private val bundle: Bundle,
++        private val expectedExceptionMessage: String
++    ) {
++
++        companion object {
++            @JvmStatic
++            @Parameterized.Parameters(name = "{0}")
++            fun data(): Collection<Array<Any>> {
++                return listOf(
++                    arrayOf(
++                        "Long",
++                        Bundle().apply {
++                            putLong("key", 123L)
++                        },
++                        "Unsupported type in Bundle for key 'key': java.lang.Long"
++                    ),
++                    arrayOf(
++                        "Double",
++                        Bundle().apply {
++                            putDouble("key", 1.23)
++                        },
++                        "Unsupported type in Bundle for key 'key': java.lang.Double"
++                    ),
++                    arrayOf(
++                        "Long in Bundle",
++                        Bundle().apply {
++                            putBundle("nestedBundle", Bundle().apply {
++                                putLong("nestedKey", 123L)
++                            })
++                        },
++                        "Unsupported type in Bundle for key 'nestedKey': java.lang.Long"
++                    ),
++                    arrayOf(
++                        "non-bundle in Array",
++                        Bundle().apply {
++                            putParcelableArray("arrayKey", arrayOf(Intent()))
++                        },
++                        "bundle-array can only hold Bundles"
++                    )
++                )
++            }
++        }
++
++        @Test
++        fun saveToXml_unsupportedTypes_throwsIllegalArgumentException() {
++            val serializer = BundlePolicySerializer()
++            val outXml = Xml.newFastSerializer()
++            val os = ByteArrayOutputStream()
++            outXml.setOutput(os, StandardCharsets.UTF_8.name())
++            outXml.startDocument(null, true)
++
++            val thrown = assertThrows(IllegalArgumentException::class.java) {
++                serializer.saveToXml(outXml, bundle)
++            }
++
++            assertThat(thrown).hasMessageThat().isEqualTo(expectedExceptionMessage)
++        }
++    }
++
++    class SupportedTypesTest {
++
++        @Test
++        fun saveToXml_supportedTypes_doesNotThrow() {
++            val bundle = Bundle().apply {
++                putBoolean("bool", true)
++                putInt("int", 42)
++                putString("str", "value")
++                putStringArray("strArray", arrayOf("val1", "val2"))
++                putBundle("nestedBundle", Bundle().apply {
++                    putString("nestedStr", "val")
++                })
++                putParcelableArray("bundleArray", arrayOf(Bundle(), Bundle()))
++            }
++
++            val serializer = BundlePolicySerializer()
++            val outXml = Xml.newFastSerializer()
++            val os = ByteArrayOutputStream()
++            outXml.setOutput(os, StandardCharsets.UTF_8.name())
++            outXml.startDocument(null, true)
++
++            // Should execute successfully without throwing exceptions
++            serializer.saveToXml(outXml, bundle)
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/services/tests/servicestests/src/com/android/server/devicepolicy/PolicyValueTest.kt b/services/tests/servicestests/src/com/android/server/devicepolicy/PolicyValueTest.kt
+index 0ebb9aadc..c92339ed1 100644
+--- a/services/tests/servicestests/src/com/android/server/devicepolicy/PolicyValueTest.kt
++++ b/services/tests/servicestests/src/com/android/server/devicepolicy/PolicyValueTest.kt
+@@ -13,68 +13,129 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+ package com.android.server.devicepolicy
+-
++import android.app.admin.BundlePolicyValue
+ import android.app.admin.ListOfStringPolicyValue
++import android.app.admin.PackageIdentifier
++import android.app.admin.PackagePolicyValue
+ import android.app.admin.StringPolicyValue
++import android.content.Intent
++import android.os.Bundle
+ import android.os.Parcel
+ import android.os.Parcelable
+ import androidx.test.ext.junit.runners.AndroidJUnit4
+ import com.google.common.truth.Truth.assertThat
++import org.junit.Assert.assertThrows
+ import org.junit.Test
++import org.junit.experimental.runners.Enclosed
+ import org.junit.runner.RunWith
+-
+-
+-@RunWith(AndroidJUnit4::class)
++import org.junit.runners.Parameterized
++@RunWith(Enclosed::class)
+ class PolicyValueTest {
+-    private fun toParcel(parcelable: Parcelable) = Parcel.obtain().apply {
+-        parcelable.writeToParcel(this, 0)
+-        setDataPosition(0)
++    @RunWith(Parameterized::class)
++    class UnsupportedBundleTypesTest(
++        private val testName: String,
++        private val bundle: Bundle
++    ) {
++        companion object {
++            @JvmStatic
++            @Parameterized.Parameters(name = "{0}")
++            fun data(): Collection<Array<Any>> {
++                return listOf(
++                    arrayOf(
++                        "Long",
++                        Bundle().apply {
++                            putLong("long_key", 123L)
++                        }
++                    ),
++                    arrayOf(
++                        "Double",
++                        Bundle().apply {
++                            putDouble("double_key", 1.23)
++                        }
++                    ),
++                    arrayOf(
++                        "Long in Bundle",
++                        Bundle().apply {
++                            putBundle("nested_bundle", Bundle().apply {
++                                putLong("nested_long_key", 123L)
++                            })
++                        }
++                    ),
++                    arrayOf(
++                        "non-bundle in Array",
++                        Bundle().apply {
++                            putParcelableArray("parcelable_array_key", arrayOf(Intent()))
++                        }
++                    )
++                )
++            }
++        }
++        @Test
++        fun bundlePolicyValue_unsupportedTypes_throws() {
++            assertThrows(IllegalArgumentException::class.java) {
++                BundlePolicyValue(bundle)
++            }
++        }
+     }
+-
+-    @Test
+-    fun serialize_emptyString_matches() {
+-        val original = StringPolicyValue("")
+-
+-        val parcel = toParcel(original)
+-        val parsed = StringPolicyValue.CREATOR.createFromParcel(parcel)
+-
+-        assertThat(parsed).isEqualTo(original)
+-    }
+-
+-    @Test
+-    fun serialize_testString_matches() {
+-        val original = StringPolicyValue("testString")
+-
+-        val parcel = toParcel(original)
+-        val parsed = StringPolicyValue.CREATOR.createFromParcel(parcel)
+-
+-        assertThat(parsed).isEqualTo(original)
+-    }
+-
+-    @Test
+-    fun serialize_emptyStringList_matches() {
+-        val original = ListOfStringPolicyValue(listOf())
+-
+-        val parcel = toParcel(original)
+-        val parsed = ListOfStringPolicyValue.CREATOR.createFromParcel(parcel)
+-
+-        assertThat(parsed).isEqualTo(original)
+-    }
+-
+-    @Test
+-    fun serialize_filledStringList_matches() {
+-        val original = ListOfStringPolicyValue(
+-            listOf(
+-                "firstTestString",
+-                "secondTestString",
+-            )
+-        )
+-
+-        val parcel = toParcel(original)
+-        val parsed = ListOfStringPolicyValue.CREATOR.createFromParcel(parcel)
+-
+-        assertThat(parsed).isEqualTo(original)
++    @RunWith(AndroidJUnit4::class)
++    class StandardTests {
++        private fun toParcel(parcelable: Parcelable) =
++            Parcel.obtain().apply {
++                parcelable.writeToParcel(this, 0)
++                setDataPosition(0)
++            }
++        @Test
++        fun serialize_emptyString_matches() {
++            val original = StringPolicyValue("")
++            val parcel = toParcel(original)
++            val parsed = StringPolicyValue.CREATOR.createFromParcel(parcel)
++            assertThat(parsed).isEqualTo(original)
++        }
++        @Test
++        fun serialize_testString_matches() {
++            val original = StringPolicyValue("testString")
++            val parcel = toParcel(original)
++            val parsed = StringPolicyValue.CREATOR.createFromParcel(parcel)
++            assertThat(parsed).isEqualTo(original)
++        }
++        @Test
++        fun serialize_emptyStringList_matches() {
++            val original = ListOfStringPolicyValue(listOf())
++            val parcel = toParcel(original)
++            val parsed = ListOfStringPolicyValue.CREATOR.createFromParcel(parcel)
++            assertThat(parsed).isEqualTo(original)
++        }
++        @Test
++        fun serialize_filledStringList_matches() {
++            val original = ListOfStringPolicyValue(listOf("firstTestString", "secondTestString"))
++            val parcel = toParcel(original)
++            val parsed = ListOfStringPolicyValue.CREATOR.createFromParcel(parcel)
++            assertThat(parsed).isEqualTo(original)
++        }
++        @Test
++        fun serialize_testPackage_matches() {
++            val original = PackagePolicyValue(PackageIdentifier("test.package.name"))
++            val parcel = toParcel(original)
++            val parsed = PackagePolicyValue.CREATOR.createFromParcel(parcel)
++            assertThat(parsed).isEqualTo(original)
++        }
++        @Test
++        fun bundlePolicyValue_validTypes_doesNotThrow() {
++            val bundle = Bundle().apply {
++                putBoolean("boolean_key", true)
++                putInt("int_key", 42)
++                putString("string_key", "value")
++                putStringArray("string_array_key", arrayOf("val1", "val2"))
++                putBundle("nested_bundle_key", Bundle().apply {
++                    putString("nested_string_key", "nested_val")
++                })
++                putParcelableArray("parcelable_array_key", arrayOf(Bundle().apply {
++                    putString("array_bundle_string", "array_bundle_val")
++                }))
++            }
++            val original = BundlePolicyValue(bundle)
++            assertThat(original.value).isEqualTo(bundle)
++        }
+     }
+ }
+\ No newline at end of file
+-- 
+2.56.0
+

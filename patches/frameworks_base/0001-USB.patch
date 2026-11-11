@@ -1,0 +1,226 @@
+From ff8e4ca757d468ac594aa7d5ba345e13aa449581 Mon Sep 17 00:00:00 2001
+From: George Chan <georgechan@google.com>
+Date: Thu, 9 Apr 2026 08:57:01 -0700
+Subject: [PATCH 01/45] =?utf-8?q?=E9=99=90=E5=88=B6=E9=94=81=E5=AE=9A?=
+ =?utf-8?q?=E6=A8=A1=E5=BC=8F=E4=B8=8B=E9=9D=9E=E4=B8=BB=E7=94=A8=E6=88=B7?=
+ =?utf-8?q?=E9=87=8D=E6=96=B0=E5=90=AF=E7=94=A8=20USB?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+The onStrongAuthRequiredChanged callback now only affects USB data for non-guest users. This prevents USB data from being enabled for guest users when the device enters lockdown mode.
+
+Bug: 466379326
+Flag: EXEMPT bugfix
+Test: manual, UsbServiceTest
+Change-Id: Ifa549103a0f454921334aad5687653088609da2d
+(cherry picked from commit d1d84790170ed14a43e94916b2a72705a28ed120)
+
+(cherry picked from commit 6261df014228afcc1e6e6dabfec7678d91693766)
+---
+ .../com/android/server/usb/UsbService.java    | 33 ++++++--
+ .../android/server/usb/UsbServiceTest.java    | 79 +++++++++++++++++++
+ 2 files changed, 104 insertions(+), 8 deletions(-)
+
+diff --git a/services/usb/java/com/android/server/usb/UsbService.java b/services/usb/java/com/android/server/usb/UsbService.java
+index ba7b77642..ce7ae67f7 100644
+--- a/services/usb/java/com/android/server/usb/UsbService.java
++++ b/services/usb/java/com/android/server/usb/UsbService.java
+@@ -89,6 +89,7 @@ import com.android.server.FgThread;
+ import com.android.server.LocalServices;
+ import com.android.server.SystemServerInitThreadPool;
+ import com.android.server.SystemService;
++import com.android.server.pm.UserManagerInternal;
+ 
+ import dalvik.annotation.optimization.NeverCompile;
+ 
+@@ -1996,18 +1997,21 @@ public class UsbService extends IUsbManager.Stub {
+      * when the device enters lockdown mode. This likely involves updating a state
+      * that controls USB data behavior.
+      */
+-    private class StrongAuthTracker extends LockPatternUtils.StrongAuthTracker {
++    @VisibleForTesting
++    class StrongAuthTracker extends LockPatternUtils.StrongAuthTracker {
+         private static final IUsbOperationInternal sDefaultOperation =
+                 new IUsbOperationInternal.Default();
+         private boolean mLockdownModeStatus;
++        private UserManagerInternal mUserManagerInternal;
+ 
+         StrongAuthTracker(Context context, Looper looper) {
+             super(context, looper);
++            mUserManagerInternal = LocalServices.getService(UserManagerInternal.class);
+         }
+ 
++        @SuppressLint("AndroidFrameworkRequiresPermission")
+         @Override
+         public synchronized void onStrongAuthRequiredChanged(int userId) {
+-
+             boolean lockDownTriggeredByUser = (getStrongAuthForUser(userId)
+                     & STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN) != 0;
+             //if it goes into the same lockdown status, no change is needed
+@@ -2015,12 +2019,25 @@ public class UsbService extends IUsbManager.Stub {
+                 return;
+             }
+             mLockdownModeStatus = lockDownTriggeredByUser;
+-            for (UsbPort port: mPortManager.getPorts()) {
+-                enableUsbDataInternal(port.getId(), !lockDownTriggeredByUser,
+-                    STRONG_AUTH_OPERATION_ID,
+-                    sDefaultOperation,
+-                    USB_DISABLE_REASON_LOCKDOWN_MODE,
+-                    true);
++            /*
++             * TODO(b/500854486)
++            * Since entering guest mode or switching to non-main user from lockscreen may not
++            * require auth, USB should not be enabled for non-main users. Should remove user switch
++            * access when device is locked down as a follow up.
++            *
++            * For now, we will only re-enable USB for the main user when the device is unlocked.
++            * Secondary users will not have USB enabled even if the device is unlocked, this is
++            * a temporary solution until we remove user switch access from lockscreen under lockdown
++            * mode.
++            */
++            if(lockDownTriggeredByUser || mUserManagerInternal.getMainUserId() == userId) {
++                for (UsbPort port: mPortManager.getPorts()) {
++                    enableUsbDataInternal(port.getId(), !lockDownTriggeredByUser,
++                        STRONG_AUTH_OPERATION_ID,
++                        sDefaultOperation,
++                        USB_DISABLE_REASON_LOCKDOWN_MODE,
++                        true);
++                }
+             }
+         }
+     }
+diff --git a/tests/UsbTests/src/com/android/server/usb/UsbServiceTest.java b/tests/UsbTests/src/com/android/server/usb/UsbServiceTest.java
+index e6ec69a65..c5756a522 100644
+--- a/tests/UsbTests/src/com/android/server/usb/UsbServiceTest.java
++++ b/tests/UsbTests/src/com/android/server/usb/UsbServiceTest.java
+@@ -32,16 +32,20 @@ import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.ArgumentMatchers.isNull;
+ import static org.mockito.Mockito.clearInvocations;
+ import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.doReturn;
++import static org.mockito.Mockito.spy;
+ import static org.mockito.Mockito.verify;
+ import static org.mockito.Mockito.verifyNoMoreInteractions;
+ import static org.mockito.Mockito.when;
+ 
+ import android.content.Context;
++import android.content.res.Resources;
+ import android.hardware.usb.IUsbManagerInternal;
+ import android.hardware.usb.IUsbOperationInternal;
+ import android.hardware.usb.UsbOperationInternal;
+ import android.hardware.usb.flags.Flags;
+ import android.hardware.usb.UsbPort;
++import android.os.Looper;
+ import android.os.RemoteException;
+ import android.os.UserManager;
+ import android.platform.test.flag.junit.SetFlagsRule;
+@@ -49,11 +53,14 @@ import android.platform.test.flag.junit.SetFlagsRule;
+ import androidx.test.runner.AndroidJUnit4;
+ 
+ import com.android.server.LocalServices;
++import com.android.server.pm.UserManagerInternal;
+ 
+ import org.junit.Before;
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
++import com.android.internal.widget.LockPatternUtils;
++
+ import org.mockito.Mock;
+ import org.mockito.MockitoAnnotations;
+ 
+@@ -71,6 +78,8 @@ public class UsbServiceTest {
+     @Mock private UsbSettingsManager mUsbSettingsManager;
+     @Mock private IUsbOperationInternal mCallback;
+     @Mock private IUsbOperationInternalProvider mUsbOperationInternalProvider;
++    @Mock private UserManagerInternal mUserManagerInternal;
++    @Mock private Resources mResources;
+ 
+     private static final String TEST_PORT_ID = "1";
+ 
+@@ -100,6 +109,10 @@ public class UsbServiceTest {
+         mSetFlagsRule.enableFlags(Flags.FLAG_ENABLE_USB_DATA_SIGNAL_STAKING_INTERNAL);
+         LocalServices.removeAllServicesForTest();
+         MockitoAnnotations.initMocks(this);
++        LocalServices.addService(UserManagerInternal.class, mUserManagerInternal);
++
++        when(mContext.getResources()).thenReturn(mResources);
++        when(mResources.getBoolean(anyInt())).thenReturn(false);
+ 
+         when(mUsbPortManager.enableUsbData(
+                         eq(TEST_PORT_ID),
+@@ -378,4 +391,70 @@ public class UsbServiceTest {
+             throws IllegalArgumentException, RemoteException {
+         mIUsbManagerInternal.enableUsbDataSignal(true, TEST_INTERNAL_REQUESTER_INVALID_REASON);
+     }
++
++    @Test
++    public void onStrongAuthRequiredChanged_lockdownTriggered_disablesUsb() {
++        int userId = 10;
++        UsbPort port = mock(UsbPort.class);
++        when(port.getId()).thenReturn(TEST_PORT_ID);
++        when(mUsbPortManager.getPorts()).thenReturn(new UsbPort[] {port});
++
++        UsbService.StrongAuthTracker tracker =
++                spy(mUsbService.new StrongAuthTracker(mContext, Looper.getMainLooper()));
++        doReturn(LockPatternUtils.StrongAuthTracker.STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN)
++                .when(tracker)
++                .getStrongAuthForUser(userId);
++
++        tracker.onStrongAuthRequiredChanged(userId);
++
++        verify(mUsbPortManager)
++                .enableUsbData(eq(TEST_PORT_ID), eq(false), anyInt(), any(), isNull());
++    }
++
++    @Test
++    public void onStrongAuthRequiredChanged_lockdownCleared_mainUser_enablesUsb() {
++        int userId = 10;
++        UsbPort port = mock(UsbPort.class);
++        when(port.getId()).thenReturn(TEST_PORT_ID);
++        when(mUsbPortManager.getPorts()).thenReturn(new UsbPort[] {port});
++        when(mUserManagerInternal.getMainUserId()).thenReturn(userId);
++        UsbService.StrongAuthTracker tracker =
++                spy(mUsbService.new StrongAuthTracker(mContext, Looper.getMainLooper()));
++        doReturn(LockPatternUtils.StrongAuthTracker.STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN)
++                .when(tracker)
++                .getStrongAuthForUser(userId);
++        tracker.onStrongAuthRequiredChanged(userId);
++        clearInvocations(mUsbPortManager);
++        doReturn(LockPatternUtils.StrongAuthTracker.STRONG_AUTH_NOT_REQUIRED)
++                .when(tracker)
++                .getStrongAuthForUser(userId);
++
++        tracker.onStrongAuthRequiredChanged(userId);
++
++        verify(mUsbPortManager)
++                .enableUsbData(eq(TEST_PORT_ID), eq(true), anyInt(), any(), isNull());
++    }
++
++    @Test
++    public void onStrongAuthRequiredChanged_lockdownCleared_nonMainUser_doesNotEnableUsb() {
++        int userId = 11;
++        UsbPort port = mock(UsbPort.class);
++        when(port.getId()).thenReturn(TEST_PORT_ID);
++        when(mUsbPortManager.getPorts()).thenReturn(new UsbPort[] {port});
++        when(mUserManagerInternal.getMainUserId()).thenReturn(userId - 1);
++        UsbService.StrongAuthTracker tracker =
++                spy(mUsbService.new StrongAuthTracker(mContext, Looper.getMainLooper()));
++        doReturn(LockPatternUtils.StrongAuthTracker.STRONG_AUTH_REQUIRED_AFTER_USER_LOCKDOWN)
++                .when(tracker)
++                .getStrongAuthForUser(userId);
++        tracker.onStrongAuthRequiredChanged(userId);
++        clearInvocations(mUsbPortManager);
++        doReturn(LockPatternUtils.StrongAuthTracker.STRONG_AUTH_NOT_REQUIRED)
++                .when(tracker)
++                .getStrongAuthForUser(userId);
++
++        tracker.onStrongAuthRequiredChanged(userId);
++
++        verifyNoMoreInteractions(mUsbPortManager);
++    }
+ }
+-- 
+2.56.0
+

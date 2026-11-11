@@ -1,0 +1,85 @@
+From 59f64a8eac155e4a45003b2df20c178192a4a2e6 Mon Sep 17 00:00:00 2001
+From: Wonsik Kim <wonsik@google.com>
+Date: Thu, 14 May 2026 23:11:32 -0700
+Subject: [PATCH 5/5] =?utf-8?q?=E9=99=90=E5=88=B6=20OMX=20=E5=8F=82?=
+ =?utf-8?q?=E6=95=B0=E4=B8=8E=E9=85=8D=E7=BD=AE=E8=BF=94=E5=9B=9E=E6=95=B0?=
+ =?utf-8?q?=E6=8D=AE=E5=A4=8D=E5=88=B6=E9=95=BF=E5=BA=A6?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Fix stack buffer overflow vulnerability in LWOmxNode::getParameter due to unbounded std::copy.
+Also fix potential out-of-bounds read in LWOmxNode::getConfig.
+
+Bug: 506176085
+Test: Build libmedia_omx libstagefright_omx libmedia
+Flag: EXEMPT BUGFIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:9efdc689acc68ed69010aa3d94e70f85df8ba0ee
+Merged-In: I030564336d3e599f6f02ec6527b351823cc4e369
+Change-Id: I030564336d3e599f6f02ec6527b351823cc4e369
+
+(cherry picked from commit 1c5914737a1a89d0c5b3e52e8289019eab3f8cbf)
+---
+ media/libmedia/omx/1.0/WOmxNode.cpp       | 6 +++---
+ media/libstagefright/omx/1.0/WOmxNode.cpp | 6 +++---
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/media/libmedia/omx/1.0/WOmxNode.cpp b/media/libmedia/omx/1.0/WOmxNode.cpp
+index 2cd8b760d1..ee40444b02 100644
+--- a/media/libmedia/omx/1.0/WOmxNode.cpp
++++ b/media/libmedia/omx/1.0/WOmxNode.cpp
+@@ -47,12 +47,12 @@ status_t LWOmxNode::getParameter(
+     status_t transStatus = toStatusT(mBase->getParameter(
+             toRawIndexType(index),
+             tParams,
+-            [&fnStatus, params](
++            [&fnStatus, params, size](
+                     Status status, hidl_vec<uint8_t> const& outParams) {
+                 fnStatus = toStatusT(status);
+                 std::copy(
+                         outParams.data(),
+-                        outParams.data() + outParams.size(),
++                        outParams.data() + std::min(outParams.size(), size),
+                         static_cast<uint8_t*>(params));
+             }));
+     return transStatus == NO_ERROR ? fnStatus : transStatus;
+@@ -77,7 +77,7 @@ status_t LWOmxNode::getConfig(
+                 fnStatus = toStatusT(status);
+                 std::copy(
+                         outParams.data(),
+-                        outParams.data() + size,
++                        outParams.data() + std::min(outParams.size(), size),
+                         static_cast<uint8_t*>(params));
+             }));
+     return transStatus == NO_ERROR ? fnStatus : transStatus;
+diff --git a/media/libstagefright/omx/1.0/WOmxNode.cpp b/media/libstagefright/omx/1.0/WOmxNode.cpp
+index 1dc7c7b6f0..05e0045b35 100644
+--- a/media/libstagefright/omx/1.0/WOmxNode.cpp
++++ b/media/libstagefright/omx/1.0/WOmxNode.cpp
+@@ -50,12 +50,12 @@ status_t LWOmxNode::getParameter(
+     status_t transStatus = toStatusT(mBase->getParameter(
+             toRawIndexType(index),
+             tParams,
+-            [&fnStatus, params](
++            [&fnStatus, params, size](
+                     Status status, hidl_vec<uint8_t> const& outParams) {
+                 fnStatus = toStatusT(status);
+                 std::copy(
+                         outParams.data(),
+-                        outParams.data() + outParams.size(),
++                        outParams.data() + std::min(outParams.size(), size),
+                         static_cast<uint8_t*>(params));
+             }));
+     return transStatus == NO_ERROR ? fnStatus : transStatus;
+@@ -80,7 +80,7 @@ status_t LWOmxNode::getConfig(
+                 fnStatus = toStatusT(status);
+                 std::copy(
+                         outParams.data(),
+-                        outParams.data() + size,
++                        outParams.data() + std::min(outParams.size(), size),
+                         static_cast<uint8_t*>(params));
+             }));
+     return transStatus == NO_ERROR ? fnStatus : transStatus;
+-- 
+2.56.0
+

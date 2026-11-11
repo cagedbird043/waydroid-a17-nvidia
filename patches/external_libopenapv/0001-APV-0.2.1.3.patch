@@ -1,0 +1,133 @@
+From 82f6d92371c402ab5a0555340f25ba678b0f98b1 Mon Sep 17 00:00:00 2001
+From: Fyodor Kyslov <kyslov@google.com>
+Date: Thu, 4 Jun 2026 17:39:05 +0000
+Subject: [PATCH] =?utf-8?q?=E5=90=8C=E6=AD=A5=E5=B7=B2=E5=8C=85=E5=90=AB?=
+ =?utf-8?q?=E7=9A=84=20APV=200.2.1.3=20=E6=BA=90=E7=A0=81=E7=89=88?=
+ =?utf-8?q?=E6=9C=AC=E8=AE=B0=E5=BD=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+This project was upgraded with external_updater.
+Usage: tools/external_updater/updater.sh update external/libopenapv
+For more info, check https://cs.android.com/android/platform/superproject/main/+/main:tools/external_updater/README.md
+
+Bug: 503554745
+Test: TreeHugger
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:dc4ad338b6ae6ae70ee32127c113202aa6ec6a17
+Merged-In: I6a01148b98506eae6ccca1ec2ff27e7a03b962a5
+Change-Id: I6a01148b98506eae6ccca1ec2ff27e7a03b962a5
+
+(cherry picked from commit 36c17db1d86213f92ac166eb7266cea799ac75b5)
+Change-Id: Icaae06253f106c7387002b1688bfeea3a68afd31
+---
+ .github/workflows/build.yml            |  6 +++---
+ .github/workflows/release_packages.yml | 10 +++++-----
+ METADATA                               |  8 ++++----
+ 3 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index fdeffc1..ccdb54d 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -25,7 +25,7 @@ jobs:
+         run: tar -cvf build-pc.tar .
+ 
+       - name: Upload Artifact
+-        uses: actions/upload-artifact@v6
++        uses: actions/upload-artifact@v7
+         with:
+           name: build-PC-artifacts
+           path: build-pc.tar
+@@ -114,13 +114,13 @@ jobs:
+           lcov --list ${{github.workspace}}/build/coverage.info
+ 
+       - name: Upload coverage report
+-        uses: actions/upload-artifact@v6
++        uses: actions/upload-artifact@v7
+         with:
+           name: coverage-report
+           path: ${{github.workspace}}/build/coverage.info
+ 
+       - name: Upload test results
+-        uses: actions/upload-artifact@v6
++        uses: actions/upload-artifact@v7
+         with:
+           name: LastTest.log
+           path: ${{github.workspace}}/build/Testing/Temporary/LastTest.log
+diff --git a/.github/workflows/release_packages.yml b/.github/workflows/release_packages.yml
+index 2a9bd91..cc9b62f 100644
+--- a/.github/workflows/release_packages.yml
++++ b/.github/workflows/release_packages.yml
+@@ -23,7 +23,7 @@ jobs:
+           cpack -C Release
+ 
+       - name: 'Upload PC Linux artifacts'
+-        uses: actions/upload-artifact@v6
++        uses: actions/upload-artifact@v7
+         with:
+           name: openapv-linux-${{github.event.release.tag_name}}
+           path: |
+@@ -63,7 +63,7 @@ jobs:
+           cpack -C Release
+ 
+       - name: 'Upload ARM artifacts'
+-        uses: actions/upload-artifact@v6
++        uses: actions/upload-artifact@v7
+         with:
+           name: openapv-arm-${{github.event.release.tag_name}}
+           path: |
+@@ -93,7 +93,7 @@ jobs:
+           cd ${{github.workspace}}/build-darwin
+           cpack -C Release -G TGZ
+ 
+-      - uses: actions/upload-artifact@v6
++      - uses: actions/upload-artifact@v7
+         with:
+           name: openapv-darwin-${{github.event.release.tag_name}}
+           path: |
+@@ -122,7 +122,7 @@ jobs:
+           cd ${{github.workspace}}/build
+           cpack -C Release -G DragNDrop
+ 
+-      - uses: actions/upload-artifact@v6
++      - uses: actions/upload-artifact@v7
+         with:
+           name: openapv-universal-${{github.event.release.tag_name}}
+           path: |
+@@ -161,7 +161,7 @@ jobs:
+           cpack -G ZIP -C Release
+ 
+       - name: 'Upload PC Windows artifacts'
+-        uses: actions/upload-artifact@v6
++        uses: actions/upload-artifact@v7
+         with:
+           name: openapv-windows-${{github.event.release.tag_name}}
+           path: |
+diff --git a/METADATA b/METADATA
+index 82c1b32..7fecf64 100644
+--- a/METADATA
++++ b/METADATA
+@@ -8,15 +8,15 @@ third_party {
+   license_type: NOTICE
+   last_upgrade_date {
+     year: 2026
+-    month: 3
+-    day: 18
++    month: 6
++    day: 4
+   }
+   homepage: "https://github.com/openapv/openapv"
+   identifier {
+     type: "Git"
+     value: "https://github.com/openapv/openapv.git"
+-    version: "4974f041917b09f01150264f98cda0089dabfc57"
+-    closest_version: "v0.2.1.2"
++    version: "390b5605c55ea5723802062a00876d67134f71d9"
++    closest_version: "v0.2.1.3"
+     primary_source: true
+   }
+ }
+-- 
+2.56.0
+

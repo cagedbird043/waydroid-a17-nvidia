@@ -1,0 +1,716 @@
+From 7eb3064c67c494d397a3974e974c3af458361828 Mon Sep 17 00:00:00 2001
+From: Samiul Islam <samiul@google.com>
+Date: Thu, 25 Jun 2026 14:28:19 +0100
+Subject: [PATCH 22/45] =?utf-8?q?=E9=99=90=E5=88=B6=E5=BA=94=E7=94=A8?=
+ =?utf-8?q?=E5=9B=BE=E6=A0=87=E5=8A=A0=E8=BD=BD=E5=B0=BA=E5=AF=B8=E9=98=B2?=
+ =?utf-8?q?=E6=AD=A2=E7=B3=BB=E7=BB=9F=E7=95=8C=E9=9D=A2=E5=B4=A9=E6=BA=83?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+An app can set its icon, logo or banner to an excessively large size
+(e.g., 8,000 x 8,000 px). When loaded via PackageManager and drawn on
+a hardware-accelerated canvas (e.g., in Settings or Launcher), this
+throws a RuntimeException ("trying to draw too large bitmap") or
+triggers an OOM, persistently crashing the system UI.
+
+Here we are opening a new hidden api that gets resources but capped to
+a maximum dimension of 2048 px. This api will be used by PackageManager
+for fetching icon resources. Since it's not easy to determine if a
+resource is icon/banner/logo just based on the id, we will be simply
+relying on the callers to pass us that info.
+
+In ResourcesImpl, we cache the capped resources with a separate key
+(63rd bit of the key is used to mark capping).
+
+Tag: agy
+Flag: EXEMPT BUGFIX
+Bug: 472701802
+Test: atest FrameworksCoreTests:ResourcesDrawableTest
+Test: atest CtsSecurityBulletinHostTestCases:android.security.cts.BUG_472701802
+
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:600a468f3f42832458eca1bc68d29b7b15dd21d6
+
+Cherrypicked by Aesir (go/aesir-backport-automation)
+
+Merged-In: If9b86e93befdba0a72f400546868455b4485b281
+
+Change-Id: If9b86e93befdba0a72f400546868455b4485b281
+
+(cherry picked from commit 9105004de66bc9dc8afc78d0b6a26e4772ff8a28)
+---
+ .../app/ApplicationPackageManager.java        | 17 ++++-
+ .../android/content/pm/LabeledIntent.java     |  5 +-
+ .../content/pm/LauncherActivityInfo.java      |  8 ++-
+ .../java/android/content/pm/LauncherApps.java | 20 ++++--
+ .../android/content/pm/PackageItemInfo.java   | 18 ++++-
+ .../android/content/pm/PackageManager.java    | 39 +++++++++++
+ core/java/android/content/pm/ResolveInfo.java |  8 ++-
+ core/java/android/content/res/Resources.java  | 27 ++++++-
+ .../android/content/res/ResourcesImpl.java    | 70 ++++++++++++++++---
+ .../content/res/ResourcesDrawableTest.java    | 67 ++++++++++++++++++
+ 10 files changed, 253 insertions(+), 26 deletions(-)
+
+diff --git a/core/java/android/app/ApplicationPackageManager.java b/core/java/android/app/ApplicationPackageManager.java
+index ce6929f0a..cfa0fb68a 100644
+--- a/core/java/android/app/ApplicationPackageManager.java
++++ b/core/java/android/app/ApplicationPackageManager.java
+@@ -138,6 +138,7 @@ import android.util.Slog;
+ import android.util.Xml;
+ import android.window.DesktopExperienceFlags;
+ 
++import com.android.internal.R;
+ import com.android.internal.annotations.GuardedBy;
+ import com.android.internal.annotations.VisibleForTesting;
+ import com.android.internal.os.ApplicationSharedMemory;
+@@ -1896,6 +1897,14 @@ public class ApplicationPackageManager extends PackageManager {
+     @Override
+     public Drawable getDrawable(String packageName, @DrawableRes int resId,
+             @Nullable ApplicationInfo appInfo) {
++        return getDrawableInternal(packageName, resId, appInfo, /* isIcon= */ false);
++    }
++
++    /** @hide */
++    @Nullable
++    @Override
++    public Drawable getDrawableInternal(String packageName, @DrawableRes int resId,
++            @Nullable ApplicationInfo appInfo, boolean isIcon) {
+         final ResourceName name = new ResourceName(packageName, resId);
+         final Drawable cachedIcon = getCachedIcon(name);
+         if (cachedIcon != null) {
+@@ -1913,7 +1922,10 @@ public class ApplicationPackageManager extends PackageManager {
+         if (resId != 0) {
+             try {
+                 final Resources r = getResourcesForApplication(appInfo);
+-                final Drawable dr = r.getDrawable(resId, null);
++                final Drawable dr = isIcon
++                        ? r.getDrawableForDensityCapped(
++                                resId, /* density= */ 0, /* theme= */ null)
++                        : r.getDrawable(resId, null);
+                 if (dr != null) {
+                     putCachedIcon(name, dr);
+                 }
+@@ -3594,7 +3606,8 @@ public class ApplicationPackageManager extends PackageManager {
+             if (itemInfo.isArchived) {
+                 dr = getArchivedAppIcon(itemInfo.packageName);
+             } else {
+-                dr = getDrawable(itemInfo.packageName, itemInfo.icon, appInfo);
++                dr = getDrawableInternal(
++                        itemInfo.packageName, itemInfo.icon, appInfo, /* isIcon= */ true);
+             }
+         }
+         if (dr == null && itemInfo != appInfo && appInfo != null) {
+diff --git a/core/java/android/content/pm/LabeledIntent.java b/core/java/android/content/pm/LabeledIntent.java
+index ae41252bc..239a2885c 100644
+--- a/core/java/android/content/pm/LabeledIntent.java
++++ b/core/java/android/content/pm/LabeledIntent.java
+@@ -148,10 +148,13 @@ public class LabeledIntent extends Intent {
+      * Retrieve the icon associated with this object.  If the object does
+      * not have a icon, null will be returned, in which case you will probably
+      * want to load the icon from the underlying resolved info for the Intent.
++     *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link PackageManager#getApplicationIcon(ApplicationInfo)}.</p>
+      */
+     public Drawable loadIcon(PackageManager pm) {
+         if (mIcon != 0 && mSourcePackage != null) {
+-            Drawable icon = pm.getDrawable(mSourcePackage, mIcon, null);
++            Drawable icon = pm.getDrawableInternal(mSourcePackage, mIcon, null, /* isIcon= */ true);
+             if (icon != null) {
+                 return icon;
+             }
+diff --git a/core/java/android/content/pm/LauncherActivityInfo.java b/core/java/android/content/pm/LauncherActivityInfo.java
+index b25a473a3..3f18b0ab3 100644
+--- a/core/java/android/content/pm/LauncherActivityInfo.java
++++ b/core/java/android/content/pm/LauncherActivityInfo.java
+@@ -120,6 +120,10 @@ public class LauncherActivityInfo {
+ 
+     /**
+      * Returns the icon for this activity, without any badging for the profile.
++     *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link PackageManager#getApplicationIcon(ApplicationInfo)}.</p>
++     *
+      * @param density The preferred density of the icon, zero for default density. Use
+      * density DPI values from {@link DisplayMetrics}.
+      * @see #getBadgedIcon(int)
+@@ -135,7 +139,9 @@ public class LauncherActivityInfo {
+             try {
+                 final Resources resources = mPm.getResourcesForApplication(
+                         getActivityInfo().applicationInfo);
+-                icon = resources.getDrawableForDensity(iconRes, density);
++                // Since this is loading the activity's icon, we use the capped resource API
++                // to apply downsampling protection and prevent OOMs.
++                icon = resources.getDrawableForDensityCapped(iconRes, density, /* theme= */ null);
+             } catch (NameNotFoundException | Resources.NotFoundException exc) {
+             }
+         }
+diff --git a/core/java/android/content/pm/LauncherApps.java b/core/java/android/content/pm/LauncherApps.java
+index 16fff722f..8aad6fe2e 100644
+--- a/core/java/android/content/pm/LauncherApps.java
++++ b/core/java/android/content/pm/LauncherApps.java
+@@ -1769,7 +1769,10 @@ public class LauncherApps {
+      * Returns the icon for this shortcut, without any badging for the profile.
+      *
+      * <p>The calling launcher application must be allowed to access the shortcut information,
+-     * as defined in {@link #hasShortcutHostPermission()}.
++     * as defined in {@link #hasShortcutHostPermission()}.</p>
++     *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link PackageManager#getApplicationIcon(ApplicationInfo)}.</p>
+      *
+      * @param density The preferred density of the icon, zero for default density. Use
+      * density DPI values from {@link DisplayMetrics}.
+@@ -1790,14 +1793,14 @@ public class LauncherApps {
+             final ParcelFileDescriptor pfd = getUriShortcutIconFd(shortcut);
+             return loadDrawableFromFileDescriptor(pfd, shortcut.hasAdaptiveBitmap());
+         } else if (shortcut.hasIconResource()) {
+-            return loadDrawableResourceFromPackage(shortcut.getPackage(),
++            return loadIconResourceFromPackage(shortcut.getPackage(),
+                     shortcut.getIconResourceId(), shortcut.getUserHandle(), density);
+         } else if (shortcut.getIcon() != null) {
+             // This happens if a shortcut is pending-approval.
+             final Icon icon = shortcut.getIcon();
+             switch (icon.getType()) {
+                 case Icon.TYPE_RESOURCE: {
+-                    return loadDrawableResourceFromPackage(shortcut.getPackage(),
++                    return loadIconResourceFromPackage(shortcut.getPackage(),
+                             icon.getResId(), shortcut.getUserHandle(), density);
+                 }
+                 case Icon.TYPE_BITMAP:
+@@ -1878,7 +1881,7 @@ public class LauncherApps {
+         }
+     }
+ 
+-    private Drawable loadDrawableResourceFromPackage(String packageName, int resId,
++    private Drawable loadIconResourceFromPackage(String packageName, int resId,
+             UserHandle user, int density) {
+         try {
+             if (resId == 0) {
+@@ -1886,7 +1889,9 @@ public class LauncherApps {
+             }
+             final ApplicationInfo ai = getApplicationInfo(packageName, /* flags =*/ 0, user);
+             final Resources res = mContext.getPackageManager().getResourcesForApplication(ai);
+-            return res.getDrawableForDensity(resId, density);
++            // Since this private helper is exclusively used to load shortcut icons, we use
++            // the capped resource API to apply downsampling protection and prevent OOMs.
++            return res.getDrawableForDensityCapped(resId, density, /* theme= */ null);
+         } catch (NameNotFoundException | Resources.NotFoundException e) {
+             return null;
+         }
+@@ -1896,7 +1901,10 @@ public class LauncherApps {
+      * Returns the shortcut icon with badging appropriate for the profile.
+      *
+      * <p>The calling launcher application must be allowed to access the shortcut information,
+-     * as defined in {@link #hasShortcutHostPermission()}.
++     * as defined in {@link #hasShortcutHostPermission()}.</p>
++     *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link PackageManager#getApplicationIcon(ApplicationInfo)}.</p>
+      *
+      * @param density Optional density for the icon, or 0 to use the default density. Use
+      * @return A badged icon for the shortcut.
+diff --git a/core/java/android/content/pm/PackageItemInfo.java b/core/java/android/content/pm/PackageItemInfo.java
+index c6a7bdd1a..126d6de75 100644
+--- a/core/java/android/content/pm/PackageItemInfo.java
++++ b/core/java/android/content/pm/PackageItemInfo.java
+@@ -279,6 +279,9 @@ public class PackageItemInfo {
+      * will call back on the given PackageManager to load the icon from
+      * the application.
+      *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link PackageManager#getApplicationIcon(ApplicationInfo)}.</p>
++     *
+      * @param pm A PackageManager from which the icon can be loaded; usually
+      * the PackageManager from which you originally retrieved this item.
+      *
+@@ -297,6 +300,9 @@ public class PackageItemInfo {
+      * This will call back on the given PackageManager to load the icon from
+      * the application.
+      *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link PackageManager#getApplicationIcon(ApplicationInfo)}.</p>
++     *
+      * @param pm A PackageManager from which the icon can be loaded; usually
+      * the PackageManager from which you originally retrieved this item.
+      *
+@@ -314,6 +320,9 @@ public class PackageItemInfo {
+      * will call back on the given PackageManager to load the banner from
+      * the application.
+      *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link PackageManager#getApplicationIcon(ApplicationInfo)}.</p>
++     *
+      * @param pm A PackageManager from which the banner can be loaded; usually
+      * the PackageManager from which you originally retrieved this item.
+      *
+@@ -323,7 +332,8 @@ public class PackageItemInfo {
+     @android.ravenwood.annotation.RavenwoodThrow(blockedBy = android.content.res.Resources.class)
+     public Drawable loadBanner(PackageManager pm) {
+         if (banner != 0) {
+-            Drawable dr = pm.getDrawable(packageName, banner, getApplicationInfo());
++            Drawable dr = pm.getDrawableInternal(
++                    packageName, banner, getApplicationInfo(), /* isIcon= */ true);
+             if (dr != null) {
+                 return dr;
+             }
+@@ -368,6 +378,9 @@ public class PackageItemInfo {
+      * will call back on the given PackageManager to load the logo from
+      * the application.
+      *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link PackageManager#getApplicationIcon(ApplicationInfo)}.</p>
++     *
+      * @param pm A PackageManager from which the logo can be loaded; usually
+      * the PackageManager from which you originally retrieved this item.
+      *
+@@ -377,7 +390,8 @@ public class PackageItemInfo {
+     @android.ravenwood.annotation.RavenwoodThrow(blockedBy = android.content.res.Resources.class)
+     public Drawable loadLogo(PackageManager pm) {
+         if (logo != 0) {
+-            Drawable d = pm.getDrawable(packageName, logo, getApplicationInfo());
++            Drawable d = pm.getDrawableInternal(
++                    packageName, logo, getApplicationInfo(), /* isIcon= */ true);
+             if (d != null) {
+                 return d;
+             }
+diff --git a/core/java/android/content/pm/PackageManager.java b/core/java/android/content/pm/PackageManager.java
+index 5a9142dea..01d7f7b4d 100644
+--- a/core/java/android/content/pm/PackageManager.java
++++ b/core/java/android/content/pm/PackageManager.java
+@@ -8798,12 +8798,31 @@ public abstract class PackageManager {
+     public abstract Drawable getDrawable(@NonNull String packageName, @DrawableRes int resid,
+             @Nullable ApplicationInfo appInfo);
+ 
++    /**
++     * Retrieve an image from a package, with optional capping for icons.
++     *
++     * @param packageName The name of the package from which to load the resource.
++     * @param resid The resource identifier.
++     * @param appInfo ApplicationInfo of the target package.
++     * @param isIcon Whether the resource is an icon and should be capped.
++     * @return Drawable An object that can be used to draw this resource, or null.
++     * @hide
++     */
++    @Nullable
++    public Drawable getDrawableInternal(@NonNull String packageName, @DrawableRes int resid,
++            @Nullable ApplicationInfo appInfo, boolean isIcon) {
++        return getDrawable(packageName, resid, appInfo);
++    }
++
+     /**
+      * Retrieve the icon associated with an activity.  Given the full name of
+      * an activity, retrieves the information about it and calls
+      * {@link ComponentInfo#loadIcon ComponentInfo.loadIcon()} to return its icon.
+      * If the activity cannot be found, NameNotFoundException is thrown.
+      *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link #getApplicationIcon(ApplicationInfo)}.</p>
++     *
+      * @param activityName Name of the activity whose icon is to be retrieved.
+      *
+      * @return Returns the image of the icon, or the default activity icon if
+@@ -8844,6 +8863,9 @@ public abstract class PackageManager {
+      * {@link ComponentInfo#loadIcon ComponentInfo.loadIcon()} to return its
+      * banner. If the activity cannot be found, NameNotFoundException is thrown.
+      *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link #getApplicationIcon(ApplicationInfo)}.</p>
++     *
+      * @param activityName Name of the activity whose banner is to be retrieved.
+      * @return Returns the image of the banner, or null if the activity has no
+      *         banner specified.
+@@ -8887,6 +8909,10 @@ public abstract class PackageManager {
+      * Retrieve the icon associated with an application.  If it has not defined
+      * an icon, the default app icon is returned.  Does not return null.
+      *
++     * <p>Note: The returned drawable's dimensions are capped to a maximum size of
++     * {@code 2048 x 2048} pixels. If the resource's intrinsic dimensions exceed this limit,
++     * it will be downsampled automatically, preserving its aspect ratio.</p>
++     *
+      * @param info Information about application being queried.
+      *
+      * @return Returns the image of the icon, or the default application icon
+@@ -8903,6 +8929,10 @@ public abstract class PackageManager {
+      * getApplicationIcon() to return its icon. If the application cannot be
+      * found, NameNotFoundException is thrown.
+      *
++     * <p>Note: The returned drawable's dimensions are capped to a maximum size of
++     * {@code 2048 x 2048} pixels. If the resource's intrinsic dimensions exceed this limit,
++     * it will be downsampled automatically, preserving its aspect ratio.</p>
++     *
+      * @param packageName Name of the package whose application icon is to be
+      *                    retrieved.
+      *
+@@ -8934,6 +8964,9 @@ public abstract class PackageManager {
+      * getApplicationIcon() to return its banner. If the application cannot be
+      * found, NameNotFoundException is thrown.
+      *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link #getApplicationIcon(ApplicationInfo)}.</p>
++     *
+      * @param packageName Name of the package whose application banner is to be
+      *            retrieved.
+      * @return Returns the image of the banner or null if the application has no
+@@ -8952,6 +8985,9 @@ public abstract class PackageManager {
+      * {@link ComponentInfo#loadLogo ComponentInfo.loadLogo()} to return its
+      * logo. If the activity cannot be found, NameNotFoundException is thrown.
+      *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link #getApplicationIcon(ApplicationInfo)}.</p>
++     *
+      * @param activityName Name of the activity whose logo is to be retrieved.
+      * @return Returns the image of the logo or null if the activity has no logo
+      *         specified.
+@@ -9005,6 +9041,9 @@ public abstract class PackageManager {
+      * getApplicationLogo() to return its logo. If the application cannot be
+      * found, NameNotFoundException is thrown.
+      *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link #getApplicationIcon(ApplicationInfo)}.</p>
++     *
+      * @param packageName Name of the package whose application logo is to be
+      *                    retrieved.
+      *
+diff --git a/core/java/android/content/pm/ResolveInfo.java b/core/java/android/content/pm/ResolveInfo.java
+index 3c7fbb2d0..4b9f07dc7 100644
+--- a/core/java/android/content/pm/ResolveInfo.java
++++ b/core/java/android/content/pm/ResolveInfo.java
+@@ -300,6 +300,9 @@ public class ResolveInfo implements Parcelable {
+      * will call back on the given PackageManager to load the icon from
+      * the application.
+      *
++     * <p>The returned drawable is subject to the same size capping limits as described
++     * in {@link PackageManager#getApplicationIcon(ApplicationInfo)}.</p>
++     *
+      * @param pm A PackageManager from which the icon can be loaded; usually
+      * the PackageManager from which you originally retrieved this item.
+      *
+@@ -310,12 +313,13 @@ public class ResolveInfo implements Parcelable {
+     public Drawable loadIcon(PackageManager pm) {
+         Drawable dr = null;
+         if (resolvePackageName != null && iconResourceId != 0) {
+-            dr = pm.getDrawable(resolvePackageName, iconResourceId, null);
++            dr = pm.getDrawableInternal(
++                    resolvePackageName, iconResourceId, null, /* isIcon= */ true);
+         }
+         ComponentInfo ci = getComponentInfo();
+         if (dr == null && iconResourceId != 0) {
+             ApplicationInfo ai = ci.applicationInfo;
+-            dr = pm.getDrawable(ci.packageName, iconResourceId, ai);
++            dr = pm.getDrawableInternal(ci.packageName, iconResourceId, ai, /* isIcon= */ true);
+         }
+         if (dr != null) {
+             return pm.getUserBadgedIcon(dr, new UserHandle(pm.getUserId()));
+diff --git a/core/java/android/content/res/Resources.java b/core/java/android/content/res/Resources.java
+index ca1380cea..e5ac32f9f 100644
+--- a/core/java/android/content/res/Resources.java
++++ b/core/java/android/content/res/Resources.java
+@@ -76,7 +76,6 @@ import android.view.WindowManager;
+ 
+ import com.android.internal.annotations.GuardedBy;
+ import com.android.internal.annotations.VisibleForTesting;
+-import com.android.internal.util.ArrayUtils;
+ import com.android.internal.util.GrowingArrayUtils;
+ import com.android.internal.util.Preconditions;
+ import com.android.internal.util.XmlUtils;
+@@ -958,6 +957,32 @@ public class Resources {
+         return getDrawableForDensity(id, 0, theme);
+     }
+ 
++    /**
++     * Return a drawable object associated with a particular resource ID and styled for the
++     * specified theme for a given screen density, applying a cap to prevent excessively large
++     * dimensions.
++     *
++     * @param id The desired resource identifier.
++     * @param density The desired screen density in DPI.
++     * @param theme The theme used to style the drawable attributes, may be {@code null}.
++     * @return Drawable An object that can be used to draw this resource.
++     * @throws NotFoundException Throws NotFoundException if the given ID does not exist.
++     * @hide
++     */
++    @Nullable
++    public Drawable getDrawableForDensityCapped(@DrawableRes int id, int density,
++            @Nullable Theme theme)
++            throws NotFoundException {
++        final TypedValue value = obtainTempTypedValue();
++        try {
++            final ResourcesImpl impl = mResourcesImpl;
++            impl.getValueForDensity(id, density, value, true);
++            return impl.loadDrawable(this, value, id, density, theme, /* isCapped= */ true);
++        } finally {
++            releaseTempTypedValue(value);
++        }
++    }
++
+     /**
+      * Return a drawable object associated with a particular resource ID for the
+      * given screen density in DPI. This will set the drawable's density to be
+diff --git a/core/java/android/content/res/ResourcesImpl.java b/core/java/android/content/res/ResourcesImpl.java
+index 4d78f6034..71e44208a 100644
+--- a/core/java/android/content/res/ResourcesImpl.java
++++ b/core/java/android/content/res/ResourcesImpl.java
+@@ -52,6 +52,7 @@ import android.util.AttributeSet;
+ import android.util.DisplayMetrics;
+ import android.util.Log;
+ import android.util.LongSparseArray;
++import android.util.Size;
+ import android.util.Slog;
+ import android.util.TypedValue;
+ import android.util.Xml;
+@@ -97,6 +98,8 @@ public class ResourcesImpl {
+ 
+     private static final int ID_OTHER = 0x01000004;
+ 
++    private static final int MAX_ICON_SIZE = 2048;
++
+     private static final Object sSync = new Object();
+ 
+     private static boolean sPreloaded;
+@@ -777,10 +780,17 @@ public class ResourcesImpl {
+     Drawable loadDrawable(@NonNull Resources wrapper, @NonNull TypedValue value, int id,
+             int density, @Nullable Resources.Theme theme)
+             throws NotFoundException {
++        return loadDrawable(wrapper, value, id, density, theme, /* isCapped= */ false);
++    }
++
++    @Nullable
++    Drawable loadDrawable(@NonNull Resources wrapper, @NonNull TypedValue value, int id,
++            int density, @Nullable Resources.Theme theme, boolean isCapped)
++            throws NotFoundException {
+         // If the drawable's XML lives in our current density qualifier,
+         // it's okay to use a scaled version from the cache. Otherwise, we
+         // need to actually load the drawable from XML.
+-        final boolean useCache = density == 0 || value.density == mMetrics.densityDpi;
++        final boolean useCache = (density == 0 || value.density == mMetrics.densityDpi);
+ 
+         // Pretend the requested density is actually the display density. If
+         // the drawable returned is not the requested density, then force it
+@@ -817,7 +827,7 @@ public class ResourcesImpl {
+             } else {
+                 isColorDrawable = false;
+                 caches = mDrawableCache;
+-                key = (((long) value.assetCookie) << 32) | value.data;
++                key = cacheKeyForCookieAsset(value.assetCookie, value.data, isCapped);
+             }
+ 
+             int cacheGeneration = caches.getGeneration();
+@@ -848,7 +858,7 @@ public class ResourcesImpl {
+             } else if (isColorDrawable) {
+                 dr = new ColorDrawable(value.data);
+             } else {
+-                dr = loadDrawableForCookie(wrapper, value, id, density);
++                dr = loadDrawableForCookie(wrapper, value, id, density, isCapped);
+             }
+             // DrawableContainer' constant state has drawables instances. In order to leave the
+             // constant state intact in the cache, we need to create a new DrawableContainer after
+@@ -983,12 +993,15 @@ public class ResourcesImpl {
+      */
+     @Nullable
+     private Drawable decodeImageDrawable(@NonNull AssetInputStream ais,
+-            @NonNull Resources wrapper, @NonNull TypedValue value) {
++            @NonNull Resources wrapper, @NonNull TypedValue value, boolean isCapped) {
+         ImageDecoder.Source src = new ImageDecoder.AssetInputStreamSource(ais,
+                 wrapper, value);
+         try {
+             return ImageDecoder.decodeDrawable(src, (decoder, info, s) -> {
+                 decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
++                if (isCapped) {
++                    capImageSize(decoder, info);
++                }
+             });
+         } catch (IOException ioe) {
+             // This is okay. This may be something that ImageDecoder does not
+@@ -998,11 +1011,15 @@ public class ResourcesImpl {
+     }
+ 
+     @Nullable
+-    private Drawable decodeImageDrawable(@NonNull FileInputStream fis, @NonNull Resources wrapper) {
++    private Drawable decodeImageDrawable(@NonNull FileInputStream fis, @NonNull Resources wrapper,
++            boolean isCapped) {
+         ImageDecoder.Source src = ImageDecoder.createSource(wrapper, fis);
+         try {
+             return ImageDecoder.decodeDrawable(src, (decoder, info, s) -> {
+                 decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
++                if (isCapped) {
++                    capImageSize(decoder, info);
++                }
+             });
+         } catch (IOException ioe) {
+             // This is okay. This may be something that ImageDecoder does not
+@@ -1011,6 +1028,34 @@ public class ResourcesImpl {
+         }
+     }
+ 
++    private void capImageSize(@NonNull ImageDecoder decoder, @NonNull ImageDecoder.ImageInfo info) {
++        Size size = info.getSize();
++        int originalWidth = size.getWidth();
++        int originalHeight = size.getHeight();
++        if (originalWidth > MAX_ICON_SIZE || originalHeight > MAX_ICON_SIZE) {
++            int maxDm = Math.max(originalWidth, originalHeight);
++            int targetWidth = Math.max(1, (int) (((long) originalWidth * MAX_ICON_SIZE) / maxDm));
++            int targetHeight = Math.max(1, (int) (((long) originalHeight * MAX_ICON_SIZE) / maxDm));
++            decoder.setTargetSize(targetWidth, targetHeight);
++        }
++    }
++
++    /**
++     * Generates a unique 64-bit cache key from the asset cookie and resource data offset.
++     *
++     * Key Structure (64-bit long):
++     * - Bit 63 (MSB): Partition flag. Set to 1 if the resource is capped (downsampled) to
++     *                 guarantee cache isolation. Set to 0 for standard (uncapped) resources.
++     * - Bits 32-62: Asset cookie (shifted left by 32). Identifies the source package/APK.
++     * - Bits 0-31: Resource data offset/identifier.
++     */
++    private static long cacheKeyForCookieAsset(int assetCookie, int data, boolean isCapped) {
++        long key = (((long) assetCookie) << 32) | data;
++        // assetCookie is always positive - it's 1-based index allocated by native AssetManager.
++        // So, (assetCookie << 32) will always have 0 at bit 31, leaving it free for manipulation.
++        return isCapped ? (key | (1L << 63)) : key;
++    }
++
+     /**
+      * Loads a drawable from XML or resources stream.
+      *
+@@ -1018,7 +1063,7 @@ public class ResourcesImpl {
+      */
+     @Nullable
+     private Drawable loadDrawableForCookie(@NonNull Resources wrapper, @NonNull TypedValue value,
+-            int id, int density) {
++            int id, int density, boolean isCapped) {
+         if (value.string == null) {
+             throw new NotFoundException("Resource \"" + getResourceName(id) + "\" ("
+                     + Integer.toHexString(id) + ") is not a Drawable (color or path): " + value);
+@@ -1079,12 +1124,12 @@ public class ResourcesImpl {
+                             offset,
+                             size);
+                     FileInputStream is = afd.createInputStream();
+-                    dr = decodeImageDrawable(is, wrapper);
++                    dr = decodeImageDrawable(is, wrapper, isCapped);
+                 } else {
+                     final InputStream is = mAssets.openNonAsset(
+                             value.assetCookie, file, AssetManager.ACCESS_STREAMING);
+                     final AssetInputStream ais = (AssetInputStream) is;
+-                    dr = decodeImageDrawable(ais, wrapper, value);
++                    dr = decodeImageDrawable(ais, wrapper, value, isCapped);
+                 }
+             } finally {
+                 stack.pop();
+@@ -1184,7 +1229,8 @@ public class ResourcesImpl {
+     @Nullable
+     private ComplexColor loadComplexColorFromName(Resources wrapper, Resources.Theme theme,
+             TypedValue value, int id) {
+-        final long key = (((long) value.assetCookie) << 32) | value.data;
++        final long key = cacheKeyForCookieAsset(value.assetCookie, value.data,
++                /* isCapped= */ false);
+         final ConfigurationBoundResourceCache<ComplexColor> cache = mComplexColorCache;
+         ComplexColor complexColor = cache.getInstance(key, wrapper, theme);
+         if (complexColor != null) {
+@@ -1228,7 +1274,8 @@ public class ResourcesImpl {
+             }
+         }
+ 
+-        final long key = (((long) value.assetCookie) << 32) | value.data;
++        final long key = cacheKeyForCookieAsset(value.assetCookie, value.data,
++                /* isCapped= */ false);
+ 
+         // Handle inline color definitions.
+         if (value.type >= TypedValue.TYPE_FIRST_COLOR_INT
+@@ -1270,7 +1317,8 @@ public class ResourcesImpl {
+             }
+         }
+ 
+-        final long key = (((long) value.assetCookie) << 32) | value.data;
++        final long key = cacheKeyForCookieAsset(value.assetCookie, value.data,
++                /* isCapped= */ false);
+ 
+         // Handle inline color definitions.
+         if (value.type >= TypedValue.TYPE_FIRST_COLOR_INT
+diff --git a/core/tests/coretests/src/android/content/res/ResourcesDrawableTest.java b/core/tests/coretests/src/android/content/res/ResourcesDrawableTest.java
+index ccf24c3bf..929564e41 100644
+--- a/core/tests/coretests/src/android/content/res/ResourcesDrawableTest.java
++++ b/core/tests/coretests/src/android/content/res/ResourcesDrawableTest.java
+@@ -21,6 +21,8 @@ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertTrue;
+ 
+ import android.content.Context;
++import android.graphics.Bitmap;
++import android.graphics.drawable.BitmapDrawable;
+ import android.graphics.drawable.ColorStateListDrawable;
+ import android.graphics.drawable.Drawable;
+ import android.graphics.drawable.LayerDrawable;
+@@ -80,4 +82,69 @@ public class ResourcesDrawableTest {
+         Drawable drawable = resources.getDrawable(R.color.drawable_in_color_dir_valid);
+         assertTrue(drawable instanceof LayerDrawable);
+     }
++
++    @Test
++    public void testGetDrawableCapped_downsamplesLargeResource() {
++        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
++        Resources resources = context.getResources();
++
++        // Load the massive 16,000 x 16,000 px image via the capped API
++        Drawable drawable = resources.getDrawableForDensityCapped(
++                com.android.frameworks.coretests.R.drawable.test16000x16000, 0, null);
++
++        assertNotNull("Capped drawable should not be null", drawable);
++        assertTrue("Capped drawable should be a BitmapDrawable",
++                drawable instanceof BitmapDrawable);
++
++        Bitmap bitmap = ((BitmapDrawable) drawable).getBitmap();
++
++        // The original image is 16,000 x 16,000. Under our cap of 2048,
++        // it should be scaled down to exactly 2048 x 2048 px.
++        assertEquals("Width should be capped to 2048 px", 2048, bitmap.getWidth());
++        assertEquals("Height should be capped to 2048 px", 2048, bitmap.getHeight());
++    }
++
++    @Test
++    public void testGetDrawableCapped_doesNotPolluteSharedCache() {
++        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
++        Resources resources = context.getResources();
++
++        // 1. Load the massive image via the capped API first
++        Drawable cappedDrawable = resources.getDrawableForDensityCapped(
++                com.android.frameworks.coretests.R.drawable.test16000x16000, 0, null);
++        assertNotNull(cappedDrawable);
++        assertEquals(2048, cappedDrawable.getIntrinsicWidth());
++
++        // 2. Load the same image using the standard uncapped API.
++        Drawable uncappedDrawable = resources.getDrawable(
++                com.android.frameworks.coretests.R.drawable.test16000x16000, null);
++        // Assert that cache isolation works:
++        // The uncapped load must either fail (return null) because it attempted to load
++        // the full 16,000px image and failed,
++        // or return the original large image (width > 2048).
++        // It must NEVER return the cached downsampled version (which would be non-null
++        // with width == 2048).
++        if (uncappedDrawable != null) {
++            assertEquals("Cache pollution occurred! The uncapped load should have returned the "
++                            + "original uncapped version (width == 16000 px)",
++                    16000, uncappedDrawable.getIntrinsicWidth());
++        }
++    }
++
++    @Test
++    public void testGetDrawableCapped_usesCache() {
++        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
++        Resources resources = context.getResources();
++
++        Drawable doc1 = resources.getDrawableForDensityCapped(
++                com.android.frameworks.coretests.R.drawable.test16000x16000, 0, null);
++        Drawable doc2 = resources.getDrawableForDensityCapped(
++                com.android.frameworks.coretests.R.drawable.test16000x16000, 0, null);
++
++        assertNotNull("First loaded capped drawable should not be null", doc1);
++        assertNotNull("Second loaded capped drawable should not be null", doc2);
++        // If caching works, both calls return a drawable sharing the same constant state
++        assertEquals("Caching failed! Capped drawables should share the same ConstantState",
++                doc1.getConstantState(), doc2.getConstantState());
++    }
+ }
+-- 
+2.56.0
+

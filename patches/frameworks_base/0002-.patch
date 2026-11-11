@@ -1,0 +1,75 @@
+From 869f2c9ff628074a3fdf9a12a1e79c4e7b1adb4c Mon Sep 17 00:00:00 2001
+From: Biswarup Pal <biswarupp@google.com>
+Date: Tue, 23 Jun 2026 08:25:29 -0700
+Subject: [PATCH 02/45] =?utf-8?q?=E6=92=A4=E5=9B=9E=E8=99=9A=E6=8B=9F?=
+ =?utf-8?q?=E8=AE=BE=E5=A4=87=E6=89=80=E6=9C=89=E8=80=85=E9=99=90=E5=88=B6?=
+ =?utf-8?q?=E4=BB=A5=E7=A7=BB=E6=A4=8D=E5=AE=8C=E6=95=B4=E4=BF=AE=E5=A4=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+This reverts commit a101654da176c6a855f134eedfcf893d698da329.
+
+Reason for revert: b/525681148
+
+Bug: 495646742
+Change-Id: I41b0580150ac75435d8ea3565b8d5e68d34e7bb6
+
+(cherry picked from commit 78ab696ab28299fe186d867f319e8784b2614dc5)
+---
+ .../android/server/companion/virtual/VirtualDeviceImpl.java   | 4 ----
+ .../server/companion/virtual/VirtualDeviceShellCommand.java   | 2 +-
+ 2 files changed, 1 insertion(+), 5 deletions(-)
+
+diff --git a/services/companion/java/com/android/server/companion/virtual/VirtualDeviceImpl.java b/services/companion/java/com/android/server/companion/virtual/VirtualDeviceImpl.java
+index 35217902e..850e8806e 100644
+--- a/services/companion/java/com/android/server/companion/virtual/VirtualDeviceImpl.java
++++ b/services/companion/java/com/android/server/companion/virtual/VirtualDeviceImpl.java
+@@ -730,7 +730,6 @@ final class VirtualDeviceImpl extends IVirtualDevice.Stub implements IBinder.Dea
+     @Override // Binder call
+     public void setListeners(@NonNull IVirtualDeviceActivityListener activityListener,
+             @NonNull IVirtualDeviceSoundEffectListener soundEffectListener) {
+-        checkCallerIsDeviceOwner();
+         mActivityListener = Objects.requireNonNull(activityListener);
+         mSoundEffectListener = Objects.requireNonNull(soundEffectListener);
+     }
+@@ -950,7 +949,6 @@ final class VirtualDeviceImpl extends IVirtualDevice.Stub implements IBinder.Dea
+ 
+     @Override // Binder call
+     public void close() {
+-        checkCallerIsDeviceOwner();
+         // Remove about-to-be-closed virtual device from the service before butchering it.
+         if (!mService.removeVirtualDevice(mDeviceId)) {
+             // Device is already closed.
+@@ -1396,7 +1394,6 @@ final class VirtualDeviceImpl extends IVirtualDevice.Stub implements IBinder.Dea
+     @Override // Binder call
+     public String getVirtualCameraId(@NonNull VirtualCameraConfig cameraConfig)
+             throws RemoteException {
+-        checkCallerIsDeviceOwner();
+         Objects.requireNonNull(cameraConfig);
+         if (mVirtualCameraController == null) {
+             throw new UnsupportedOperationException("Virtual camera controller is not available");
+@@ -1970,7 +1967,6 @@ final class VirtualDeviceImpl extends IVirtualDevice.Stub implements IBinder.Dea
+     }
+ 
+     void playSoundEffect(int effectType) {
+-        checkCallerIsDeviceOwner();
+         if (mSoundEffectListener == null) {
+             return;
+         }
+diff --git a/services/companion/java/com/android/server/companion/virtual/VirtualDeviceShellCommand.java b/services/companion/java/com/android/server/companion/virtual/VirtualDeviceShellCommand.java
+index 4f170f51f..410e80a77 100644
+--- a/services/companion/java/com/android/server/companion/virtual/VirtualDeviceShellCommand.java
++++ b/services/companion/java/com/android/server/companion/virtual/VirtualDeviceShellCommand.java
+@@ -166,7 +166,7 @@ class VirtualDeviceShellCommand extends ShellCommand {
+         if (virtualDevice == null) {
+             return 1;
+         }
+-        Binder.withCleanCallingIdentity(() -> virtualDevice.close());
++        virtualDevice.close();
+         return 0;
+     }
+ 
+-- 
+2.56.0
+

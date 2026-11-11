@@ -1,0 +1,168 @@
+From f69c448600a08b2025c9127f5687f50f57b88ac8 Mon Sep 17 00:00:00 2001
+From: Dmitry Dementyev <dementyev@google.com>
+Date: Thu, 9 Jul 2026 15:30:24 -0700
+Subject: [PATCH 41/45] =?utf-8?q?=E6=A0=A1=E9=AA=8C=E8=B4=A6=E5=8F=B7?=
+ =?utf-8?q?=E7=AE=A1=E7=90=86=E4=BC=9A=E8=AF=9D=E5=9B=9E=E8=B0=83=E8=B0=83?=
+ =?utf-8?q?=E7=94=A8=E8=80=85=E8=BA=AB=E4=BB=BD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+IAccountManagerResponse.onResult() can be used only by
+system components and Authenticators.
+Store mAuthenticatorUid earlier to use it in the new check.
+
+Bug: 527036999
+Test: manual
+Flag: EXEMPT BUGFIX
+(cherry picked from commit 729f1962dbc443fbbff3df22b5cb5badccaef181)
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:104e7077a478f65b8ee1c5ce6024f859d180a1d6
+Merged-In: If208678e4b5785c703e6355f596ec1f9454f341e
+Change-Id: If208678e4b5785c703e6355f596ec1f9454f341e
+
+(cherry picked from commit 5c5c971a8cb10518ef3caccc4d69f460f9648d01)
+---
+ .../accounts/AccountManagerService.java       | 46 ++++++++++++++++++-
+ 1 file changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/services/core/java/com/android/server/accounts/AccountManagerService.java b/services/core/java/com/android/server/accounts/AccountManagerService.java
+index 308996d8c..11d78dfe9 100644
+--- a/services/core/java/com/android/server/accounts/AccountManagerService.java
++++ b/services/core/java/com/android/server/accounts/AccountManagerService.java
+@@ -2211,6 +2211,9 @@ public class AccountManagerService
+ 
+         @Override
+         public void onResult(Bundle result) {
++            if (!callerIsAuthenticatorOrSystem()) {
++                return;
++            }
+             Bundle.setDefusable(result, true);
+             IAccountManagerResponse response = getResponseAndClose();
+             if (response != null) {
+@@ -2573,6 +2576,9 @@ public class AccountManagerService
+ 
+         @Override
+         public void onResult(Bundle result) {
++            if (!callerIsAuthenticatorOrSystem()) {
++                return;
++            }
+             Bundle.setDefusable(result, true);
+             if (result != null && result.containsKey(AccountManager.KEY_BOOLEAN_RESULT)
+                     && !result.containsKey(AccountManager.KEY_INTENT)) {
+@@ -3752,6 +3758,9 @@ public class AccountManagerService
+ 
+         @Override
+         public void onResult(Bundle result) {
++            if (!callerIsAuthenticatorOrSystem()) {
++                return;
++            }
+             Bundle.setDefusable(result, true);
+             mNumResults++;
+             Intent intent = null;
+@@ -4405,6 +4414,10 @@ public class AccountManagerService
+                 new AccountAuthenticatorResponse(new IAccountAuthenticatorResponse.Stub() {
+             @Override
+             public void onResult(Bundle value) throws RemoteException {
++                if (!UserHandle.isSameApp(Binder.getCallingUid(), Process.SYSTEM_UID)) {
++                    Slog.w(TAG, "onResult: the caller is not system");
++                    return;
++                }
+                 handleAuthenticatorResponse(true);
+             }
+ 
+@@ -4415,6 +4428,10 @@ public class AccountManagerService
+ 
+             @Override
+             public void onError(int errorCode, String errorMessage) throws RemoteException {
++                if (!UserHandle.isSameApp(Binder.getCallingUid(), Process.SYSTEM_UID)) {
++                    Slog.w(TAG, "onError: the caller is not system");
++                    return;
++                }
+                 handleAuthenticatorResponse(false);
+             }
+ 
+@@ -4514,6 +4531,9 @@ public class AccountManagerService
+ 
+         @Override
+         public void onResult(Bundle result) {
++            if (!callerIsAuthenticatorOrSystem()) {
++                return;
++            }
+             Bundle.setDefusable(result, true);
+             mNumResults++;
+             if (result == null) {
+@@ -5098,7 +5118,7 @@ public class AccountManagerService
+         protected boolean mCanStartAccountManagerActivity = false;
+         protected final UserAccounts mAccounts;
+ 
+-        private int mAuthenticatorUid;
++        private volatile int mAuthenticatorUid;
+         private long mBindingStartTime;
+ 
+         public Session(UserAccounts accounts, IAccountManagerResponse response, String accountType,
+@@ -5137,6 +5157,21 @@ public class AccountManagerService
+             }
+         }
+ 
++        boolean callerIsAuthenticatorOrSystem() {
++            final int callingUid = Binder.getCallingUid();
++            if (UserHandle.isSameApp(callingUid, Process.SYSTEM_UID)) {
++                return true;
++            }
++            if (UserHandle.isSameApp(callingUid, mAuthenticatorUid)) {
++                return true;
++            }
++
++            Slog.w(TAG, "the caller is neither system nor authenticator: callingUid="
++                    + callingUid + ", mAuthenticatorUid=" + mAuthenticatorUid);
++            return false;
++        }
++
++
+         IAccountManagerResponse getResponseAndClose() {
+             if (mAuthenticatorUid != 0 && mBindingStartTime > 0) {
+                 sResponseLatency.logSampleWithUid(mAuthenticatorUid,
+@@ -5384,6 +5419,9 @@ public class AccountManagerService
+ 
+         @Override
+         public void onResult(Bundle result) {
++            if (!callerIsAuthenticatorOrSystem()) {
++                return;
++            }
+             Bundle.setDefusable(result, true);
+             mNumResults++;
+             Intent intent = null;
+@@ -5483,6 +5521,9 @@ public class AccountManagerService
+ 
+         @Override
+         public void onRequestContinued() {
++            if (!callerIsAuthenticatorOrSystem()) {
++                return;
++            }
+             mNumRequestContinued++;
+         }
+ 
+@@ -5530,6 +5571,7 @@ public class AccountManagerService
+                         + " which isn't encryption aware");
+                 return false;
+             }
++            mAuthenticatorUid = authenticatorInfo.uid;
+ 
+             Intent intent = new Intent();
+             intent.setAction(AccountManager.ACTION_AUTHENTICATOR_INTENT);
+@@ -5544,11 +5586,11 @@ public class AccountManagerService
+             if (!mContext.bindServiceAsUser(intent, this, Context.BindServiceFlags.of(flags),
+                     UserHandle.of(mAccounts.userId))) {
+                 Log.w(TAG, "bindService to " + authenticatorInfo.componentName + " failed");
++                mBindingStartTime = 0;
+                 // Perform unbind as per documentation at Context.bindServiceAsUser
+                 mContext.unbindService(this);
+                 return false;
+             }
+-            mAuthenticatorUid = authenticatorInfo.uid;
+             mBindingStartTime = SystemClock.uptimeMillis();
+             return true;
+         }
+-- 
+2.56.0
+

@@ -1,0 +1,283 @@
+From 62b0dfdc421ecafe04772ca00f0dee9606061bdb Mon Sep 17 00:00:00 2001
+From: Chris Li <lihongyu@google.com>
+Date: Wed, 8 Jul 2026 13:12:30 +0000
+Subject: [PATCH 21/45] =?utf-8?q?=E4=BF=9D=E7=95=99=E9=87=8D=E5=9E=8B?=
+ =?utf-8?q?=E5=BA=94=E7=94=A8=E5=88=87=E6=8D=A2=E5=99=A8=E7=9A=84=E5=8E=9F?=
+ =?utf-8?q?=E5=A7=8B=E8=B0=83=E7=94=A8=E8=BA=AB=E4=BB=BD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+When an activity launch from an app with cantSaveState="true"
+conflicts with an existing heavy-weight process, ActivityStarter
+intercepts the request in resolveToHeavyWeightSwitcherIfNeeded()
+and reroutes the intent to HeavyWeightSwitcherActivity.
+
+Previously, resolveToHeavyWeightSwitcherIfNeeded() overwrote
+mRequest.callingUid and callingPid with Binder.getCallingUid()
+and Binder.getCallingPid() after Binder.clearCallingIdentity().
+This caused the calling UID to be replaced with SYSTEM_UID (1000).
+Because Background Activity Launch (BAL) evaluation in
+checkBackgroundActivityStart() evaluates permissions against
+mRequest.callingUid, this overwrite allowed untrusted background
+apps to bypass BAL restrictions (via BAL_ALLOW_ALLOWLISTED_UID)
+and launch the switcher activity over any foreground app.
+
+This change prevents the BAL bypass while ensuring the switcher
+activity can still be launched:
+1. Preserve the original app Calling UID and PID in mRequest when
+   rerouting to HeavyWeightSwitcherActivity so BAL and Intent
+   Firewall checks are evaluated against the true caller.
+2. Set mRequest.ignoreTargetSecurity = true when rerouting to
+   HeavyWeightSwitcherActivity so that component permission and
+   exported checks in checkStartAnyActivityPermission permit
+   starting the non-exported system activity.
+3. Add unit test coverage in ActivityStarterTests to verify
+   UID/PID preservation, ignoreTargetSecurity assignment, and
+   BAL blocking behavior.
+
+Bug: 527036967
+Test: atest WmTests:ActivityStarterTests#testHeavyWeightSwitcher_preservesCallingUid_setsFlag,testHeavyWeightSwitcher_blockedByBal_whenCallerInBackground
+Flag: EXEMPT CVE_FIX
+TAG=agy
+CONV=8361c3cf-3e81-46e5-bfae-2a1df0f05a55
+
+Change-Id: I00fed9cda203a06ae47089ed8d959ee372aecec7
+(cherry picked from commit 038570272e1bffb436ba462a17019ee1591e6ea2)
+
+(cherry picked from commit be50016275f62a87e1d53bf24b268355ad76e550)
+---
+ .../android/server/wm/ActivityStarter.java    |  23 ++-
+ .../server/wm/ActivityStarterTests.java       | 144 ++++++++++++++++++
+ 2 files changed, 164 insertions(+), 3 deletions(-)
+
+diff --git a/services/core/java/com/android/server/wm/ActivityStarter.java b/services/core/java/com/android/server/wm/ActivityStarter.java
+index b0b270ebb..f372154d1 100644
+--- a/services/core/java/com/android/server/wm/ActivityStarter.java
++++ b/services/core/java/com/android/server/wm/ActivityStarter.java
+@@ -425,6 +425,17 @@ class ActivityStarter {
+         String intentCreatorPackage;
+         int startFlags;
+         SafeActivityOptions activityOptions;
++        /**
++         * Set to {@code true} for system-delegated activity launches (such as {@link
++         * ActivityTaskManagerService#startActivityAsCaller}) or internal system UI redirects (such
++         * as rerouting to {@link HeavyWeightSwitcherActivity} in {@link
++         * #resolveToHeavyWeightSwitcherIfNeeded}) to bypass target component permission and
++         * exported checks in {@link ActivityTaskSupervisor#checkStartAnyActivityPermission}.
++         *
++         * <p>Note: this field has no effect on Background Activity Launch (BAL) evaluation or
++         * Intent Firewall enforcements. Its scope should not be expanded without carefully
++         * reviewing all security implications and use cases.
++         */
+         boolean ignoreTargetSecurity;
+         boolean componentSpecified;
+         boolean avoidMoveToFront;
+@@ -1008,10 +1019,13 @@ class ActivityStarter {
+         }
+ 
+         int appCallingUid = mRequest.callingUid;
++        int appCallingPid = mRequest.callingPid;
+         if (mRequest.caller != null) {
+-            WindowProcessController callerApp = mService.getProcessController(mRequest.caller);
++            final WindowProcessController callerApp =
++                    mService.getProcessController(mRequest.caller);
+             if (callerApp != null) {
+                 appCallingUid = callerApp.mUid;
++                appCallingPid = callerApp.getPid();
+             } else {
+                 Slog.w(TAG, "Unable to find app for caller " + mRequest.caller + " (pid="
+                         + mRequest.callingPid + ") when starting: " + mRequest.intent.toString());
+@@ -1043,8 +1057,11 @@ class ActivityStarter {
+         mRequest.intent = newIntent;
+         mRequest.resolvedType = null;
+         mRequest.caller = null;
+-        mRequest.callingUid = Binder.getCallingUid();
+-        mRequest.callingPid = Binder.getCallingPid();
++        // Preserve original calling UID/PID for BAL evaluation and ignore target security to
++        // permit starting the non-exported system activity in checkStartAnyActivityPermission.
++        mRequest.callingUid = appCallingUid;
++        mRequest.callingPid = appCallingPid;
++        mRequest.ignoreTargetSecurity = true;
+         mRequest.componentSpecified = true;
+         mRequest.resolveInfo = mSupervisor.resolveIntent(mRequest.intent, null /* resolvedType */,
+                 mRequest.userId, 0 /* matchFlags */,
+diff --git a/services/tests/wmtests/src/com/android/server/wm/ActivityStarterTests.java b/services/tests/wmtests/src/com/android/server/wm/ActivityStarterTests.java
+index 1dcd5c493..23f75dece 100644
+--- a/services/tests/wmtests/src/com/android/server/wm/ActivityStarterTests.java
++++ b/services/tests/wmtests/src/com/android/server/wm/ActivityStarterTests.java
+@@ -84,6 +84,7 @@ import static org.mockito.ArgumentMatchers.eq;
+ import static org.mockito.ArgumentMatchers.notNull;
+ import static org.mockito.Mockito.clearInvocations;
+ 
++import android.app.ActivityManagerInternal;
+ import android.app.ActivityOptions;
+ import android.app.AppOpsManager;
+ import android.app.IApplicationThread;
+@@ -94,6 +95,7 @@ import android.content.pm.ActivityInfo;
+ import android.content.pm.ActivityInfo.WindowLayout;
+ import android.content.pm.ApplicationInfo;
+ import android.content.pm.IPackageManager;
++import android.content.pm.ResolveInfo;
+ import android.content.pm.SigningDetails;
+ import android.graphics.Rect;
+ import android.os.Binder;
+@@ -114,6 +116,9 @@ import android.window.TaskFragmentOrganizerToken;
+ 
+ import androidx.test.filters.SmallTest;
+ 
++import com.android.internal.app.HeavyWeightSwitcherActivity;
++import com.android.server.am.PendingIntentController;
++import com.android.server.am.PendingIntentRecord;
+ import com.android.server.am.psc.ProcessRecordInternal;
+ import com.android.server.pm.pkg.AndroidPackage;
+ import com.android.server.wm.BackgroundActivityStartController.BalVerdict;
+@@ -2153,6 +2158,145 @@ public final class ActivityStarterTests extends ActivityStarterTestBase {
+                 maliciousUid, p2.launchedFromUid);
+     }
+ 
++    /**
++     * Verifies that when an activity launch from a package with {@code cantSaveState="true"}
++     * conflicts with an existing heavy-weight process, {@link ActivityStarter} preserves the
++     * original app calling UID and PID in {@link ActivityStarter.Request} when rerouting the
++     * intent to {@link HeavyWeightSwitcherActivity}. Also verifies that {@code
++     * ignoreTargetSecurity} is set to permit starting the non-exported system activity while
++     * preventing untrusted background apps from bypassing BAL restrictions.
++     */
++    @Test
++    public void testHeavyWeightSwitcher_preservesCallingUid_setsFlag() {
++        mAtm.mHasHeavyWeightFeature = true;
++        final int heavyUid = 10001;
++        final int attackerUid = 10002;
++        final int attackerPid = 12346;
++        final String heavyPackage = "com.test.heavy";
++        final String attackerPackage = "com.test.attacker";
++
++        // Create an active heavy-weight process.
++        final WindowProcessController heavyWpc = mSystemServicesTestRule.addProcess(heavyPackage,
++                heavyPackage, 12345 /* pid */, heavyUid);
++        mAtm.mHeavyWeightProcess = heavyWpc;
++
++        // Mock PendingIntentController to prevent NPE when wrapping target in IntentSender.
++        mAtm.mPendingIntentController = mock(PendingIntentController.class);
++        doReturn(mock(PendingIntentRecord.class)).when(mAtm.mPendingIntentController)
++                .getIntentSender(anyInt(), any(), any(), anyInt(), anyInt(), any(), any(),
++                        anyInt(), any(), any(), anyInt(), any());
++
++        // Configure starter for an activity in a different package with cantSaveState.
++        final ActivityStarter starter = prepareStarter(0 /* launchFlags */);
++        starter.setCallingUid(attackerUid);
++        starter.setCallingPid(attackerPid);
++        starter.setCallingPackage(attackerPackage);
++        starter.setRealCallingUid(attackerUid);
++        starter.setRealCallingPid(attackerPid);
++
++        final ActivityInfo info = starter.mRequest.activityInfo;
++        info.packageName = attackerPackage;
++        info.processName = attackerPackage;
++        info.applicationInfo.packageName = attackerPackage;
++        info.applicationInfo.uid = attackerUid;
++        info.applicationInfo.privateFlags |= ApplicationInfo.PRIVATE_FLAG_CANT_SAVE_STATE;
++        info.name = "com.test.attacker.TargetActivity";
++
++        // Mock resolution and ActivityManagerInternal so HeavyWeightSwitcherActivity resolves.
++        final ResolveInfo switcherResolveInfo = new ResolveInfo();
++        final ActivityInfo switcherActivityInfo = new ActivityInfo();
++        switcherActivityInfo.name = HeavyWeightSwitcherActivity.class.getName();
++        switcherActivityInfo.packageName = "android";
++        switcherActivityInfo.applicationInfo = new ApplicationInfo();
++        switcherActivityInfo.applicationInfo.packageName = "android";
++        switcherActivityInfo.applicationInfo.uid = SYSTEM_UID;
++        switcherResolveInfo.activityInfo = switcherActivityInfo;
++        doReturn(switcherResolveInfo).when(mSupervisor).resolveIntent(any(), any(), anyInt(),
++                anyInt(), anyInt(), anyInt());
++        mAtm.mAmInternal = mock(ActivityManagerInternal.class);
++        doAnswer(invocation -> invocation.getArgument(0))
++                .when(mAtm.mAmInternal).getActivityInfoForUser(any(), anyInt());
++
++        final int result = starter.execute();
++
++        assertEquals(START_SUCCESS, result);
++        assertTrue(starter.mRequest.ignoreTargetSecurity);
++        assertEquals(attackerUid, starter.mRequest.callingUid);
++        assertEquals(attackerPid, starter.mRequest.callingPid);
++        assertEquals(HeavyWeightSwitcherActivity.class.getName(),
++                starter.mRequest.intent.getComponent().getClassName());
++    }
++
++    /**
++     * Verifies that when {@link ActivityStarter.Request#callingUid} is preserved for a
++     * heavy-weight switcher launch, if BAL evaluation blocks the background caller,
++     * {@link ActivityStarter} aborts the launch instead of allowing the non-exported activity
++     * to open.
++     */
++    @Test
++    public void testHeavyWeightSwitcher_blockedByBal_whenCallerInBackground() {
++        mAtm.mHasHeavyWeightFeature = true;
++        final int heavyUid = 10001;
++        final int attackerUid = 10002;
++        final int attackerPid = 12346;
++        final String heavyPackage = "com.test.heavy";
++        final String attackerPackage = "com.test.attacker";
++
++        // Create an active heavy-weight process.
++        final WindowProcessController heavyWpc = mSystemServicesTestRule.addProcess(heavyPackage,
++                heavyPackage, 12345 /* pid */, heavyUid);
++        mAtm.mHeavyWeightProcess = heavyWpc;
++
++        // Mock PendingIntentController to prevent NPE when wrapping target in IntentSender.
++        mAtm.mPendingIntentController = mock(PendingIntentController.class);
++        doReturn(mock(PendingIntentRecord.class)).when(mAtm.mPendingIntentController)
++                .getIntentSender(anyInt(), any(), any(), anyInt(), anyInt(), any(), any(),
++                        anyInt(), any(), any(), anyInt(), any());
++
++        doReturn(false).when(mAtm).isBackgroundActivityStartsEnabled();
++        final BackgroundActivityStartController balController =
++                mock(BackgroundActivityStartController.class);
++        doReturn(balController).when(mSupervisor).getBackgroundActivityLaunchController();
++        doReturn(BalVerdict.BLOCK).when(balController).checkBackgroundActivityStart(
++                anyInt(), anyInt(), any(), anyInt(), anyInt(), any(), any(), anyBoolean(),
++                any(), any(), any());
++
++        // Configure starter for an activity in a different package with cantSaveState.
++        final ActivityStarter starter = prepareStarter(0 /* launchFlags */);
++        starter.setCallingUid(attackerUid);
++        starter.setCallingPid(attackerPid);
++        starter.setCallingPackage(attackerPackage);
++        starter.setRealCallingUid(attackerUid);
++        starter.setRealCallingPid(attackerPid);
++
++        final ActivityInfo info = starter.mRequest.activityInfo;
++        info.packageName = attackerPackage;
++        info.processName = attackerPackage;
++        info.applicationInfo.packageName = attackerPackage;
++        info.applicationInfo.uid = attackerUid;
++        info.applicationInfo.privateFlags |= ApplicationInfo.PRIVATE_FLAG_CANT_SAVE_STATE;
++        info.name = "com.test.attacker.TargetActivity";
++
++        // Mock resolution and ActivityManagerInternal so HeavyWeightSwitcherActivity resolves.
++        final ResolveInfo switcherResolveInfo = new ResolveInfo();
++        final ActivityInfo switcherActivityInfo = new ActivityInfo();
++        switcherActivityInfo.name = HeavyWeightSwitcherActivity.class.getName();
++        switcherActivityInfo.packageName = "android";
++        switcherActivityInfo.applicationInfo = new ApplicationInfo();
++        switcherActivityInfo.applicationInfo.packageName = "android";
++        switcherActivityInfo.applicationInfo.uid = SYSTEM_UID;
++        switcherResolveInfo.activityInfo = switcherActivityInfo;
++        doReturn(switcherResolveInfo).when(mSupervisor).resolveIntent(any(), any(), anyInt(),
++                anyInt(), anyInt(), anyInt());
++        mAtm.mAmInternal = mock(ActivityManagerInternal.class);
++        doAnswer(invocation -> invocation.getArgument(0))
++                .when(mAtm.mAmInternal).getActivityInfoForUser(any(), anyInt());
++
++        final int result = starter.execute();
++
++        assertEquals(START_ABORTED, result);
++    }
++
+     private ActivityRecord createBubbledActivity() {
+         final ActivityOptions opts = ActivityOptions.makeBasic();
+         opts.setTaskAlwaysOnTop(true);
+-- 
+2.56.0
+

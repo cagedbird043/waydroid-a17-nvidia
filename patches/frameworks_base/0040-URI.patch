@@ -1,0 +1,264 @@
+From 5d7259cd057c0ae500facaf0ee5d3980c7294b6f Mon Sep 17 00:00:00 2001
+From: Michael Mikhail <michaelmikhil@google.com>
+Date: Sat, 11 Jul 2026 01:01:59 +0000
+Subject: [PATCH 40/45] =?utf-8?q?=E6=A0=A1=E9=AA=8C=E5=AA=92=E4=BD=93?=
+ =?utf-8?q?=E5=B0=81=E9=9D=A2=20URI=20=E7=9A=84=E6=9D=A5=E6=BA=90=E6=9D=83?=
+ =?utf-8?q?=E9=99=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+NO_KTFMT=b/532541805
+
+Flag: EXEMPT BUGFIX
+Bug: 507686594
+Test: atest MediaDataLoaderTest
+(cherry picked from commit 08242a08f31db2527a5de7e6de83f0f0c6112044)
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:3c941394fa59cf6a3e9766ad6108d898c7424f63
+Merged-In: I5256e8788b48683559d28be157d3417c27c7dd52
+Change-Id: I5256e8788b48683559d28be157d3417c27c7dd52
+
+(cherry picked from commit 5e052ae68e833997f886c61170e45981692a37a5)
+---
+ .../domain/pipeline/MediaDataLoaderTest.kt    | 84 ++++++++++++++++++-
+ .../domain/pipeline/MediaDataLoader.kt        | 23 +++--
+ 2 files changed, 100 insertions(+), 7 deletions(-)
+
+diff --git a/packages/SystemUI/multivalentTests/src/com/android/systemui/media/controls/domain/pipeline/MediaDataLoaderTest.kt b/packages/SystemUI/multivalentTests/src/com/android/systemui/media/controls/domain/pipeline/MediaDataLoaderTest.kt
+index 350d97303..6ad3f405c 100644
+--- a/packages/SystemUI/multivalentTests/src/com/android/systemui/media/controls/domain/pipeline/MediaDataLoaderTest.kt
++++ b/packages/SystemUI/multivalentTests/src/com/android/systemui/media/controls/domain/pipeline/MediaDataLoaderTest.kt
+@@ -13,6 +13,7 @@
+  */
+ package com.android.systemui.media.controls.domain.pipeline
+ 
++import android.app.IUriGrantsManager
+ import android.app.Notification
+ import android.app.Notification.MediaStyle
+ import android.app.PendingIntent
+@@ -27,6 +28,7 @@ import android.media.MediaMetadata
+ import android.media.session.MediaController
+ import android.media.session.MediaSession
+ import android.media.session.PlaybackState
++import android.net.Uri
+ import android.os.Bundle
+ import android.service.notification.StatusBarNotification
+ import android.testing.TestableLooper.RunWithLooper
+@@ -35,7 +37,6 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
+ import androidx.test.filters.SmallTest
+ import com.android.systemui.SysuiTestCase
+ import com.android.systemui.graphics.ImageLoader
+-import com.android.systemui.graphics.imageLoader
+ import com.android.systemui.kosmos.testDispatcher
+ import com.android.systemui.kosmos.testScope
+ import com.android.systemui.media.controls.shared.mediaLogger
+@@ -55,6 +56,7 @@ import org.junit.runner.RunWith
+ import org.mockito.ArgumentMatchers.anyInt
+ import org.mockito.kotlin.any
+ import org.mockito.kotlin.mock
++import org.mockito.kotlin.never
+ import org.mockito.kotlin.times
+ import org.mockito.kotlin.verify
+ import org.mockito.kotlin.whenever
+@@ -87,6 +89,9 @@ class MediaDataLoaderTest : SysuiTestCase() {
+             putString(MediaMetadata.METADATA_KEY_TITLE, SESSION_TITLE)
+         }
+ 
++    private val ugm = mock<IUriGrantsManager>()
++    private val imageLoader = mock<ImageLoader>()
++
+     private lateinit var underTest: MediaDataLoader
+ 
+     @Before
+@@ -103,11 +108,12 @@ class MediaDataLoaderTest : SysuiTestCase() {
+                 testScope,
+                 mediaControllerFactory,
+                 mediaFlags,
+-                kosmos.imageLoader,
++                imageLoader,
+                 statusBarManager,
+                 kosmos.media3ActionFactory,
+                 kosmos.mediaLogger,
+             )
++        underTest.uriGrantsManager = ugm
+     }
+ 
+     @Test
+@@ -334,6 +340,78 @@ class MediaDataLoaderTest : SysuiTestCase() {
+             assertThat(result).isNotNull()
+         }
+ 
++    @Test
++    fun loadMediaData_hasArtPermission_artLoaded() =
++        testScope.runTest {
++            // When media is loaded and user/app has permission to access the art URI,
++            whenever(
++                    ugm.checkGrantUriPermission_ignoreNonSystem(
++                        anyInt(),
++                        any(),
++                        any(),
++                        anyInt(),
++                        anyInt(),
++                    )
++                )
++                .thenReturn(1)
++            val artwork = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
++            val uri = Uri.parse("content://example")
++            metadataBuilder.putString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, uri.toString())
++            whenever(imageLoader.loadBitmap(any(), anyInt(), anyInt(), anyInt()))
++                .thenReturn(artwork)
++
++            val mediaNotification =
++                SbnBuilder().run {
++                    setPkg(PACKAGE_NAME)
++                    modifyNotification(context).also {
++                        it.setSmallIcon(android.R.drawable.ic_media_pause)
++                        it.setStyle(MediaStyle().apply { setMediaSession(session.sessionToken) })
++                    }
++                    build()
++                }
++
++            val result = underTest.loadMediaData(KEY, mediaNotification)
++
++            assertThat(result?.artworkIcon).isNotNull()
++            verify(imageLoader).loadBitmap(any(), anyInt(), anyInt(), anyInt())
++        }
++
++    @Test
++    fun loadMediaData_noArtPermission_noArtLoaded() =
++        testScope.runTest {
++            // When media is loaded and user/app has no permission to access the art URI,
++            whenever(
++                    ugm.checkGrantUriPermission_ignoreNonSystem(
++                        anyInt(),
++                        any(),
++                        any(),
++                        anyInt(),
++                        anyInt(),
++                    )
++                )
++                .thenThrow(SecurityException("Test no permission"))
++            val artwork = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
++            val uri = Uri.parse("content://example")
++            metadataBuilder.putString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, uri.toString())
++            whenever(imageLoader.loadBitmap(any(), anyInt(), anyInt(), anyInt()))
++                .thenReturn(artwork)
++
++            val mediaNotification =
++                SbnBuilder().run {
++                    setPkg(PACKAGE_NAME)
++                    modifyNotification(context).also {
++                        it.setSmallIcon(android.R.drawable.ic_media_pause)
++                        it.setStyle(MediaStyle().apply { setMediaSession(session.sessionToken) })
++                    }
++                    build()
++                }
++
++            val result = underTest.loadMediaData(KEY, mediaNotification)
++
++            assertThat(result).isNotNull()
++            verify(imageLoader, never()).loadBitmap(any(), anyInt(), anyInt(), anyInt())
++        }
++
+     @Test
+     fun loadMediaData_invalidTokenNoCrash() =
+         testScope.runTest {
+@@ -399,6 +477,7 @@ class MediaDataLoaderTest : SysuiTestCase() {
+                     media3ActionFactory,
+                     kosmos.mediaLogger,
+                 )
++            mediaDataLoader.uriGrantsManager = ugm
+             metadataBuilder.putString(
+                 MediaMetadata.METADATA_KEY_ALBUM_ART_URI,
+                 "content://album_art_uri",
+@@ -428,6 +507,7 @@ class MediaDataLoaderTest : SysuiTestCase() {
+                     media3ActionFactory,
+                     kosmos.mediaLogger,
+                 )
++            mediaDataLoader.uriGrantsManager = ugm
+             metadataBuilder.putString(
+                 MediaMetadata.METADATA_KEY_ALBUM_ART_URI,
+                 "content://album_art_uri",
+diff --git a/packages/SystemUI/src/com/android/systemui/media/controls/domain/pipeline/MediaDataLoader.kt b/packages/SystemUI/src/com/android/systemui/media/controls/domain/pipeline/MediaDataLoader.kt
+index 18a724ea9..4e665ff39 100644
+--- a/packages/SystemUI/src/com/android/systemui/media/controls/domain/pipeline/MediaDataLoader.kt
++++ b/packages/SystemUI/src/com/android/systemui/media/controls/domain/pipeline/MediaDataLoader.kt
+@@ -18,6 +18,7 @@ package com.android.systemui.media.controls.domain.pipeline
+ 
+ import android.annotation.UserIdInt
+ import android.annotation.WorkerThread
++import android.app.IUriGrantsManager
+ import android.app.Notification
+ import android.app.Notification.EXTRA_SUBSTITUTE_APP_NAME
+ import android.app.PendingIntent
+@@ -46,6 +47,7 @@ import android.util.Log
+ import androidx.media.utils.MediaConstants
+ import com.android.app.tracing.coroutines.asyncTraced as async
+ import com.android.app.tracing.coroutines.traceCoroutine
++import com.android.internal.annotations.VisibleForTesting
+ import com.android.systemui.dagger.SysUISingleton
+ import com.android.systemui.dagger.qualifiers.Application
+ import com.android.systemui.dagger.qualifiers.Background
+@@ -106,6 +108,8 @@ constructor(
+             )
+             .defaultColor
+ 
++    @VisibleForTesting internal var uriGrantsManager: IUriGrantsManager? = null
++
+     /**
+      * Loads media data for a given [StatusBarNotification]. It does the loading on the background
+      * thread.
+@@ -204,8 +208,12 @@ constructor(
+             // Don't attempt to load bitmaps if the job was cancelled.
+             coroutineContext.ensureActive()
+ 
++            val appUid = appInfo?.uid ?: Process.INVALID_UID
+             // Album art
+-            var artworkBitmap = metadata?.let { loadBitmapFromUri(it, sbn.user) }
++            var artworkBitmap =
++                metadata?.let {
++                    loadBitmapFromUri(it, sbn.user.identifier, appUid, sbn.packageName)
++                }
+             if (artworkBitmap == null) {
+                 artworkBitmap = metadata?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+             }
+@@ -257,7 +265,6 @@ constructor(
+             val playbackLocation = getPlaybackLocation(sbn, mediaController)
+             val isPlaying = mediaController.playbackState?.let { isPlayingState(it.state) }
+ 
+-            val appUid = appInfo?.uid ?: Process.INVALID_UID
+             return MediaDataLoaderResult(
+                 appName = appName,
+                 appIcon = smallIcon,
+@@ -442,11 +449,17 @@ constructor(
+     }
+ 
+     /** Load a bitmap from the various Art metadata URIs */
+-    private suspend fun loadBitmapFromUri(metadata: MediaMetadata, user: UserHandle): Bitmap? {
++    private suspend fun loadBitmapFromUri(
++        metadata: MediaMetadata,
++        @UserIdInt userId: Int,
++        appUid: Int,
++        packageName: String,
++    ): Bitmap? {
+         for (uri in ART_URIS) {
+             val uriString = metadata.getString(uri)
+             if (!TextUtils.isEmpty(uriString)) {
+-                val albumArt = loadBitmapFromUriAsUser(Uri.parse(uriString), user)
++                val albumArt =
++                    loadBitmapFromUriChecked(Uri.parse(uriString), userId, appUid, packageName)
+                 // If we got cancelled during slow album art load, cancel the rest of the process.
+                 coroutineContext.ensureActive()
+                 if (albumArt != null) {
+@@ -496,7 +509,7 @@ constructor(
+         packageName: String,
+     ): Bitmap? {
+         try {
+-            val ugm = UriGrantsManager.getService()
++            val ugm = uriGrantsManager ?: UriGrantsManager.getService()
+             ugm.checkGrantUriPermission_ignoreNonSystem(
+                 appUid,
+                 packageName,
+-- 
+2.56.0
+

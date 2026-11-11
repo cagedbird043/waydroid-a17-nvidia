@@ -1,0 +1,96 @@
+From 9a1585b0426c6120eccbe1899e6b0bda4ff0135e Mon Sep 17 00:00:00 2001
+From: Fyodor Kyslov <kyslov@google.com>
+Date: Mon, 18 May 2026 21:48:46 +0000
+Subject: [PATCH 1/5] =?utf-8?q?=E4=BF=AE=E5=A4=8D=20APV=20=E8=BD=AF?=
+ =?utf-8?q?=E4=BB=B6=E8=A7=A3=E7=A0=81=E5=99=A8=E4=B8=BB=E5=B8=A7=E5=B0=BA?=
+ =?utf-8?q?=E5=AF=B8=E8=B7=9F=E8=B8=AA=E8=B6=8A=E7=95=8C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+A state-tracking error in C2SoftApvDec when handling multi-frame APV
+access units causes mWidth and mHeight to be set to the dimensions
+of the last frame, while the output is copied from the primary frame's
+smaller buffer. This mismatch leads to a heap out-of-bounds read.
+
+This patch fixes the issue by only updating mWidth and mHeight from
+the primary frame in process(), and adding validation and update
+logic in outputBuffer() using the actual primary frame dimensions
+extracted from the image buffer.
+
+Bug: 501467247
+Test: local test
+Flag: EXEMPT BUGFIX
+Low-Coverage-Reason: TEST_IN_POSTSUBMIT
+
+TAG=agy
+CONV=6d836493-f1b3-4534-83a8-b805271d79e8
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:f96778b1c09dadf119dc89ccdc030aafd2ca1232
+Merged-In: I0da9aac6c81130dbed10a9cc61e5d8d40c60c807
+Change-Id: I0da9aac6c81130dbed10a9cc61e5d8d40c60c807
+
+(cherry picked from commit 6d9360d5cfb597f1d72ba718fe667e56c8533af8)
+---
+ media/codec2/components/apv/C2SoftApvDec.cpp | 35 +++++++++++++++-----
+ 1 file changed, 27 insertions(+), 8 deletions(-)
+
+diff --git a/media/codec2/components/apv/C2SoftApvDec.cpp b/media/codec2/components/apv/C2SoftApvDec.cpp
+index e32766ee1c..9b2c126b2a 100644
+--- a/media/codec2/components/apv/C2SoftApvDec.cpp
++++ b/media/codec2/components/apv/C2SoftApvDec.cpp
+@@ -972,18 +972,21 @@ void C2SoftApvDec::process(const std::unique_ptr<C2Work>& work,
+             oapv_frm_info_t* finfo = &aui.frm_info[i];
+             oapv_frm_t* frm = &mOutFrames.frm[i];
+ 
+-            if (mWidth != finfo->w || mHeight != finfo->h) {
+-                mWidth = finfo->w;
+-                mHeight = finfo->h;
+-                reportResolutionChange = true;
+-            }
+-
+-            if (mWidth > MAX_SUPPORTED_WIDTH || mHeight > MAX_SUPPORTED_HEIGHT) {
+-                ALOGE("Stream resolution of %dx%d is not supported.", mWidth, mHeight);
++            if (finfo->w > MAX_SUPPORTED_WIDTH || finfo->h > MAX_SUPPORTED_HEIGHT) {
++                ALOGE("Stream resolution of %dx%d is not supported.", finfo->w, finfo->h);
+                 work->result = C2_CORRUPTED;
+                 return;
+             }
+ 
++            if (finfo->pbu_type == OAPV_PBU_TYPE_PRIMARY_FRAME && !reportResolutionChange) {
++                if (mWidth != finfo->w || mHeight != finfo->h) {
++                    mWidth = finfo->w;
++                    mHeight = finfo->h;
++                    reportResolutionChange = true;
++                }
++            }
++
++
+             if (frm->imgb != NULL && (frm->imgb->w[0] != finfo->w || frm->imgb->h[0] != finfo->h)) {
+                 frm->imgb->release(frm->imgb);
+                 frm->imgb = NULL;
+@@ -1333,6 +1336,22 @@ status_t C2SoftApvDec::outputBuffer(const std::shared_ptr<C2BlockPool>& pool,
+ 
+     C2MemoryUsage usage = {C2MemoryUsage::CPU_READ, C2MemoryUsage::CPU_WRITE};
+ 
++    uint32_t outWidth = imgbOutput->w[0];
++    uint32_t outHeight = imgbOutput->h[0];
++    if (outWidth == 0 || outHeight == 0 || outWidth > MAX_SUPPORTED_WIDTH ||
++        outHeight > MAX_SUPPORTED_HEIGHT) {
++        ALOGE("Primary-frame imgb dimensions invalid: %ux%u", outWidth, outHeight);
++        work->result = C2_CORRUPTED;
++        return UNKNOWN_ERROR;
++    }
++
++    if (outWidth != mWidth || outHeight != mHeight) {
++        ALOGW("Output dimensions mismatch: imgb(%ux%u) vs mWidth/mHeight(%ux%u)", outWidth,
++              outHeight, mWidth, mHeight);
++        mWidth = outWidth;
++        mHeight = outHeight;
++    }
++
+     // check. align height to 2 times does not work.
+     c2_status_t err =
+             pool->fetchGraphicBlock(align(mWidth, 16), align(mHeight, 16), format, usage, &block);
+-- 
+2.56.0
+

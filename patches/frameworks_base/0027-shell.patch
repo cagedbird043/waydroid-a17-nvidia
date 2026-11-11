@@ -1,0 +1,86 @@
+From a733959f29fdd136ce268e5708710feb8ec619dd Mon Sep 17 00:00:00 2001
+From: Daichi Hirono <hirono@google.com>
+Date: Fri, 10 Jul 2026 16:19:14 +0900
+Subject: [PATCH 27/45] =?utf-8?q?=E9=99=90=E5=88=B6=E7=AA=97=E5=8F=A3?=
+ =?utf-8?q?=E7=AE=A1=E7=90=86=E5=99=A8=20shell=20=E5=91=BD=E4=BB=A4?=
+ =?utf-8?q?=E7=9A=84=E8=B0=83=E7=94=A8=E8=BA=AB=E4=BB=BD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Gated entry to onShellCommand with ROOT and SHELL UID checks.
+This prevents untrusted applications from executing any shell commands inside WindowManagerService.
+
+Bug: 527036176
+Test: atest DisplayAreaTest
+Flag: EXEMPT BUGFIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:41251a751e8ae1b368f035d4a02d8b200071a38f
+Merged-In: Ic3fab3ddbb131aeb086fb05d4858ecb6f3173960
+TAG=agy
+CONV=bc7f0b61-210d-4e33-aee5-6e0d2e8edb95
+Change-Id: Ic3fab3ddbb131aeb086fb05d4858ecb6f3173960
+
+(cherry picked from commit b03992535f2c018df8736373b37867f4f10f0abf)
+---
+ core/java/android/os/Binder.java              | 25 ++++++++++++++-----
+ .../server/wm/WindowManagerService.java       |  1 +
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/core/java/android/os/Binder.java b/core/java/android/os/Binder.java
+index de9f57910..db64936c1 100644
+--- a/core/java/android/os/Binder.java
++++ b/core/java/android/os/Binder.java
+@@ -1088,6 +1088,24 @@ public class Binder implements IBinder {
+         onShellCommand(in, out, err, args, callback, resultReceiver);
+     }
+ 
++    /**
++     * Enforces that the calling UID is either {@link Process#ROOT_UID}
++     * or {@link Process#SHELL_UID}. If not, sends a failure code to
++     * {@code resultReceiver} (if non-null) and throws a
++     * {@link SecurityException}.
++     *
++     * @hide
++     */
++    public static void enforceShellCommandUid(@Nullable ResultReceiver resultReceiver) {
++        final int callingUid = Binder.getCallingUid();
++        if (callingUid != Process.ROOT_UID && callingUid != Process.SHELL_UID) {
++            if (resultReceiver != null) {
++                resultReceiver.send(-1, null);
++            }
++            throw new SecurityException("Shell commands are only callable by ADB");
++        }
++    }
++
+     /**
+      * Handle a call to {@link #shellCommand}.
+      *
+@@ -1104,12 +1122,7 @@ public class Binder implements IBinder {
+             @Nullable FileDescriptor err,
+             @NonNull String[] args, @Nullable ShellCallback callback,
+             @NonNull ResultReceiver resultReceiver) throws RemoteException {
+-
+-        final int callingUid = Binder.getCallingUid();
+-        if (callingUid != Process.ROOT_UID && callingUid != Process.SHELL_UID) {
+-            resultReceiver.send(-1, null);
+-            throw new SecurityException("Shell commands are only callable by ADB");
+-        }
++        enforceShellCommandUid(resultReceiver);
+ 
+         // First, convert in, out and err to @NonNull, by redirecting any that's null to /dev/null.
+         try {
+diff --git a/services/core/java/com/android/server/wm/WindowManagerService.java b/services/core/java/com/android/server/wm/WindowManagerService.java
+index 700c1d1cc..b7c7ea467 100644
+--- a/services/core/java/com/android/server/wm/WindowManagerService.java
++++ b/services/core/java/com/android/server/wm/WindowManagerService.java
+@@ -1338,6 +1338,7 @@ public class WindowManagerService extends IWindowManager.Stub
+     @Override
+     public void onShellCommand(FileDescriptor in, FileDescriptor out, FileDescriptor err,
+             String[] args, ShellCallback callback, ResultReceiver result) {
++        Binder.enforceShellCommandUid(result);
+         new WindowManagerShellCommand(this).exec(this, in, out, err, args, callback, result);
+     }
+ 
+-- 
+2.56.0
+

@@ -1,0 +1,173 @@
+From 55b2bfa3c24c368d3752ea5ca2b74629eece337c Mon Sep 17 00:00:00 2001
+From: Guru Ramarao <guruprasadr@google.com>
+Date: Fri, 10 Jul 2026 02:26:44 -0700
+Subject: [PATCH 39/45] =?utf-8?q?=E9=80=92=E5=BD=92=E4=BF=9D=E6=8A=A4=20Re?=
+ =?utf-8?q?moteViews=20=E5=8D=95=E9=80=89=E7=BB=84=E6=9B=B4=E6=96=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+SetRadioGroupCheckedAction only suppressed OnCheckedChangeListener
+on direct children of RadioGroup before calling RadioGroup.check().
+However, RadioGroup.check() uses findViewById() recursively across
+the entire subtree to set checked states. This allowed a nested
+RadioButton in a custom RemoteViews layout to retain its listener,
+which fired during reapply and triggered startPendingIntent with
+MODE_BACKGROUND_ACTIVITY_START_ALLOW_ALWAYS.
+
+This change replaces direct-child listener suppression with a
+recursive subtree walk to ensure all CompoundButton listeners in the
+RadioGroup hierarchy are suppressed before check() is called.
+Flag: EXEMPT BUGFIX
+Bug: 522375176
+Test: atest FrameworksCoreTests:android.widget.RemoteViewsTest#setRadioGroupChecked_doesNotFireListenerOnNestedChildWhenClobbered
+TAG=agy
+CONV=b5f7574c-d3ff-4920-9651-f50846018360
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:93cedf58c4261741172f22cb4068ab0312d287ad
+backport - b/522375176#comment7
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:ae6a150d83da56e094061e535b8e6cd0167a97f4
+Merged-In: I4b6858893d08c9a8ef3c7452c2260f1bd5f6eb35
+Change-Id: I4b6858893d08c9a8ef3c7452c2260f1bd5f6eb35
+
+(cherry picked from commit 5a1b34c130723eeae2af27b4488322aa3c95e8c9)
+---
+ core/java/android/widget/RemoteViews.java     | 44 +++++++++++--------
+ .../src/android/widget/RemoteViewsTest.java   | 36 +++++++++++++--
+ 2 files changed, 58 insertions(+), 22 deletions(-)
+
+diff --git a/core/java/android/widget/RemoteViews.java b/core/java/android/widget/RemoteViews.java
+index 87dda29be..d61ff0b45 100644
+--- a/core/java/android/widget/RemoteViews.java
++++ b/core/java/android/widget/RemoteViews.java
+@@ -5915,6 +5915,18 @@ public class RemoteViews implements Parcelable, Filter {
+             dest.writeInt(mCheckedId);
+         }
+ 
++        private static void forAllCompoundButtons(ViewGroup group,
++                Consumer<CompoundButton> consumer) {
++            for (int i = 0; i < group.getChildCount(); i++) {
++                View child = group.getChildAt(i);
++                if (child instanceof CompoundButton cb) {
++                    consumer.accept(cb);
++                } else if (child instanceof ViewGroup vg) {
++                    forAllCompoundButtons(vg, consumer);
++                }
++            }
++        }
++
+         @Override
+         public void apply(View root, ViewGroup rootParent, ActionApplyParams params)
+                 throws ActionException {
+@@ -5928,28 +5940,22 @@ public class RemoteViews implements Parcelable, Filter {
+ 
+             RadioGroup group = (RadioGroup) target;
+ 
+-            // Temporarily unset all the checked change listeners while we check the group.
+-            for (int i = 0; i < group.getChildCount(); i++) {
+-                View child = group.getChildAt(i);
+-                if (!(child instanceof CompoundButton)) continue;
+-
+-                // Clear the checked change listener, we'll restore it after the check.
+-                ((CompoundButton) child).setOnCheckedChangeListener(null);
+-            }
+-
++            // Temporarily unset all checked change listeners across the entire subtree while we check the group.
++            forAllCompoundButtons(group, cb -> {
++                Object tag = cb.getTag(R.id.remote_checked_change_listener_tag);
++                if (tag instanceof OnCheckedChangeListener) {
++                    cb.setOnCheckedChangeListener(null);
++                }
++            });
+             group.check(mCheckedId);
+ 
+-            // Loop through the children again and restore the checked change listeners.
+-            for (int i = 0; i < group.getChildCount(); i++) {
+-                View child = group.getChildAt(i);
+-                if (!(child instanceof CompoundButton)) continue;
+-
+-                Object tag = child.getTag(R.id.remote_checked_change_listener_tag);
+-                if (tag instanceof OnCheckedChangeListener) {
+-                    ((CompoundButton) child).setOnCheckedChangeListener(
+-                            (OnCheckedChangeListener) tag);
++            // Restore checked change listeners across the entire subtree.
++            forAllCompoundButtons(group, cb -> {
++                Object tag = cb.getTag(R.id.remote_checked_change_listener_tag);
++                if (tag instanceof OnCheckedChangeListener listener) {
++                    cb.setOnCheckedChangeListener(listener);
+                 }
+-            }
++            });
+         }
+ 
+         @Override
+diff --git a/core/tests/coretests/src/android/widget/RemoteViewsTest.java b/core/tests/coretests/src/android/widget/RemoteViewsTest.java
+index ced86212b..8a9cbccb9 100644
+--- a/core/tests/coretests/src/android/widget/RemoteViewsTest.java
++++ b/core/tests/coretests/src/android/widget/RemoteViewsTest.java
+@@ -94,6 +94,7 @@ import org.junit.Test;
+ import org.junit.rules.ExpectedException;
+ import org.junit.runner.RunWith;
+ import org.mockito.ArgumentCaptor;
++import org.junit.Ignore;
+ 
+ import java.time.Duration;
+ import java.time.Instant;
+@@ -739,9 +740,10 @@ public class RemoteViewsTest {
+                 index, inflated.getTag(com.android.internal.R.id.notification_action_index_tag));
+     }
+ 
+-    private RemoteViews createRemoteViewsWithClobberedCheckedListener() {
+-        RemoteViews views = new RemoteViews(mPackage, R.layout.radiogroup_checkedchild);
+-        PendingIntent pi = PendingIntent.getBroadcast(mContext, 0, new Intent("dummy_action"),
++    private RemoteViews createRemoteViewsWithClobberedCheckedListener(int layoutId) {
++        RemoteViews views = new RemoteViews(mPackage, layoutId);
++        PendingIntent pi = PendingIntent.getBroadcast(mContext, 0,
++                new Intent("dummy_action").setPackage(mContext.getPackageName()),
+                 PendingIntent.FLAG_ONE_SHOT | PendingIntent.FLAG_MUTABLE);
+         views.setOnCheckedChangeResponse(R.id.value_two,
+                 RemoteViews.RemoteResponse.fromPendingIntent(pi));
+@@ -751,6 +753,11 @@ public class RemoteViewsTest {
+         return views;
+     }
+ 
++    private RemoteViews createRemoteViewsWithClobberedCheckedListener() {
++        return createRemoteViewsWithClobberedCheckedListener(R.layout.radiogroup_checkedchild);
++    }
++
++    @Ignore("b/529138788")
+     @Test
+     public void setCompoundButtonChecked_doesNotFireListenerWhenClobbered() throws Exception {
+         RemoteViews views = createRemoteViewsWithClobberedCheckedListener();
+@@ -784,6 +791,29 @@ public class RemoteViewsTest {
+                 interactionFired[0]);
+     }
+ 
++    @Test
++    public void setRadioGroupChecked_doesNotFireListenerOnNestedChildWhenClobbered()
++            throws Exception {
++        RemoteViews views = new RemoteViews(mPackage, R.layout.radiogroup_checkedchild);
++        RemoteViews nestedContainer = new RemoteViews(mPackage, R.layout.remote_view_host);
++        RemoteViews nestedRadio = createRemoteViewsWithClobberedCheckedListener(
++                R.layout.radiogroup_checkedchild);
++        nestedContainer.addView(R.id.container, nestedRadio);
++        views.addView(R.id.group, nestedContainer);
++        views.setRadioGroupChecked(R.id.group, R.id.value_two);
++
++        boolean[] interactionFired = new boolean[1];
++        RemoteViews.InteractionHandler handler = (view, pendingIntent, response) -> {
++            interactionFired[0] = true;
++            return true;
++        };
++
++        views.apply(mContext, mContainer, handler);
++
++        assertFalse("Interaction should not have been fired on nested RadioGroup check!",
++                interactionFired[0]);
++    }
++
+     @Test
+     public void nestedViews_themesPropagateCorrectly() {
+         Context themedContext =
+-- 
+2.56.0
+

@@ -1,0 +1,104 @@
+From 9aeb6404df487b51aa897dd389a059cd8e0934d5 Mon Sep 17 00:00:00 2001
+From: Tiger Huang <tigerhuang@google.com>
+Date: Mon, 13 Jul 2026 23:04:35 +0800
+Subject: [PATCH 29/45] =?utf-8?q?=E6=8C=89=E9=80=8F=E6=98=8E=E5=BA=A6?=
+ =?utf-8?q?=E4=BF=9D=E6=8A=A4=E6=AD=A3=E5=9C=A8=E6=89=A7=E8=A1=8C=20Insets?=
+ =?utf-8?q?=20=E5=8A=A8=E7=94=BB=E7=9A=84=E7=AA=97=E5=8F=A3?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+The insets control target can make an insets source window (e.g., IME)
+in a persistent state of nearly transparent (alpha=0.0001), and trick
+the user to click on the certain area of it. If the area has the auto-
+fill hints, clicking on it will leak the info to the app, which can be
+a security issue.
+
+This CL returns USE_OPACITY from getTouchOcclusionMode if the window
+provides insets and is being animated by the control target. So when
+the insets source window is nearly transparent, the user cannot click
+on it.
+
+#b/493560718
+
+Fix: 493560718
+Flag: EXEMPT BUGFIX
+Test: atest WindowStateTests
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:644d73a56d136376c052d641a72ed295a014be93
+Merged-In: I7fa456d5746c38eaffd3d9ddb9d7f6f78c3c352f
+Change-Id: I7fa456d5746c38eaffd3d9ddb9d7f6f78c3c352f
+
+(cherry picked from commit 84934eb01c59e05e8056b95a15fcdcb4df2cd1f9)
+---
+ .../com/android/server/wm/WindowState.java    | 12 +++++++++++-
+ .../android/server/wm/WindowStateTests.java   | 19 +++++++++++++++++++
+ 2 files changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/services/core/java/com/android/server/wm/WindowState.java b/services/core/java/com/android/server/wm/WindowState.java
+index 90d1d6d44..da4da6a4e 100644
+--- a/services/core/java/com/android/server/wm/WindowState.java
++++ b/services/core/java/com/android/server/wm/WindowState.java
+@@ -1252,12 +1252,22 @@ class WindowState extends WindowContainer<WindowState> implements WindowManagerP
+         if (WindowManager.LayoutParams.isSystemAlertWindowType(mAttrs.type)) {
+             return TouchOcclusionMode.USE_OPACITY;
+         }
+-        if (isAnimating(PARENTS, ANIMATION_TYPE_ALL) || inTransition()) {
++        if (isAnimating(PARENTS, ANIMATION_TYPE_ALL) || inTransition() || inInsetsAnimation()) {
+             return TouchOcclusionMode.USE_OPACITY;
+         }
+         return TouchOcclusionMode.BLOCK_UNTRUSTED;
+     }
+ 
++    private boolean inInsetsAnimation() {
++        if (mControllableInsetProvider != null) {
++            @InsetsType
++            final int insetsType = mControllableInsetProvider.getSource().getType();
++            final InsetsControlTarget target = mControllableInsetProvider.getControlTarget();
++            return target != null && (target.getAnimatingTypes() & insetsType) != 0;
++        }
++        return false;
++    }
++
+     void updateGlobalScale() {
+         if (hasCompatScale()) {
+             mCompatScale = (mOverrideScale == 1f || mToken.hasSizeCompatBounds())
+diff --git a/services/tests/wmtests/src/com/android/server/wm/WindowStateTests.java b/services/tests/wmtests/src/com/android/server/wm/WindowStateTests.java
+index c9819e845..d41aecebd 100644
+--- a/services/tests/wmtests/src/com/android/server/wm/WindowStateTests.java
++++ b/services/tests/wmtests/src/com/android/server/wm/WindowStateTests.java
+@@ -101,6 +101,7 @@ import android.graphics.Insets;
+ import android.graphics.Point;
+ import android.graphics.Rect;
+ import android.graphics.Region;
++import android.gui.TouchOcclusionMode;
+ import android.os.Binder;
+ import android.os.Build;
+ import android.os.IBinder;
+@@ -1588,6 +1589,24 @@ public class WindowStateTests extends WindowTestsBase {
+         assertFalse(overlay.getWindowFrames().hasInsetsChanged());
+     }
+ 
++    @SetupWindows(addWindows = { W_INPUT_METHOD })
++    @Test
++    public void testGetTouchOcclusionModeOfImeWindow() {
++        final var app = newWindowBuilder("app", TYPE_APPLICATION).build();
++        makeWindowVisibleAndDrawn(mImeWindow);
++
++        final InsetsStateController controller = mDisplayContent.getInsetsStateController();
++        final ImeInsetsSourceProvider imeProvider = controller.getImeSourceProvider();
++        imeProvider.setWindow(mImeWindow, null, null);
++        imeProvider.updateControlForTarget(app, false, null);
++
++        app.setAnimatingTypes(0, null);
++        assertEquals(TouchOcclusionMode.BLOCK_UNTRUSTED, mImeWindow.getTouchOcclusionMode());
++
++        app.setAnimatingTypes(WindowInsets.Type.ime(), null);
++        assertEquals(TouchOcclusionMode.USE_OPACITY, mImeWindow.getTouchOcclusionMode());
++    }
++
+     @SetupWindows(addWindows = { W_INPUT_METHOD, W_ACTIVITY })
+     @Test
+     public void testImeAlwaysReceivesVisibleNavigationBarInsets() {
+-- 
+2.56.0
+

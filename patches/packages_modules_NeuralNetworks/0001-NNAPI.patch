@@ -1,0 +1,81 @@
+From 56b147057fd4b91814f77aba6f9e66dab8e4bcac Mon Sep 17 00:00:00 2001
+From: Michael Butler <butlermichael@google.com>
+Date: Wed, 24 Jun 2026 16:11:37 -0700
+Subject: [PATCH] =?utf-8?q?=E6=A0=A1=E9=AA=8C=20NNAPI=20=E6=93=8D=E4=BD=9C?=
+ =?utf-8?q?=E4=B8=8E=E5=AD=90=E5=9B=BE=E7=B4=A2=E5=BC=95=E8=BE=B9=E7=95=8C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Add explicit bounds checks for operation inputs/outputs and subgraph
+input/output indexes in isValid() of ShimConverter.cpp to prevent OOB
+access and improve error logging.
+
+Bug: 269456968
+Test: alint
+Flag: EXEMPT BUGFIX
+DISABLE_TOPIC_PROTECTOR
+Change-Id: I09c16a02f2b97ce223285871dd38c04ed3327690
+
+(cherry picked from commit 1905cbda6547b5658a71d00f8fdd4cebb1abddc5)
+Change-Id: I20b16caaa54430d948dd24814e62475ab97a0770
+---
+ shim_and_sl/ShimConverter.cpp | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/shim_and_sl/ShimConverter.cpp b/shim_and_sl/ShimConverter.cpp
+index 9914af1..1d9a5a9 100644
+--- a/shim_and_sl/ShimConverter.cpp
++++ b/shim_and_sl/ShimConverter.cpp
+@@ -302,6 +302,12 @@ bool isValid(const Subgraph& subgraph) {
+ 
+         for (size_t j = 0; j < operation.inputs.size(); ++j) {
+             const uint32_t k = operation.inputs[j];
++            if (k >= operandValueKnown.size()) {
++                LOG(ERROR) << "Operation " << i << " input " << j
++                           << " operand index out of bounds: requested " << k
++                           << ", but valid index range is [0, " << operandValueKnown.size() << ")";
++                return false;
++            }
+             if (!operandValueKnown[k]) {
+                 LOG(ERROR) << "Operation " << i << " input " << j << " (operand " << k
+                            << ") is read before it is written";
+@@ -311,6 +317,12 @@ bool isValid(const Subgraph& subgraph) {
+ 
+         for (size_t j = 0; j < operation.outputs.size(); ++j) {
+             const uint32_t k = operation.outputs[j];
++            if (k >= operandValueKnown.size()) {
++                LOG(ERROR) << "Operation " << i << " output " << j
++                           << " operand index out of bounds: requested " << k
++                           << ", but valid index range is [0, " << operandValueKnown.size() << ")";
++                return false;
++            }
+             // Assuming validateOperations() has not returned an error, we know that this output is
+             // TEMPORARY_VARIABLE or MODEL_OUTPUT, and so the only way operandValueKnown[k] can be
+             // true is if we've already seen a writer for this operand.
+@@ -342,12 +354,22 @@ bool isValid(const Subgraph& subgraph) {
+ 
+     // Validate input and output lifetime
+     for (auto index : subgraph.inputIndexes) {
++        if (index >= subgraph.operands.size()) {
++            LOG(ERROR) << "Input index out of bounds: requested " << index
++                       << ", but valid index range is [0, " << subgraph.operands.size() << ")";
++            return false;
++        }
+         if (subgraph.operands[index].lifetime != OperandLifeTime::SUBGRAPH_INPUT) {
+             LOG(ERROR) << "Input with index" << index << " has invalid lifetime";
+             return false;
+         }
+     }
+     for (auto index : subgraph.outputIndexes) {
++        if (index >= subgraph.operands.size()) {
++            LOG(ERROR) << "Output index out of bounds: requested " << index
++                       << ", but valid index range is [0, " << subgraph.operands.size() << ")";
++            return false;
++        }
+         if (subgraph.operands[index].lifetime != OperandLifeTime::SUBGRAPH_OUTPUT) {
+             LOG(ERROR) << "Output with index" << index << " has invalid lifetime";
+             return false;
+-- 
+2.56.0
+

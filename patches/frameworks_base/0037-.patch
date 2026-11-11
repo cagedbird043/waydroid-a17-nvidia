@@ -1,0 +1,245 @@
+From c2ffc57d011ba9a08c0186543f4ea9eb2021e450 Mon Sep 17 00:00:00 2001
+From: Anton Potapov <apotapov@google.com>
+Date: Mon, 17 Aug 2026 07:12:12 -0700
+Subject: [PATCH 37/45] =?utf-8?q?=E9=94=81=E5=B1=8F=E6=97=B6=E9=9A=90?=
+ =?utf-8?q?=E8=97=8F=E9=9F=B3=E9=87=8F=E9=9D=A2=E6=9D=BF?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Flag: EXEMPT BUGFIX
+Bug: 522375529
+Test: atest VolumePanelGlobalStateInteractorTest
+Test: manual on device: lock the screen while volume panel is visible to observe that it disappears
+Test: manual on device: try to invoke volume panel when the device is locked
+Merged-In: I8a42e00fa9da15c75e78ba7b757cffa73840d258
+Merged-In: I794dc2a7578f34070debfd121430e3dd3a5e9210
+Change-Id: I8a42e00fa9da15c75e78ba7b757cffa73840d258
+
+(cherry picked from commit 27d642ba02a8cd4d175ee2ce7b3317c37e70c765)
+---
+ .../VolumePanelGlobalStateInteractorTest.kt   | 73 +++++++++++++++----
+ .../VolumePanelGlobalStateInteractor.kt       | 53 +++++++++++++-
+ .../volume/ui/navigation/VolumeNavigator.kt   |  9 +--
+ .../VolumePanelGlobalStateInteractorKosmos.kt | 13 +++-
+ 4 files changed, 122 insertions(+), 26 deletions(-)
+
+diff --git a/packages/SystemUI/multivalentTests/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractorTest.kt b/packages/SystemUI/multivalentTests/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractorTest.kt
+index d44724f67..56f840688 100644
+--- a/packages/SystemUI/multivalentTests/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractorTest.kt
++++ b/packages/SystemUI/multivalentTests/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractorTest.kt
+@@ -19,30 +19,75 @@ package com.android.systemui.volume.panel.domain.interactor
+ import androidx.test.ext.junit.runners.AndroidJUnit4
+ import androidx.test.filters.SmallTest
+ import com.android.systemui.SysuiTestCase
+-import com.android.systemui.kosmos.testScope
+-import com.android.systemui.testKosmos
++import com.android.systemui.authentication.data.repository.fakeAuthenticationRepository
++import com.android.systemui.authentication.shared.model.AuthenticationMethodModel
++import com.android.systemui.keyguard.data.repository.fakeKeyguardRepository
++import com.android.systemui.kosmos.Kosmos
++import com.android.systemui.kosmos.runTest
++import com.android.systemui.plugins.ActivityStarter
++import com.android.systemui.plugins.activityStarter
++import com.android.systemui.scene.domain.interactor.sceneInteractor
++import com.android.systemui.scene.shared.model.Scenes
++import com.android.systemui.testKosmosNew
+ import com.google.common.truth.Truth.assertThat
+-import kotlinx.coroutines.test.runTest
++import org.junit.Before
+ import org.junit.Test
+ import org.junit.runner.RunWith
++import org.mockito.ArgumentMatchers.anyBoolean
++import org.mockito.kotlin.any
++import org.mockito.kotlin.whenever
+ 
+ @SmallTest
+ @RunWith(AndroidJUnit4::class)
+ class VolumePanelGlobalStateInteractorTest : SysuiTestCase() {
+ 
+-    private val kosmos = testKosmos()
++    private val kosmos = testKosmosNew()
+ 
+-    private val underTest = kosmos.volumePanelGlobalStateInteractor
++    private val underTest by lazy { kosmos.volumePanelGlobalStateInteractor }
++
++    @Before
++    fun setUp() {
++        whenever(kosmos.activityStarter.dismissKeyguardThenExecute(any(), any(), anyBoolean()))
++            .then { (it.arguments[0] as ActivityStarter.OnDismissAction).onDismiss() }
++    }
++
++    @Test
++    fun changeVisibility_changesVisibility() = kosmos.runTest {
++        setDeviceEntered(true)
++
++        underTest.setVisible(false)
++        assertThat(underTest.globalState.value.isVisible).isFalse()
++
++        underTest.setVisible(true)
++        assertThat(underTest.globalState.value.isVisible).isTrue()
++    }
+ 
+     @Test
+-    fun changeVisibility_changesVisibility() =
+-        with(kosmos) {
+-            testScope.runTest {
+-                underTest.setVisible(false)
+-                assertThat(underTest.globalState.value.isVisible).isFalse()
+-
+-                underTest.setVisible(true)
+-                assertThat(underTest.globalState.value.isVisible).isTrue()
+-            }
++    fun setVisible_noOpWhenDeviceNotEntered() = kosmos.runTest {
++        setDeviceEntered(false)
++
++        underTest.setVisible(true)
++        assertThat(underTest.globalState.value.isVisible).isFalse()
++    }
++
++    @Test
++    fun globalState_becomesInvisibleWhenDeviceNotEntered() = kosmos.runTest {
++        setDeviceEntered(true)
++
++        underTest.setVisible(true)
++        assertThat(underTest.globalState.value.isVisible).isTrue()
++
++        setDeviceEntered(false)
++        assertThat(underTest.globalState.value.isVisible).isFalse()
++    }
++
++    private fun Kosmos.setDeviceEntered(isEntered: Boolean) {
++        if (isEntered) {
++            fakeAuthenticationRepository.setAuthenticationMethod(AuthenticationMethodModel.None)
++            fakeKeyguardRepository.setKeyguardEnabled(true)
++            sceneInteractor.changeScene(Scenes.Gone, "reason")
++        } else {
++            sceneInteractor.changeScene(Scenes.Lockscreen, "reason")
+         }
++    }
+ }
+diff --git a/packages/SystemUI/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractor.kt b/packages/SystemUI/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractor.kt
+index e930aca05..04089db1e 100644
+--- a/packages/SystemUI/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractor.kt
++++ b/packages/SystemUI/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractor.kt
+@@ -17,22 +17,71 @@
+ package com.android.systemui.volume.panel.domain.interactor
+ 
+ import com.android.systemui.dagger.SysUISingleton
++import com.android.systemui.dagger.qualifiers.Application
++import com.android.systemui.deviceentry.domain.interactor.DeviceEntryInteractor
++import com.android.systemui.plugins.ActivityStarter
+ import com.android.systemui.volume.panel.data.repository.VolumePanelGlobalStateRepository
+ import com.android.systemui.volume.panel.shared.model.VolumePanelGlobalState
+ import javax.inject.Inject
++import kotlin.coroutines.resume
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.flow.SharingStarted
+ import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.launchIn
++import kotlinx.coroutines.flow.mapLatest
++import kotlinx.coroutines.flow.onEach
++import kotlinx.coroutines.flow.stateIn
++import kotlinx.coroutines.suspendCancellableCoroutine
+ 
+ @SysUISingleton
+ class VolumePanelGlobalStateInteractor
+ @Inject
+ constructor(
++    @param:Application private val coroutineScope: CoroutineScope,
++    private val deviceEntryInteractor: DeviceEntryInteractor,
+     private val repository: VolumePanelGlobalStateRepository,
++    private val activityStarter: ActivityStarter,
+ ) {
+ 
+-    val globalState: StateFlow<VolumePanelGlobalState>
+-        get() = repository.globalState
++    val globalState: StateFlow<VolumePanelGlobalState> =
++        repository.globalState
++            .mapLatest { state ->
++                if (state.isVisible) {
++                    awaitKeyguard()
++                }
++                state
++            }
++            .stateIn(coroutineScope, SharingStarted.Eagerly, VolumePanelGlobalState(false))
++
++    init {
++        deviceEntryInteractor.isDeviceEntered
++            .onEach { isDeviceEntered ->
++                if (!isDeviceEntered) {
++                    setVisible(false)
++                }
++            }
++            .launchIn(coroutineScope)
++    }
+ 
+     fun setVisible(isVisible: Boolean) {
++        if (isVisible && !deviceEntryInteractor.isDeviceEntered.value) {
++            return
++        }
+         repository.updateVolumePanelState { it.copy(isVisible = isVisible) }
+     }
++
++    private suspend fun awaitKeyguard() {
++        return suspendCancellableCoroutine { continuation ->
++            activityStarter.dismissKeyguardThenExecute(
++                /* action = */ {
++                    if (continuation.isActive) {
++                        continuation.resume(Unit)
++                    }
++                    false
++                },
++                /* cancel = */ {},
++                /* afterKeyguardGone = */ true,
++            )
++        }
++    }
+ }
+diff --git a/packages/SystemUI/src/com/android/systemui/volume/ui/navigation/VolumeNavigator.kt b/packages/SystemUI/src/com/android/systemui/volume/ui/navigation/VolumeNavigator.kt
+index 0b90c98e9..f51f63917 100644
+--- a/packages/SystemUI/src/com/android/systemui/volume/ui/navigation/VolumeNavigator.kt
++++ b/packages/SystemUI/src/com/android/systemui/volume/ui/navigation/VolumeNavigator.kt
+@@ -101,14 +101,7 @@ constructor(
+     }
+ 
+     private fun showNewVolumePanel() {
+-        activityStarter.dismissKeyguardThenExecute(
+-            /* action = */ {
+-                volumePanelGlobalStateInteractor.setVisible(true)
+-                false
+-            },
+-            /* cancel = */ {},
+-            /* afterKeyguardGone = */ true,
+-        )
++        volumePanelGlobalStateInteractor.setVisible(true)
+     }
+ 
+     private fun createNewVolumePanelDialog(): Dialog {
+diff --git a/packages/SystemUI/tests/utils/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractorKosmos.kt b/packages/SystemUI/tests/utils/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractorKosmos.kt
+index 6e523648c..672f76075 100644
+--- a/packages/SystemUI/tests/utils/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractorKosmos.kt
++++ b/packages/SystemUI/tests/utils/src/com/android/systemui/volume/panel/domain/interactor/VolumePanelGlobalStateInteractorKosmos.kt
+@@ -16,8 +16,17 @@
+ 
+ package com.android.systemui.volume.panel.domain.interactor
+ 
++import com.android.systemui.deviceentry.domain.interactor.deviceEntryInteractor
+ import com.android.systemui.kosmos.Kosmos
++import com.android.systemui.kosmos.applicationCoroutineScope
++import com.android.systemui.plugins.activityStarter
+ import com.android.systemui.volume.panel.data.repository.volumePanelGlobalStateRepository
+ 
+-val Kosmos.volumePanelGlobalStateInteractor: VolumePanelGlobalStateInteractor by
+-    Kosmos.Fixture { VolumePanelGlobalStateInteractor(volumePanelGlobalStateRepository) }
++val Kosmos.volumePanelGlobalStateInteractor: VolumePanelGlobalStateInteractor by Kosmos.Fixture {
++    VolumePanelGlobalStateInteractor(
++        coroutineScope = applicationCoroutineScope,
++        activityStarter = activityStarter,
++        deviceEntryInteractor = deviceEntryInteractor,
++        repository = volumePanelGlobalStateRepository,
++    )
++}
+-- 
+2.56.0
+

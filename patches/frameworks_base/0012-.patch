@@ -1,0 +1,54 @@
+From 86dbb4057a6c91dcaa6ea906ef61cd3e10fd8787 Mon Sep 17 00:00:00 2001
+From: Louis Chang <louischang@google.com>
+Date: Tue, 14 Jul 2026 00:23:18 +0000
+Subject: [PATCH 12/45] =?utf-8?q?=E6=A0=A1=E9=AA=8C=E4=BB=BB=E5=8A=A1?=
+ =?utf-8?q?=E5=86=85=E5=85=A8=E9=83=A8=E6=B4=BB=E5=8A=A8=E7=9A=84=E6=98=BE?=
+ =?utf-8?q?=E7=A4=BA=E6=9D=83=E9=99=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Loop over all activities in the task and verify their
+display permissions using the caller's identity before moving the task.
+If any activity fails the check, a SecurityException is thrown.
+
+Bug: 527035781
+Bug: 527036864
+Bug: 527039128
+Test: ActivityTaskManagerServiceTests
+Flag: EXEMPT CVE_FIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:12d5de2a0e06beb34abce054ab0e8897135da323
+Merged-In: Ifcbb9b08399273995a6da358e438e1335acc5f32
+Change-Id: Ifcbb9b08399273995a6da358e438e1335acc5f32
+
+(cherry picked from commit 6cbe35c1cce520f5dd8f2ac070cf8e49b10059bb)
+---
+ .../server/wm/ActivityTaskManagerService.java        | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/services/core/java/com/android/server/wm/ActivityTaskManagerService.java b/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
+index 6cc67150f..e3ea3454e 100644
+--- a/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
++++ b/services/core/java/com/android/server/wm/ActivityTaskManagerService.java
+@@ -2491,9 +2491,15 @@ public class ActivityTaskManagerService extends IActivityTaskManager.Stub {
+                 SafeActivityOptions.abort(options);
+                 return;
+             }
+-            ActivityOptions realOptions = options != null
+-                    ? options.getOptions(mTaskSupervisor)
+-                    : null;
++            ActivityOptions realOptions = null;
++            if (options != null) {
++                // Check permissions for all activities in the task to ensure the options is
++                // legitimate.
++                task.forAllActivities((r) -> {
++                    options.getOptions(r);
++                });
++                realOptions = options.getOptions(mTaskSupervisor);
++            }
+             mTaskSupervisor.findTaskToMoveToFront(task, flags, realOptions, "moveTaskToFront",
+                     false /* forceNonResizable */);
+         } finally {
+-- 
+2.56.0
+

@@ -1,0 +1,150 @@
+From 2e2a0407841c00a7803abe75e487eda78e0b36c2 Mon Sep 17 00:00:00 2001
+From: Andrei Gubceac <agubceac@google.com>
+Date: Wed, 17 Jun 2026 09:58:00 +0000
+Subject: [PATCH 38/45] =?utf-8?q?=E6=9B=B4=E6=96=B0=20RemoteViews=20?=
+ =?utf-8?q?=E5=89=8D=E6=97=A0=E6=9D=A1=E4=BB=B6=E7=A7=BB=E9=99=A4=E9=80=89?=
+ =?utf-8?q?=E4=B8=AD=E7=9B=91=E5=90=AC=E5=99=A8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+In RemoteViews, SetCompoundButtonCheckedAction and
+SetRadioGroupCheckedAction temporarily clear the checked change
+listener on the view to prevent updates from triggering intents.
+
+Previously, this was only done if the listener tag was an instance of
+OnCheckedChangeListener. However, if the tag is clobbered to a non-listener
+type (e.g. by setting an integer tag), this check was bypassed, meaning
+updating the checked state would fire the listener.
+
+Always clear the listener on the view first. Then, restore it only if
+the tag is a valid OnCheckedChangeListener.
+
+Bug: 517378366
+Bug: 517379315
+Test: atest RemoteViewsTest
+Flag: EXEMPT CVE_FIX
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:78dd69fb8af983ee314f36ac9e54e6743b5c242d
+Merged-In: I835cbbefd37fdb91afef8a04848031699d5f26cc
+Change-Id: I835cbbefd37fdb91afef8a04848031699d5f26cc
+
+(cherry picked from commit 3d9b2db09f10ef638622e1695034d7caaccbfcb2)
+---
+ core/java/android/widget/RemoteViews.java     | 23 +++++-----
+ .../src/android/widget/RemoteViewsTest.java   | 45 +++++++++++++++++++
+ 2 files changed, 55 insertions(+), 13 deletions(-)
+
+diff --git a/core/java/android/widget/RemoteViews.java b/core/java/android/widget/RemoteViews.java
+index 1318f4c85..87dda29be 100644
+--- a/core/java/android/widget/RemoteViews.java
++++ b/core/java/android/widget/RemoteViews.java
+@@ -77,6 +77,7 @@ import android.graphics.Bitmap;
+ import android.graphics.BitmapFactory;
+ import android.graphics.BlendMode;
+ import android.graphics.Color;
++import android.graphics.ImageDecoder;
+ import android.graphics.Outline;
+ import android.graphics.PorterDuff;
+ import android.graphics.Rect;
+@@ -5832,13 +5833,11 @@ public class RemoteViews implements Parcelable, Filter {
+             Object tag = button.getTag(R.id.remote_checked_change_listener_tag);
+             // Temporarily unset the checked change listener so calling setChecked doesn't launch
+             // the intent.
+-            if (tag instanceof OnCheckedChangeListener) {
+-                button.setOnCheckedChangeListener(null);
+-                button.setChecked(mChecked);
+-                button.setOnCheckedChangeListener((OnCheckedChangeListener) tag);
+-            } else {
+-                button.setChecked(mChecked);
+-            }
++            OnCheckedChangeListener saved = (tag instanceof OnCheckedChangeListener)
++                    ? (OnCheckedChangeListener) tag : null;
++            button.setOnCheckedChangeListener(null);
++            button.setChecked(mChecked);
++            button.setOnCheckedChangeListener(saved);
+         }
+ 
+         @Override
+@@ -5934,9 +5933,6 @@ public class RemoteViews implements Parcelable, Filter {
+                 View child = group.getChildAt(i);
+                 if (!(child instanceof CompoundButton)) continue;
+ 
+-                Object tag = child.getTag(R.id.remote_checked_change_listener_tag);
+-                if (!(tag instanceof OnCheckedChangeListener)) continue;
+-
+                 // Clear the checked change listener, we'll restore it after the check.
+                 ((CompoundButton) child).setOnCheckedChangeListener(null);
+             }
+@@ -5949,9 +5945,10 @@ public class RemoteViews implements Parcelable, Filter {
+                 if (!(child instanceof CompoundButton)) continue;
+ 
+                 Object tag = child.getTag(R.id.remote_checked_change_listener_tag);
+-                if (!(tag instanceof OnCheckedChangeListener)) continue;
+-
+-                ((CompoundButton) child).setOnCheckedChangeListener((OnCheckedChangeListener) tag);
++                if (tag instanceof OnCheckedChangeListener) {
++                    ((CompoundButton) child).setOnCheckedChangeListener(
++                            (OnCheckedChangeListener) tag);
++                }
+             }
+         }
+ 
+diff --git a/core/tests/coretests/src/android/widget/RemoteViewsTest.java b/core/tests/coretests/src/android/widget/RemoteViewsTest.java
+index 4a1292151..ced86212b 100644
+--- a/core/tests/coretests/src/android/widget/RemoteViewsTest.java
++++ b/core/tests/coretests/src/android/widget/RemoteViewsTest.java
+@@ -739,6 +739,51 @@ public class RemoteViewsTest {
+                 index, inflated.getTag(com.android.internal.R.id.notification_action_index_tag));
+     }
+ 
++    private RemoteViews createRemoteViewsWithClobberedCheckedListener() {
++        RemoteViews views = new RemoteViews(mPackage, R.layout.radiogroup_checkedchild);
++        PendingIntent pi = PendingIntent.getBroadcast(mContext, 0, new Intent("dummy_action"),
++                PendingIntent.FLAG_ONE_SHOT | PendingIntent.FLAG_MUTABLE);
++        views.setOnCheckedChangeResponse(R.id.value_two,
++                RemoteViews.RemoteResponse.fromPendingIntent(pi));
++
++        int tagKey = com.android.internal.R.id.remote_checked_change_listener_tag;
++        views.setIntTag(R.id.value_two, tagKey, 0);
++        return views;
++    }
++
++    @Test
++    public void setCompoundButtonChecked_doesNotFireListenerWhenClobbered() throws Exception {
++        RemoteViews views = createRemoteViewsWithClobberedCheckedListener();
++        views.setCompoundButtonChecked(R.id.value_two, true);
++
++        boolean[] interactionFired = new boolean[1];
++        RemoteViews.InteractionHandler handler = (view, pendingIntent, response) -> {
++            interactionFired[0] = true;
++            return true;
++        };
++
++        views.apply(mContext, mContainer, handler);
++
++        assertFalse("Interaction should not have been fired!", interactionFired[0]);
++    }
++
++    @Test
++    public void setRadioGroupChecked_doesNotFireListenerWhenClobbered() throws Exception {
++        RemoteViews views = createRemoteViewsWithClobberedCheckedListener();
++        views.setRadioGroupChecked(R.id.group, R.id.value_two);
++
++        boolean[] interactionFired = new boolean[1];
++        RemoteViews.InteractionHandler handler = (view, pendingIntent, response) -> {
++            interactionFired[0] = true;
++            return true;
++        };
++
++        views.apply(mContext, mContainer, handler);
++
++        assertFalse("Interaction should not have been fired on RadioGroup check!",
++                interactionFired[0]);
++    }
++
+     @Test
+     public void nestedViews_themesPropagateCorrectly() {
+         Context themedContext =
+-- 
+2.56.0
+

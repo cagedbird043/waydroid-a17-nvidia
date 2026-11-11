@@ -1,0 +1,88 @@
+From 1bd72cc810eba4048f82100d118a14806a9729ba Mon Sep 17 00:00:00 2001
+From: Hao Liu <haoliuu@google.com>
+Date: Wed, 19 Aug 2026 17:16:18 +0000
+Subject: [PATCH] =?utf-8?q?=E6=A0=A1=E9=AA=8C=E5=88=86=E6=9E=90=E7=BB=93?=
+ =?utf-8?q?=E6=9E=9C=E6=96=87=E4=BB=B6=E5=90=8D=E9=98=B2=E6=AD=A2=E8=B7=AF?=
+ =?utf-8?q?=E5=BE=84=E7=A9=BF=E8=B6=8A?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+ProfilingService.sendAnomalyProfile() accepted an unsanitized
+resultFileName parameter from callers, which was concatenated directly
+with sTempTracePath (/data/misc/perfetto-traces/profiling/) in file
+operations (e.g. read via receiveFileDescriptor and delete via
+deleteProfilingFiles).
+
+This allowed path traversal payloads (such as
+"../../../../data/system/packages.xml") to read or delete arbitrary
+files with system_server privileges.
+
+This change adds enforceValidResultFileName() in ProfilingService to
+reject null/empty strings, path separators (/ and \), relative path
+sequences (..), and paths resolving outside the base profiling
+directory.
+
+Bug: 546680461
+Bug: 546679793
+Test: manual
+Flag: EXEMPT bugfix
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:e5e649dd60542f17bc9d3988fb8afd24911a3c8f
+Merged-In: I30adfd935a60ac2b878e60cda2b12b1f6423d25b
+Change-Id: I30adfd935a60ac2b878e60cda2b12b1f6423d25b
+
+(cherry picked from commit 9d7570458fce594f1431f20d5b857b4966ea7a0b)
+Change-Id: Iefb043a2280ef668e338acf06b09edf235fb99db
+---
+ .../os/profiling/ProfilingService.java        | 28 +++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/service/java/com/android/os/profiling/ProfilingService.java b/service/java/com/android/os/profiling/ProfilingService.java
+index 503e678..4114338 100644
+--- a/service/java/com/android/os/profiling/ProfilingService.java
++++ b/service/java/com/android/os/profiling/ProfilingService.java
+@@ -2925,6 +2925,8 @@ public class ProfilingService extends IProfilingService.Stub {
+ 
+         enforceAnomalyTriggerType(triggerType);
+ 
++        enforceValidResultFileName(resultFileName);
++
+         if (DEBUG) Log.d(TAG, "sendAnomalyProfile passed validation.");
+ 
+         // Move off the calling thread.
+@@ -3075,6 +3077,32 @@ public class ProfilingService extends IProfilingService.Stub {
+         }
+     }
+ 
++    private void enforceValidResultFileName(@Nullable String resultFileName) {
++        if (TextUtils.isEmpty(resultFileName)) {
++            throw new IllegalArgumentException("resultFileName cannot be null or empty");
++        }
++        if (resultFileName.contains("/")
++                || resultFileName.contains("\\")
++                || resultFileName.contains("..")
++                || !resultFileName.equals(new File(resultFileName).getName())) {
++            throw new IllegalArgumentException(
++                    "Invalid resultFileName (contains path traversal characters): "
++                            + resultFileName);
++        }
++        try {
++            Path baseDir = Path.of(sTempTracePath).toAbsolutePath().normalize();
++            Path resolvedPath = baseDir.resolve(resultFileName).toAbsolutePath().normalize();
++            if (!resolvedPath.startsWith(baseDir) || !baseDir.equals(resolvedPath.getParent())) {
++                throw new IllegalArgumentException(
++                        "resultFileName traverses outside temporary directory: " + resultFileName);
++            }
++        } catch (IllegalArgumentException e) {
++            throw e;
++        } catch (Exception e) {
++            throw new IllegalArgumentException("Invalid resultFileName: " + resultFileName, e);
++        }
++    }
++
+     /** Send the session result back to anomaly detector. */
+     private void sendSessionToAnomalyDetector(TracingSession session) {
+         if (!session.isReturnToAnomalyDetectorOnly()) {
+-- 
+2.56.0
+

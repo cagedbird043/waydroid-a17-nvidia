@@ -1,0 +1,100 @@
+From 7b3c12173f0fa8fb58ae46bc4782b6df44f7c63f Mon Sep 17 00:00:00 2001
+From: Weston Carvalho <westoncarvalho@google.com>
+Date: Tue, 23 Jun 2026 13:33:13 -0700
+Subject: [PATCH] =?utf-8?q?=E6=8F=90=E4=BE=9B=E5=AE=89=E5=85=A8=E7=A7=BB?=
+ =?utf-8?q?=E9=99=A4=20TIPC=20=E6=9C=8D=E5=8A=A1=E7=9A=84=E6=8E=A5?=
+ =?utf-8?q?=E5=8F=A3?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Add tipc_remove_service to stop and clean up a running service
+
+Bug: 514731794
+Test: presubmits
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:8bf0b920be8031221f9a4b01fac022a2d5dcde0b
+Merged-In: I0a8f677d54580131f02570c82f3c539c4c3a638d
+Change-Id: I0a8f677d54580131f02570c82f3c539c4c3a638d
+
+(cherry picked from commit 058cbb7314268dd01c13263affc593ed87426b04)
+Change-Id: I8e46dbe6b03aae0919b6298c505c3e6f17fec81b
+---
+ lib/tipc/include/lib/tipc/tipc_srv.h | 11 ++++++++-
+ lib/tipc/tipc_srv.c                  | 37 ++++++++++++++++++++++++++++
+ 2 files changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/lib/tipc/include/lib/tipc/tipc_srv.h b/lib/tipc/include/lib/tipc/tipc_srv.h
+index eb43739..893d9d7 100644
+--- a/lib/tipc/include/lib/tipc/tipc_srv.h
++++ b/lib/tipc/include/lib/tipc/tipc_srv.h
+@@ -225,7 +225,7 @@ int tipc_add_service_ports(struct tipc_hset* hset,
+  *
+  * Note: the caller retain an ownership of structures pointed by @ports
+  * parameters and should not modify these structures in any way after the
+- * service has beed instantiated. Also, the caller is responsible for keeping
++ * service has been instantiated. Also, the caller is responsible for keeping
+  * them alive while service is running. The same is true for handle set. In
+  * addition, the caller should not invoke any direct operations on handle set
+  * outside of API's provided by this framework.
+@@ -262,4 +262,13 @@ int tipc_add_connection(struct tipc_port_ctx* port,
+  */
+ struct tipc_hset* tipc_get_hset(struct tipc_port_ctx* port);
+ 
++/**
++ * tipc_remove_service() - Shuts down a service.
++ * @port: A handle to _one of_ the ports of the service to remove. (All other
++ * ports for this service will also be closed.)
++ *
++ * Return: 0 on success, negative error code otherwise
++ */
++int tipc_remove_service(struct tipc_port_ctx* port);
++
+ __END_CDECLS
+diff --git a/lib/tipc/tipc_srv.c b/lib/tipc/tipc_srv.c
+index 4b85946..2ae697a 100644
+--- a/lib/tipc/tipc_srv.c
++++ b/lib/tipc/tipc_srv.c
+@@ -500,3 +500,40 @@ err_no_acl:
+ struct tipc_hset* tipc_get_hset(struct tipc_port_ctx* port) {
+     return port->srv->hset;
+ }
++
++int tipc_remove_service(struct tipc_port_ctx* port) {
++    uint32_t i;
++    int rc;
++
++    if (!port) {
++        return ERR_INVALID_ARGS;
++    }
++
++    struct tipc_srv* srv = port->srv;
++    if (!srv) {
++        return ERR_INVALID_ARGS;
++    }
++
++    /* Remove all ports of the service from the handle set and close them */
++    for (i = 0; i < srv->port_cnt; i++) {
++        struct tipc_port_ctx* p = &srv->ports[i];
++        if (p->handle != INVALID_IPC_HANDLE) {
++            rc = tipc_hset_remove_entry(srv->hset, p->handle);
++            if (rc != NO_ERROR) {
++                TLOGE("failed (%d) to remove port from hset\n", rc);
++            }
++            close(p->handle);
++            p->handle = INVALID_IPC_HANDLE;
++        }
++    }
++
++    /* Close all active channels of the service */
++    struct tipc_chan_ctx* chan;
++    while ((chan = list_peek_head_type(&srv->chan_list, struct tipc_chan_ctx,
++                                       chan_list_node)) != NULL) {
++        tipc_chan_close(chan);
++    }
++
++    free(srv);
++    return 0;
++}
+-- 
+2.56.0
+

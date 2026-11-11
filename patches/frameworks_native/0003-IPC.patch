@@ -1,0 +1,484 @@
+From 59a9cce28a12bb6dca708229cc56909137975d86 Mon Sep 17 00:00:00 2001
+From: Alec Mouri <alecmouri@google.com>
+Date: Thu, 28 May 2026 16:04:43 +0000
+Subject: [PATCH 3/4] =?utf-8?q?=E5=9C=A8=20IPC=20=E8=BE=B9=E7=95=8C?=
+ =?utf-8?q?=E6=A0=A1=E9=AA=8C=E6=98=BE=E7=A4=BA=E6=9F=A5=E6=89=BE=E8=A1=A8?=
+ =?utf-8?q?=E5=B9=B6=E4=BF=9D=E6=8A=A4=E6=B8=B2=E6=9F=93=E8=AF=BB=E5=8F=96?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Bug: 505573349
+
+(cherry picked from commit a3a89ae3bf9c19a0e4db8bd2a98ceabb0a759d99)
+Change-Id: Ieec24b0e11d53a8b61c5ceabe28417677ce109cf
+---
+ libs/gui/DisplayLuts.cpp                      | 116 ++++++++++++--
+ libs/gui/include/gui/DisplayLuts.h            |   4 +
+ libs/gui/tests/Android.bp                     |   1 +
+ libs/gui/tests/DisplayLuts_test.cpp           | 148 ++++++++++++++++++
+ libs/renderengine/skia/filters/LutShader.cpp  |  64 ++++----
+ .../CompositionEngine/src/OutputLayer.cpp     |   2 +-
+ 6 files changed, 289 insertions(+), 46 deletions(-)
+ create mode 100644 libs/gui/tests/DisplayLuts_test.cpp
+
+diff --git a/libs/gui/DisplayLuts.cpp b/libs/gui/DisplayLuts.cpp
+index 2b1099f..4bd59ca 100644
+--- a/libs/gui/DisplayLuts.cpp
++++ b/libs/gui/DisplayLuts.cpp
+@@ -15,9 +15,11 @@
+  */
+ 
+ #include <android-base/stringprintf.h>
++#include <cutils/ashmem.h>
+ #include <gui/DisplayLuts.h>
+ #include <private/gui/ParcelUtils.h>
+ #include <sys/mman.h>
++#include <sys/stat.h>
+ #include <algorithm>
+ 
+ namespace android::gui {
+@@ -36,21 +38,14 @@ void DisplayLuts::dump(std::string& out) const {
+     }
+     out.append("]");
+ 
+-    if (fd.ok() && !offsets.empty()) {
+-        int32_t fullLength = offsets.back();
+-        const auto& lastProp = lutProperties.back();
+-        if (lastProp.dimension == 1) {
+-            fullLength += lastProp.size;
+-        } else {
+-            fullLength += (lastProp.size * lastProp.size * lastProp.size * 3);
+-        }
+-
+-        size_t bufferSize = static_cast<size_t>(fullLength) * sizeof(float);
++    if (isValid()) {
++        size_t maxEndOffset = getMaxEndOffset();
++        size_t bufferSize = static_cast<size_t>(ashmem_get_size_region(fd.get()));
+         float* ptr = (float*)mmap(NULL, bufferSize, PROT_READ, MAP_SHARED, fd.get(), 0);
+         if (ptr != MAP_FAILED) {
+             out.append(", values=[");
+-            for (int32_t i = 0; i < fullLength; ++i) {
+-                StringAppendF(&out, "%f%s", ptr[i], (i == fullLength - 1 ? "" : ", "));
++            for (size_t i = 0; i < maxEndOffset; ++i) {
++                StringAppendF(&out, "%f%s", ptr[i], (i == maxEndOffset - 1 ? "" : ", "));
+             }
+             out.append("]");
+             munmap(ptr, bufferSize);
+@@ -62,6 +57,60 @@ void DisplayLuts::dump(std::string& out) const {
+     out.append(" }");
+ }
+ 
++size_t DisplayLuts::Entry::getElementsNeededPerChannel() const {
++    if (size <= 0) return 0;
++    if (dimension == 1) {
++        return static_cast<size_t>(size);
++    } else if (dimension == 3) {
++        size_t sizeCubed;
++        if (__builtin_mul_overflow(static_cast<size_t>(size), static_cast<size_t>(size),
++                                   &sizeCubed) ||
++            __builtin_mul_overflow(sizeCubed, static_cast<size_t>(size), &sizeCubed)) {
++            return 0;
++        }
++        return sizeCubed;
++    }
++    return 0;
++}
++
++size_t DisplayLuts::getMaxEndOffset() const {
++    size_t maxEndOffset = 0;
++    for (size_t i = 0; i < offsets.size(); i++) {
++        size_t elementsNeededPerChannel = lutProperties[i].getElementsNeededPerChannel();
++        if (elementsNeededPerChannel == 0) {
++            ALOGW("%s: Invalid Entry at index %zu!", __func__, i);
++            return 0;
++        }
++
++        size_t totalElementsNeeded;
++        if (lutProperties[i].dimension == 1) {
++            totalElementsNeeded = elementsNeededPerChannel;
++        } else {
++            if (__builtin_mul_overflow(elementsNeededPerChannel, 3, &totalElementsNeeded)) {
++                ALOGW("%s: Integer overflow in totalElementsNeeded calculation at index %zu!",
++                      __func__, i);
++                return 0;
++            }
++        }
++
++        if (offsets[i] < 0) {
++            ALOGW("%s: Negative offset %d at index %zu!", __func__, offsets[i], i);
++            return 0;
++        }
++
++        size_t endOffset;
++        if (__builtin_add_overflow(static_cast<size_t>(offsets[i]), totalElementsNeeded,
++                                   &endOffset)) {
++            ALOGW("%s: Integer overflow in endOffset calculation at index %zu!", __func__, i);
++            return 0;
++        }
++        if (endOffset > maxEndOffset) {
++            maxEndOffset = endOffset;
++        }
++    }
++    return maxEndOffset;
++}
++
+ status_t DisplayLuts::Entry::readFromParcel(const android::Parcel* parcel) {
+     if (parcel == nullptr) {
+         ALOGE("%s: Null parcel", __func__);
+@@ -88,6 +137,42 @@ status_t DisplayLuts::Entry::writeToParcel(android::Parcel* parcel) const {
+     return OK;
+ }
+ 
++bool DisplayLuts::isValid() const {
++    if (!fd.ok()) {
++        ALOGW("%s: fd is not OK!", __func__);
++        return false;
++    }
++    if (offsets.empty() || lutProperties.empty()) {
++        ALOGW("%s: offsets or lutProperties is empty!", __func__);
++        return false;
++    }
++    if (offsets.size() != lutProperties.size()) {
++        ALOGW("%s: offsets.size() %zu != lutProperties.size() %zu!", __func__, offsets.size(),
++              lutProperties.size());
++        return false;
++    }
++
++    int ashmemSize = ashmem_get_size_region(fd.get());
++    if (ashmemSize <= 0 || static_cast<size_t>(ashmemSize) % sizeof(float) != 0) {
++        ALOGW("%s: Invalid ashmemSize %d!", __func__, ashmemSize);
++        return false;
++    }
++    size_t ashmemFloatCount = static_cast<size_t>(ashmemSize) / sizeof(float);
++
++    size_t maxEndOffset = getMaxEndOffset();
++    if (maxEndOffset == 0) {
++        return false;
++    }
++
++    if (maxEndOffset > ashmemFloatCount) {
++        ALOGW("%s: LUT maxEndOffset %zu exceeds ashmemFloatCount %zu!", __func__, maxEndOffset,
++              ashmemFloatCount);
++        return false;
++    }
++
++    return true;
++}
++
+ status_t DisplayLuts::readFromParcel(const android::Parcel* parcel) {
+     if (parcel == nullptr) {
+         ALOGE("%s: Null parcel", __func__);
+@@ -103,6 +188,13 @@ status_t DisplayLuts::readFromParcel(const android::Parcel* parcel) {
+         lutProperties.push_back({});
+         SAFE_PARCEL(lutProperties.back().readFromParcel, parcel);
+     }
++    if (!isValid()) {
++        ALOGW("DisplayLuts failed validation after readFromParcel!");
++        fd.reset();
++        offsets.clear();
++        lutProperties.clear();
++        return BAD_VALUE;
++    }
+     return OK;
+ }
+ 
+diff --git a/libs/gui/include/gui/DisplayLuts.h b/libs/gui/include/gui/DisplayLuts.h
+index 728e4b6..9212bee 100644
+--- a/libs/gui/include/gui/DisplayLuts.h
++++ b/libs/gui/include/gui/DisplayLuts.h
+@@ -21,6 +21,7 @@
+ #include <cutils/ashmem.h>
+ #include <sys/mman.h>
+ #include <algorithm>
++#include <optional>
+ #include <ostream>
+ #include <vector>
+ 
+@@ -38,6 +39,7 @@ public:
+ 
+         status_t writeToParcel(android::Parcel* parcel) const override;
+         status_t readFromParcel(const android::Parcel* parcel) override;
++        size_t getElementsNeededPerChannel() const;
+     };
+ 
+     DisplayLuts() {}
+@@ -56,7 +58,9 @@ public:
+     status_t writeToParcel(android::Parcel* parcel) const override;
+     status_t readFromParcel(const android::Parcel* parcel) override;
+ 
++    bool isValid() const;
+     void dump(std::string& out) const;
++    size_t getMaxEndOffset() const;
+ 
+     const base::unique_fd& getLutFileDescriptor() const { return fd; }
+ 
+diff --git a/libs/gui/tests/Android.bp b/libs/gui/tests/Android.bp
+index 91f54cc..881e42d 100644
+--- a/libs/gui/tests/Android.bp
++++ b/libs/gui/tests/Android.bp
+@@ -69,6 +69,7 @@ cc_test {
+         "CpuConsumer_test.cpp",
+         "DisplayedContentSampling_test.cpp",
+         "DisplayInfo_test.cpp",
++        "DisplayLuts_test.cpp",
+         "EndToEndNativeInputTest.cpp",
+         "FillBuffer.cpp",
+         "FrameRateUtilsTest.cpp",
+diff --git a/libs/gui/tests/DisplayLuts_test.cpp b/libs/gui/tests/DisplayLuts_test.cpp
+new file mode 100644
+index 0000000..88905d0
+--- /dev/null
++++ b/libs/gui/tests/DisplayLuts_test.cpp
+@@ -0,0 +1,148 @@
++/*
++ * Copyright (C) 2026 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <android-base/unique_fd.h>
++#include <cutils/ashmem.h>
++#include <gtest/gtest.h>
++#include <gui/DisplayLuts.h>
++#include <sys/mman.h>
++
++namespace android {
++namespace gui {
++
++class DisplayLutsTest : public ::testing::Test {
++protected:
++    base::unique_fd createAshmem(size_t size) {
++        int fd = ashmem_create_region("DisplayLutsTestAshmem", size);
++        EXPECT_GE(fd, 0);
++        return base::unique_fd(fd);
++    }
++};
++
++TEST_F(DisplayLutsTest, EntryElementsNeeded) {
++    // 1D LUT
++    DisplayLuts::Entry entry1D(1, 16, 0);
++    EXPECT_EQ(entry1D.getElementsNeededPerChannel(), 16u);
++
++    // 3D LUT
++    DisplayLuts::Entry entry3D(3, 4, 0);
++    EXPECT_EQ(entry3D.getElementsNeededPerChannel(), 64u); // 4^3
++
++    // Invalid dimension
++    DisplayLuts::Entry entryInvalidDim(2, 16, 0);
++    EXPECT_EQ(entryInvalidDim.getElementsNeededPerChannel(), 0u);
++
++    // Invalid size
++    DisplayLuts::Entry entryInvalidSize(1, 0, 0);
++    EXPECT_EQ(entryInvalidSize.getElementsNeededPerChannel(), 0u);
++    DisplayLuts::Entry entryNegativeSize(1, -5, 0);
++    EXPECT_EQ(entryNegativeSize.getElementsNeededPerChannel(), 0u);
++
++    // Overflow size 3D
++    DisplayLuts::Entry entryOverflowSize(3, 3000000, 0);
++    EXPECT_EQ(entryOverflowSize.getElementsNeededPerChannel(), 0u);
++}
++
++TEST_F(DisplayLutsTest, ValidDisplayLuts) {
++    size_t ashmemSize = 100 * sizeof(float);
++    base::unique_fd fd = createAshmem(ashmemSize);
++
++    std::vector<int32_t> offsets = {0, 40};
++    std::vector<int32_t> dimensions = {1, 3};
++    std::vector<int32_t> sizes = {16, 2}; // 16 elements (1D), 2^3*3 = 24 elements (3D)
++    std::vector<int32_t> samplingKeys = {0, 0};
++
++    DisplayLuts luts(std::move(fd), offsets, dimensions, sizes, samplingKeys);
++    EXPECT_TRUE(luts.isValid());
++    // Max end offset:
++    // LUT 0: offset 0, size 16 (1D) -> end 16
++    // LUT 1: offset 40, size 2 (3D) -> 2^3 * 3 = 24 elements -> end 40 + 24 = 64
++    // Max end offset should be 64.
++    EXPECT_EQ(luts.getMaxEndOffset(), 64u);
++}
++
++TEST_F(DisplayLutsTest, InvalidAshmemSize) {
++    // Size not multiple of float
++    base::unique_fd fd = createAshmem(100 * sizeof(float) + 2);
++
++    std::vector<int32_t> offsets = {0};
++    std::vector<int32_t> dimensions = {1};
++    std::vector<int32_t> sizes = {16};
++    std::vector<int32_t> samplingKeys = {0};
++
++    DisplayLuts luts(std::move(fd), offsets, dimensions, sizes, samplingKeys);
++    EXPECT_FALSE(luts.isValid());
++}
++
++TEST_F(DisplayLutsTest, NegativeOffset) {
++    base::unique_fd fd = createAshmem(100 * sizeof(float));
++
++    std::vector<int32_t> offsets = {-10};
++    std::vector<int32_t> dimensions = {1};
++    std::vector<int32_t> sizes = {16};
++    std::vector<int32_t> samplingKeys = {0};
++
++    DisplayLuts luts(std::move(fd), offsets, dimensions, sizes, samplingKeys);
++    EXPECT_FALSE(luts.isValid());
++    EXPECT_EQ(luts.getMaxEndOffset(), 0u);
++}
++
++TEST_F(DisplayLutsTest, OffsetExceedsBounds) {
++    base::unique_fd fd = createAshmem(30 * sizeof(float)); // Ashmem fits 30 floats
++
++    std::vector<int32_t> offsets = {20}; // End offset will be 20 + 16 = 36 > 30
++    std::vector<int32_t> dimensions = {1};
++    std::vector<int32_t> sizes = {16};
++    std::vector<int32_t> samplingKeys = {0};
++
++    DisplayLuts luts(std::move(fd), offsets, dimensions, sizes, samplingKeys);
++    EXPECT_FALSE(luts.isValid());
++    EXPECT_EQ(luts.getMaxEndOffset(), 36u); // Still calculates max end offset
++}
++
++TEST_F(DisplayLutsTest, Parceling) {
++    size_t ashmemSize = 100 * sizeof(float);
++    base::unique_fd fd = createAshmem(ashmemSize);
++
++    std::vector<int32_t> offsets = {0, 40};
++    std::vector<int32_t> dimensions = {1, 3};
++    std::vector<int32_t> sizes = {16, 2};
++    std::vector<int32_t> samplingKeys = {1, 2};
++
++    DisplayLuts luts(std::move(fd), offsets, dimensions, sizes, samplingKeys);
++    ASSERT_TRUE(luts.isValid());
++
++    Parcel parcel;
++    ASSERT_EQ(luts.writeToParcel(&parcel), OK);
++
++    parcel.setDataPosition(0);
++
++    DisplayLuts deSerializedLuts;
++    ASSERT_EQ(deSerializedLuts.readFromParcel(&parcel), OK);
++
++    EXPECT_TRUE(deSerializedLuts.isValid());
++    EXPECT_EQ(deSerializedLuts.offsets, luts.offsets);
++    EXPECT_EQ(deSerializedLuts.lutProperties.size(), luts.lutProperties.size());
++    for (size_t i = 0; i < luts.lutProperties.size(); ++i) {
++        EXPECT_EQ(deSerializedLuts.lutProperties[i].dimension, luts.lutProperties[i].dimension);
++        EXPECT_EQ(deSerializedLuts.lutProperties[i].size, luts.lutProperties[i].size);
++        EXPECT_EQ(deSerializedLuts.lutProperties[i].samplingKey, luts.lutProperties[i].samplingKey);
++    }
++    EXPECT_EQ(deSerializedLuts.getMaxEndOffset(), luts.getMaxEndOffset());
++}
++
++} // namespace gui
++} // namespace android
+diff --git a/libs/renderengine/skia/filters/LutShader.cpp b/libs/renderengine/skia/filters/LutShader.cpp
+index ac12870..568de05 100644
+--- a/libs/renderengine/skia/filters/LutShader.cpp
++++ b/libs/renderengine/skia/filters/LutShader.cpp
+@@ -20,8 +20,10 @@
+ #include <common/trace.h>
+ #include <cutils/ashmem.h>
+ #include <include/core/SkColorSpace.h>
++#include <log/log.h>
+ #include <math/half.h>
+ #include <sys/mman.h>
++#include <sys/stat.h>
+ #include <ui/ColorSpace.h>
+ 
+ #include <renderengine/ColorSpaces.h>
+@@ -292,42 +294,38 @@ sk_sp<SkShader> LutShader::lutShader(sk_sp<SkShader>& input,
+         mBuilder = std::make_unique<SkRuntimeShaderBuilder>(mEffect);
+     }
+ 
++    if (!displayLuts || !displayLuts->isValid()) {
++        ALOGW("displayLuts is nullptr or invalid, skip LutShader!");
++        return input;
++    }
++
++    size_t maxEndOffset = displayLuts->getMaxEndOffset();
+     auto& fd = displayLuts->getLutFileDescriptor();
+-    if (fd.ok()) {
+-        auto& offsets = displayLuts->offsets;
+-        auto& lutProperties = displayLuts->lutProperties;
+-        std::vector<float> buffers;
+-        int fullLength = offsets[lutProperties.size() - 1];
+-        if (lutProperties[lutProperties.size() - 1].dimension == 1) {
+-            fullLength += lutProperties[lutProperties.size() - 1].size;
+-        } else {
+-            fullLength += (lutProperties[lutProperties.size() - 1].size *
+-                           lutProperties[lutProperties.size() - 1].size *
+-                           lutProperties[lutProperties.size() - 1].size * 3);
+-        }
+-        size_t bufferSize = fullLength * sizeof(float);
++    auto& offsets = displayLuts->offsets;
++    auto& lutProperties = displayLuts->lutProperties;
+ 
+-        // decode the shared memory of luts
+-        float* ptr =
+-                (float*)mmap(NULL, bufferSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd.get(), 0);
+-        if (ptr == MAP_FAILED) {
+-            LOG_ALWAYS_FATAL("mmap failed");
+-        }
+-        buffers = std::vector<float>(ptr, ptr + fullLength);
+-        munmap(ptr, bufferSize);
+-
+-        for (size_t i = 0; i < offsets.size(); i++) {
+-            int bufferSizePerLut = (i == offsets.size() - 1) ? buffers.size() - offsets[i]
+-                                                             : offsets[i + 1] - offsets[i];
+-            // divide by 3 for 3d Lut because of 3 (RGB) channels
+-            if (static_cast<LutProperties::Dimension>(lutProperties[i].dimension) ==
+-                LutProperties::Dimension::THREE_D) {
+-                bufferSizePerLut /= 3;
+-            }
+-            input = generateLutShader(input, buffers, offsets[i], bufferSizePerLut,
+-                                      lutProperties[i].dimension, lutProperties[i].size,
+-                                      lutProperties[i].samplingKey, srcDataspace);
++    size_t bufferSize = static_cast<size_t>(ashmem_get_size_region(fd.get()));
++
++    std::vector<float> buffers;
++    // decode the shared memory of luts
++    float* ptr = (float*)mmap(NULL, bufferSize, PROT_READ, MAP_SHARED, fd.get(), 0);
++    if (ptr == MAP_FAILED) {
++        ALOGW("mmap failed when decoding displayLuts");
++        return input;
++    }
++    buffers = std::vector<float>(ptr, ptr + maxEndOffset);
++    munmap(ptr, bufferSize);
++
++    for (size_t i = 0; i < offsets.size(); i++) {
++        size_t elementsNeededPerChannel = lutProperties[i].getElementsNeededPerChannel();
++        if (elementsNeededPerChannel == 0) {
++            ALOGW("Invalid elementsNeededPerChannel at index %zu", i);
++            return input;
+         }
++
++        input = generateLutShader(input, buffers, offsets[i], elementsNeededPerChannel,
++                                  lutProperties[i].dimension, lutProperties[i].size,
++                                  lutProperties[i].samplingKey, srcDataspace);
+     }
+     return input;
+ }
+diff --git a/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp b/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp
+index a923f10..f7edcf5 100644
+--- a/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp
++++ b/services/surfaceflinger/CompositionEngine/src/OutputLayer.cpp
+@@ -844,7 +844,7 @@ void OutputLayer::writeLutToHWC(HWC2::Layer* hwcLayer,
+             : getState().generatedLuts ? getState().generatedLuts
+                                        : nullptr;
+ 
+-    if (sourceLuts) {
++    if (sourceLuts && sourceLuts->isValid()) {
+         auto& lutFileDescriptor = sourceLuts->getLutFileDescriptor();
+         auto lutOffsets = sourceLuts->offsets;
+         auto& lutProperties = sourceLuts->lutProperties;
+-- 
+2.56.0
+

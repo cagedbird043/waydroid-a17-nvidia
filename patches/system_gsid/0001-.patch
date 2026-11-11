@@ -1,0 +1,321 @@
+From 9d8377f4c98cacfce6f62be77f9e214b012514f5 Mon Sep 17 00:00:00 2001
+From: Howard Chen <howardsoc@google.com>
+Date: Wed, 10 Jun 2026 11:37:55 +0800
+Subject: [PATCH] =?utf-8?q?=E6=A0=A1=E9=AA=8C=E5=8A=A8=E6=80=81=E7=B3=BB?=
+ =?utf-8?q?=E7=BB=9F=E6=A7=BD=E4=BD=8D=E5=90=8D=E7=A7=B0=E5=B9=B6=E6=8B=92?=
+ =?utf-8?q?=E7=BB=9D=E4=BF=9D=E7=95=99=E8=B7=AF=E5=BE=84?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+1. Add `IsValidSlotName` to validate DSU slot names. We restrict characters
+   to `[a-zA-Z0-9_-.]` and reject reserved names: "booted", "active",
+   "lp_names", "install_status", "one_shot_boot", "avb", "avb_enforce".
+   This prevents directory creation at reserved file paths (like "booted")
+   which can spoof GSI state.
+2. In `IsGsiRunning()`, check that `kGsiBootedIndicatorFile` is a regular
+   file (S_ISREG) to prevent directory pre-creation from spoofing the state.
+
+Bug: 514746269
+Test: libgsi_test, DsuGsiToolTest
+TAG=agy
+CONV=4780f233-094e-4c5b-9d84-70e39974112e
+(cherry picked from commit 6fd5bdef3bb3c2bf744ea1634f4573825c15035d)
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:375b2443285dcfcad7a41448a3b67153937ee62e
+Merged-In: I098bc3d514a91a8cac116719b1db9193d43a7558
+Change-Id: I098bc3d514a91a8cac116719b1db9193d43a7558
+
+(cherry picked from commit abcc9f711e157901382b180d8ed0a418a0545c17)
+Change-Id: Ia42244ef3c4b3572c332db0b9f2a13300e630c87
+---
+ gsi_service.cpp           | 13 ++++--
+ include/libgsi/libgsi.h   |  3 ++
+ libgsi.cpp                | 31 ++++++++++++-
+ tests/Android.bp          | 12 +++++
+ tests/DsuGsiToolTest.java | 29 ++++++++++++
+ tests/libgsi_test.cpp     | 97 +++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 181 insertions(+), 4 deletions(-)
+ create mode 100644 tests/libgsi_test.cpp
+
+diff --git a/gsi_service.cpp b/gsi_service.cpp
+index 224f520..c44a57a 100644
+--- a/gsi_service.cpp
++++ b/gsi_service.cpp
+@@ -146,13 +146,20 @@ binder::Status GsiService::openInstall(const std::string& install_dir, int* _aid
+         *_aidl_return = IGsiService::INSTALL_ERROR_GENERIC;
+         return binder::Status::ok();
+     }
+-    install_dir_ = install_dir;
+-    if (int status = ValidateInstallParams(install_dir_)) {
++    // ValidateInstallParams modifies its argument (trailing /), so we need a non-const copy.
++    std::string working_install_dir = install_dir;
++    if (int status = ValidateInstallParams(working_install_dir)) {
+         *_aidl_return = status;
+         return binder::Status::ok();
+     }
+     std::string message;
+-    auto dsu_slot = GetDsuSlot(install_dir_);
++    auto dsu_slot = GetDsuSlot(working_install_dir);
++    if (!IsValidSlotName(dsu_slot)) {
++        LOG(ERROR) << "Invalid DSU slot name: " << dsu_slot;
++        *_aidl_return = IGsiService::INSTALL_ERROR_GENERIC;
++        return binder::Status::ok();
++    }
++    install_dir_ = std::move(working_install_dir);
+     if (!RemoveFileIfExists(GetCompleteIndication(dsu_slot), &message)) {
+         LOG(ERROR) << message;
+     }
+diff --git a/include/libgsi/libgsi.h b/include/libgsi/libgsi.h
+index b10749b..4d0de27 100644
+--- a/include/libgsi/libgsi.h
++++ b/include/libgsi/libgsi.h
+@@ -99,6 +99,9 @@ static inline bool GetActiveDsu(std::string* active_dsu) {
+     return android::base::ReadFileToString(kDsuActiveFile, active_dsu);
+ }
+ 
++// Returns true if the slot name is valid.
++bool IsValidSlotName(const std::string& name);
++
+ // Returns true if the currently running system image is a GSI (both dynamic and flashed).
+ bool IsGsiImage();
+ 
+diff --git a/libgsi.cpp b/libgsi.cpp
+index 097fcb6..b811cbb 100644
+--- a/libgsi.cpp
++++ b/libgsi.cpp
+@@ -17,9 +17,13 @@
+ #include "libgsi/libgsi.h"
+ 
+ #include <string.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
++#include <cctype>
++#include <set>
+ #include <string>
++#include <string_view>
+ 
+ #include <android-base/file.h>
+ #include <android-base/parseint.h>
+@@ -37,12 +41,37 @@ using android::base::ReadFileToString;
+ using android::base::Split;
+ using android::base::unique_fd;
+ 
++bool IsValidSlotName(const std::string& name) {
++    if (name.empty() || name == "." || name == "..") {
++        return false;
++    }
++    for (char c : name) {
++        if (!isalnum(c) && c != '_' && c != '-' && c != '.') {
++            return false;
++        }
++    }
++    static const std::set<std::string_view, std::less<>> kReservedSlotNames = {
++        "booted",
++        "active",
++        "lp_names",
++        "install_status",
++        "one_shot_boot",
++        "avb",
++        "avb_enforce",
++    };
++    return !kReservedSlotNames.contains(name);
++}
++
+ bool IsGsiImage() {
+     return !access(kGsiSpecificInitRcFile, F_OK);
+ }
+ 
+ bool IsGsiRunning() {
+-    return !access(kGsiBootedIndicatorFile, F_OK);
++    struct stat buf;
++    if (lstat(kGsiBootedIndicatorFile, &buf) != 0) {
++        return false;
++    }
++    return S_ISREG(buf.st_mode);
+ }
+ 
+ bool IsGsiInstalled() {
+diff --git a/tests/Android.bp b/tests/Android.bp
+index 5cc8163..69891ba 100644
+--- a/tests/Android.bp
++++ b/tests/Android.bp
+@@ -115,3 +115,15 @@ java_test_host {
+         "general-tests",
+     ],
+ }
++
++cc_test {
++    name: "libgsi_test",
++    srcs: [
++        "libgsi_test.cpp",
++    ],
++    shared_libs: [
++        "libbase",
++        "libgsi",
++    ],
++    test_suites: ["device-tests"],
++}
+diff --git a/tests/DsuGsiToolTest.java b/tests/DsuGsiToolTest.java
+index c6e621a..cd706e9 100644
+--- a/tests/DsuGsiToolTest.java
++++ b/tests/DsuGsiToolTest.java
+@@ -22,6 +22,7 @@ import static org.junit.Assert.assertTrue;
+ import com.android.tradefed.device.DeviceNotAvailableException;
+ import com.android.tradefed.log.LogUtil.CLog;
+ import com.android.tradefed.testtype.DeviceJUnit4ClassRunner;
++import com.android.tradefed.util.CommandResult;
+ import com.android.tradefed.util.CommandStatus;
+ 
+ import org.junit.After;
+@@ -78,6 +79,12 @@ public class DsuGsiToolTest extends DsuTestBase {
+ 
+         // These commands should run without any error
+         assertShellCommand("gsi_tool enable");
++
++        // Try to enable a non-installed slot
++        var result = getDevice().executeShellV2Command("gsi_tool enable -d bar");
++        assertFalse("Expected enable -d bar to fail", result.getStatus() == CommandStatus.SUCCESS);
++        assertTrue(result.getStderr().contains("Error re-enabling GSI"));
++
+         assertShellCommand("gsi_tool disable");
+         assertShellCommand("gsi_tool wipe");
+     }
+@@ -99,9 +106,31 @@ public class DsuGsiToolTest extends DsuTestBase {
+         // These commands should fail on a locked DSU
+         var result = getDevice().executeShellV2Command("gsi_tool enable");
+         assertFalse(result.getStatus() == CommandStatus.SUCCESS);
++        result = getDevice().executeShellV2Command("gsi_tool enable -d " + slotName);
++        assertFalse(result.getStatus() == CommandStatus.SUCCESS);
+         result = getDevice().executeShellV2Command("gsi_tool disable");
+         assertFalse(result.getStatus() == CommandStatus.SUCCESS);
+         result = getDevice().executeShellV2Command("gsi_tool wipe");
+         assertFalse(result.getStatus() == CommandStatus.SUCCESS);
+     }
++
++    @Test
++    public void testInvalidSlotNames() throws DeviceNotAvailableException {
++        assertAdbRoot();
++        String[] invalidSlots = {".", "..", "booted", "active", "foo@bar"};
++        for (String slot : invalidSlots) {
++            String installDir = "/data/gsi/dsu/" + slot;
++            // We need to provide a dummy size > 0 to pass argument validation in gsi_tool
++            String command = String.format(
++                    "gsi_tool install --gsi-size 1024 --install-dir %s", installDir);
++            CommandResult result = getDevice().executeShellV2Command(command);
++            assertFalse(
++                    String.format("Expected command to fail: %s", command),
++                    result.getStatus() == CommandStatus.SUCCESS);
++            assertTrue(
++                    String.format("Expected error message in stderr for slot: %s, "
++                            + "got: %s", slot, result.getStderr()),
++                    result.getStderr().contains("Could not open DSU installation"));
++        }
++    }
+ }
+diff --git a/tests/libgsi_test.cpp b/tests/libgsi_test.cpp
+new file mode 100644
+index 0000000..de43336
+--- /dev/null
++++ b/tests/libgsi_test.cpp
+@@ -0,0 +1,97 @@
++//
++// Copyright (C) 2026 The Android Open Source Project
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++#include <gtest/gtest.h>
++#include <libgsi/libgsi.h>
++#include <string>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <android-base/file.h>
++
++namespace android {
++namespace gsi {
++
++TEST(LibGsiTest, IsValidSlotName) {
++    EXPECT_TRUE(IsValidSlotName("dsu"));
++    EXPECT_TRUE(IsValidSlotName("dsu2"));
++    EXPECT_TRUE(IsValidSlotName("dsu_test"));
++    EXPECT_TRUE(IsValidSlotName("dsu-test"));
++    EXPECT_TRUE(IsValidSlotName("dsu.test"));
++
++    EXPECT_FALSE(IsValidSlotName(""));
++    EXPECT_FALSE(IsValidSlotName("."));
++    EXPECT_FALSE(IsValidSlotName(".."));
++    EXPECT_FALSE(IsValidSlotName("booted"));
++    EXPECT_FALSE(IsValidSlotName("active"));
++    EXPECT_FALSE(IsValidSlotName("lp_names"));
++    EXPECT_FALSE(IsValidSlotName("install_status"));
++    EXPECT_FALSE(IsValidSlotName("one_shot_boot"));
++    EXPECT_FALSE(IsValidSlotName("avb"));
++    EXPECT_FALSE(IsValidSlotName("avb_enforce"));
++
++    EXPECT_FALSE(IsValidSlotName("foo/bar"));
++    EXPECT_FALSE(IsValidSlotName("foo@bar"));
++}
++
++TEST(LibGsiTest, IsGsiRunning) {
++    // This test requires root to modify /metadata/gsi/dsu/booted
++    if (getuid() != 0) {
++        GTEST_SKIP() << "Skipping test that requires root";
++    }
++
++    std::string booted_path = kGsiBootedIndicatorFile;
++    struct stat s;
++    bool was_booted = (lstat(booted_path.c_str(), &s) == 0);
++    std::string backup_path = booted_path + ".bak";
++
++    if (was_booted) {
++        ASSERT_EQ(rename(booted_path.c_str(), backup_path.c_str()), 0);
++    }
++
++    // Ensure it returns false when it doesn't exist
++    EXPECT_FALSE(IsGsiRunning());
++
++    // Ensure it returns false when it is a directory (the bug scenario)
++    ASSERT_EQ(mkdir(booted_path.c_str(), 0755), 0);
++    EXPECT_FALSE(IsGsiRunning());
++    ASSERT_EQ(rmdir(booted_path.c_str()), 0);
++
++    // Ensure it returns false when it is a symlink (even to a regular file)
++    std::string temp_file = "/data/local/tmp/gsi_temp";
++    int fd = open(temp_file.c_str(), O_CREAT | O_WRONLY, 0644);
++    ASSERT_GE(fd, 0);
++    close(fd);
++    ASSERT_EQ(symlink(temp_file.c_str(), booted_path.c_str()), 0);
++    EXPECT_FALSE(IsGsiRunning());
++    ASSERT_EQ(unlink(booted_path.c_str()), 0);
++    ASSERT_EQ(unlink(temp_file.c_str()), 0);
++
++    // Ensure it returns true when it is a regular file
++    fd = open(booted_path.c_str(), O_CREAT | O_WRONLY, 0644);
++    ASSERT_GE(fd, 0);
++    close(fd);
++    EXPECT_TRUE(IsGsiRunning());
++    ASSERT_EQ(unlink(booted_path.c_str()), 0);
++
++    // Restore
++    if (was_booted) {
++        ASSERT_EQ(rename(backup_path.c_str(), booted_path.c_str()), 0);
++    }
++}
++
++} // namespace gsi
++} // namespace android
+-- 
+2.56.0
+

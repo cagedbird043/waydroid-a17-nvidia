@@ -1,0 +1,56 @@
+From c1157897eeba94092a2570e10efaf7b84839053c Mon Sep 17 00:00:00 2001
+From: Evan Chen <evanxinchen@google.com>
+Date: Mon, 29 Jun 2026 10:52:22 -0700
+Subject: [PATCH 43/45] =?utf-8?q?=E5=9C=A8=E7=94=A8=E6=88=B7=E8=A7=A3?=
+ =?utf-8?q?=E9=94=81=E5=90=8E=E6=B8=85=E7=90=86=E5=B7=B2=E6=92=A4=E9=94=80?=
+ =?utf-8?q?=E7=9A=84=E8=AE=BE=E5=A4=87=E5=85=B3=E8=81=94?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Move the logic to disassociate revoked Companion Device Manager associations from the boot phase to when a user unlocks. This ensures the permissions can be revoked since they are stored in system_ce
+
+Test: cts
+Flag: EXEMPT BUGFIX
+Bug: 510137092
+(cherry picked from commit 4ba87708d35798cf9cf940eb0d0e0c44ee80ff90)
+Cherrypick-From: https://googleplex-android-review.googlesource.com/q/commit:a30078ddc88dad1b82ae1b00dc1e9dc087402aa4
+Merged-In: I701c4b87bf1e0e6ceaa9c655f9fd9042823fa17a
+Change-Id: I701c4b87bf1e0e6ceaa9c655f9fd9042823fa17a
+
+(cherry picked from commit 696a5773fa284f53429dbb6c3e5dcc96bf5bd0b3)
+---
+ .../companion/CompanionDeviceManagerService.java       | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/services/companion/java/com/android/server/companion/CompanionDeviceManagerService.java b/services/companion/java/com/android/server/companion/CompanionDeviceManagerService.java
+index 7b97bfe6c..e95a6dc26 100644
+--- a/services/companion/java/com/android/server/companion/CompanionDeviceManagerService.java
++++ b/services/companion/java/com/android/server/companion/CompanionDeviceManagerService.java
+@@ -245,11 +245,6 @@ public class CompanionDeviceManagerService extends SystemService {
+         // Init association stores
+         mAssociationStore.refreshCache();
+ 
+-        // Remove any revoked associations after reboot.
+-        for (AssociationInfo ai : mAssociationStore.getRevokedAssociations()) {
+-            mDisassociationProcessor.disassociate(ai.getId(), REASON_REVOKED);
+-        }
+-
+         // Init UUID store
+         mObservableUuidStore.readObservableUuids(getContext().getUserId());
+ 
+@@ -293,6 +288,11 @@ public class CompanionDeviceManagerService extends SystemService {
+     public void onUserUnlocked(@NonNull TargetUser user) {
+         Slog.i(TAG, "onUserUnlocked() user=" + user);
+         final int userId = user.getUserIdentifier();
++        for (AssociationInfo a : mAssociationStore.getRevokedAssociations()) {
++            if (a.getUserId() == userId) {
++                mDisassociationProcessor.disassociate(a.getId(), REASON_REVOKED);
++            }
++        }
+ 
+         // Notify and bind the app after the phone is unlocked.
+         mDevicePresenceProcessor.sendDevicePresenceEventOnUnlocked(userId);
+-- 
+2.56.0
+

@@ -1,0 +1,270 @@
+From 730932cc6920ed630b7fbca0e936e29496223d57 Mon Sep 17 00:00:00 2001
+From: Ray Essick <essick@google.com>
+Date: Sat, 15 Aug 2026 10:46:52 -0500
+Subject: [PATCH] =?utf-8?q?=E7=A7=BB=E9=99=A4=E5=AD=98=E5=9C=A8=E8=B6=8A?=
+ =?utf-8?q?=E7=95=8C=E8=AF=BB=E5=8F=96=E7=9A=84=20ARM32=20=E5=93=88?=
+ =?utf-8?q?=E5=A4=AB=E6=9B=BC=E6=B1=87=E7=BC=96=E9=81=8D=E5=8E=86?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Eliminate an early exit huffman walk bug in hand-written arm32 which
+results in a possible OOB read. Other architectures run C implementation.
+Removed the hand-crafted assembler, so now arm32 will use the same
+C-based implementation that we're using everywhere else.
+
+Bug: 514742326
+Test: atest VorbisDecoderTest, compiled for 32-bits
+Test: system build & run w/ swcodec built as 32bit not default 64bit
+Flag: EXEMPT BUGFIX
+Change-Id: Ie4fd9274a9df4c1801e8a29a36fa6faa893e956f
+(cherry picked from commit 7293b0a896ee258313883f5524808e4f7e805ec7)
+
+(cherry picked from commit 04f93e8026edaafcd11eff36fba76cb9cd846f16)
+Change-Id: I971e9ca1c4053de443304a5e9f2a92d28d504ce9
+---
+ Tremolo/codebook.c |   9 +--
+ Tremolo/dpen.s     | 188 +--------------------------------------------
+ 2 files changed, 3 insertions(+), 194 deletions(-)
+
+diff --git a/Tremolo/codebook.c b/Tremolo/codebook.c
+index ae5500a..f1fba89 100644
+--- a/Tremolo/codebook.c
++++ b/Tremolo/codebook.c
+@@ -649,12 +649,8 @@ int vorbis_book_unpack(oggpack_buffer *opb,codebook *s){
+   return -1;
+ }
+ 
+-#ifndef ONLY_C
+-ogg_uint32_t decode_packed_entry_number(codebook *book,
+-                                        oggpack_buffer *b);
+-#else
+-static inline ogg_uint32_t decode_packed_entry_number(codebook *book,
+-                                                      oggpack_buffer *b){
++// dropped the hand-crafted arm32 asm version for security reasons
++ogg_uint32_t decode_packed_entry_number(codebook *book, oggpack_buffer *b){
+   ogg_uint32_t chase=0;
+   int  read=book->dec_maxlength;
+   long lok = oggpack_look(b,read),i;
+@@ -751,7 +747,6 @@ static inline ogg_uint32_t decode_packed_entry_number(codebook *book,
+   oggpack_adv(b,read+1);
+   return(-1);
+ }
+-#endif
+ 
+ /* returns the [original, not compacted] entry number or -1 on eof *********/
+ long vorbis_book_decode(codebook *book, oggpack_buffer *b){
+diff --git a/Tremolo/dpen.s b/Tremolo/dpen.s
+index cc492cf..07b7fd0 100644
+--- a/Tremolo/dpen.s
++++ b/Tremolo/dpen.s
+@@ -34,205 +34,19 @@
+ 
+     .text
+ 
+-	.global	decode_packed_entry_number
+-	.global decode_packed_entry_number_REALSTART
+ 	.global decode_map
+ 	.global vorbis_book_decodevv_add
+ 	.global _checksum
+ 
+-	.type decode_packed_entry_number, %function
+-	.type decode_packed_entry_number_REALSTART, %function
+ 	.type decode_map, %function
+ 	.type vorbis_book_decodevv_add, %function
+ 	.type _checksum, %function
+ 
+-	.extern	oggpack_adv
+-	.extern	oggpack_look
++	.extern decode_packed_entry_number
+ 	.extern	oggpack_eop
+ 	.extern	crc_lookup
+ 	.hidden	crc_lookup
+ 
+-decode_packed_entry_number_REALSTART:
+-dpen_nobits:
+-	MOV	r0,r5		@ r0 = b
+-	MOV	r1,#1		@ r1 = 1
+-	BL	oggpack_adv	@ oggpack_adv(b,1)      /* Force eop */
+-duff:
+-	MVN	r0,#0		@ return -1
+-	LDMFD	r13!,{r4-r8,r10,PC}
+-
+-dpen_readfailed:
+-	SUBS	r4,r4,#1	@ r4 = --read
+-	BEQ	dpen_nobits
+-	MOV	r0,r5		@ r0 = b
+-	MOV	r1,r4		@ r1 = read
+-	ADR	r14,dpen_read_return
+-	B	oggpack_look
+-
+-decode_packed_entry_number:
+-	@ r0 = codebook       *book
+-	@ r1 = oggpack_buffer *b
+-	STMFD	r13!,{r4-r8,r10,r14}
+-
+-	LDMIA	r0,{r4,r6,r7}		@ r4 = read = book->max_length
+-					@ r6 = book->dec_table
+-					@ r7 = book->dec_method
+-	MOV	r5,r1		@ r5 = b
+-
+-	MOV	r0,r5		@ r0 = b
+-	MOV	r1,r4		@ r1 = read
+-	BL	oggpack_look
+-dpen_read_return:
+-	CMP	r0,#0
+-	BLT	dpen_readfailed
+-
+-	@ r0 = lok
+-	@ r4 = read
+-	@ r5 = b
+-	@ r6 = dec_table
+-	@ r7 = dec_method
+-
+-	CMP	r7, #3
+-	BGT	meth4
+-	BEQ	meth3
+-	CMP	r7, #1
+-	BGT	meth2
+-	BEQ	meth1
+-meth0:
+-	RSB	r1, r4, #0		@ r1 = i-read = 0-read
+-	MOV	r7, #0			@ r7 = chase
+-m0_loop:
+-	MOVS	r0, r0, LSR #1		@ r0 = lok>>1   C = bottom bit
+-	ADC	r2, r6, r7, LSL #1	@ r8 = &t[chase*2+C]
+-	LDRB	r7, [r2]
+-	ADDS	r1, r1, #1		@ r1 = i-read++ (i-read<0 => i<read)
+-	@ stall Xscale
+-	CMPLT	r7, #0x80
+-	BLT	m0_loop
+-	AND	r7, r7, #0x7F		@ r7 = chase
+-	CMP	r1, #0			@ if (i-read >= 0) === (i >= read)
+-	MVNGT	r7, #0			@ if (i >= read) value to return = -1
+-	ADD	r1, r1, r4		@ r1 = i-read+read+1 = i +1
+-	MOV	r0, r5			@ r0 = b
+-	BL	oggpack_adv		@ oggpack_adv(b, i+1);
+-	MOV	r0, r7			@ return chase
+-	LDMFD	r13!,{r4-r8,r10,PC}
+-
+-meth1:
+-	@ r0 = lok
+-	@ r4 = read
+-	@ r5 = b
+-	@ r6 = dec_table
+-	RSB	r1, r4, #0		@ r1 = i = -read
+-	MOV	r10,#0			@ r10= next = 0
+-m1_loop:
+-	MOV	r7, r10			@ r7 = chase=next
+-	MOVS	r0, r0, LSR #1		@ r0 = lok>>1     C = bottom bit
+-	ADC	r8, r6, r7		@ r8 = t+chase+bit
+-	LDRB	r10,[r8], -r6		@ r10= next=t[chase+bit] r8=chase+bit
+-	ADDS	r1, r1, #1		@ r1 = i++
+-	@ stall Xscale
+-	CMPLT	r10,#0x80		@ if (next & 0x80) == 0
+-	BLT	m1_loop
+-
+-	ADD	r1, r1, r4		@ r1 = i+read
+-	MOV	r0, r5			@ r0 = b
+-	BL	oggpack_adv		@ oggpack_adv(b, i)
+-
+-	CMP	r10,#0x80
+-	BLT	duff
+-
+-	CMP	r8, r7			@ if bit==0 (chase+bit==chase) (sets C)
+-	LDRBNE	r14,[r6, r7]		@ r14= t[chase]
+-	MOVEQ	r14,#128
+-	ADC	r12,r8, r6		@ r12= chase+bit+1+t
+-	LDRB	r14,[r12,r14,LSR #7]	@ r14= t[chase+bit+1+(!bit || t[chase]0x0x80)]
+-	BIC	r10,r10,#0x80		@ r3 = next &= ~0x80
+-	@ stall Xscale
+-	ORR	r0, r14,r10,LSL #8	@ r7 = chase = (next<<8) | r14
+-
+-	LDMFD	r13!,{r4-r8,r10,PC}
+-
+-
+-meth2:
+-	RSB	r1, r4, #0		@ r1 = i-read = 0-read
+-	MOV	r7, #0			@ r7 = chase
+-	MOV	r6, r6, LSR #1
+-m2_loop:
+-	MOVS	r0, r0, LSR #1		@ r0 = lok>>1   C = bottom bit
+-	ADC	r2, r6, r7, LSL #1	@ r8 = &t[chase*2+C]
+-	LDRH	r7, [r2, r2]
+-	ADDS	r1, r1, #1		@ r1 = i-read++ (i-read<0 => i<read)
+-	@ stall Xscale
+-	CMPLT	r7, #0x8000
+-	BLT	m2_loop
+-	BIC	r7, r7, #0x8000		@ r7 = chase
+-	CMP	r1, #0			@ if (i-read >= 0) === (i >= read)
+-	MVNGT	r7, #0			@ if (i >= read) value to return = -1
+-	ADD	r1, r1, r4		@ r1 = i-read+read+1 = i +1
+-	MOV	r0, r5			@ r0 = b
+-	BL	oggpack_adv		@ oggpack_adv(b, i+1);
+-	MOV	r0, r7			@ return chase
+-	LDMFD	r13!,{r4-r8,r10,PC}
+-
+-meth3:
+-	@ r0 = lok
+-	@ r4 = read
+-	@ r5 = b
+-	@ r6 = dec_table
+-	RSB	r1, r4, #0		@ r1 = i = -read
+-	MOV	r10,#0			@ r10= next = 0
+-m3_loop:
+-	MOV	r7, r10			@ r7 = chase=next
+-	MOVS	r0, r0, LSR #1		@ r0 = lok>>1     C = bottom bit
+-	ADC	r8, r7, #0		@ r8 = chase+bit
+-	MOV	r8, r8, LSL #1		@ r8 = (chase+bit)<<1
+-	LDRH	r10,[r6, r8]		@ r10= next=t[chase+bit]
+-	ADDS	r1, r1, #1		@ r1 = i++
+-	@ stall Xscale
+-	CMPLT	r10,#0x8000		@ if (next & 0x8000) == 0
+-	BLT	m3_loop
+-
+-	ADD	r1, r1, r4		@ r1 = i+read
+-	MOV	r0, r5			@ r0 = b
+-	BL	oggpack_adv		@ oggpack_adv(b, i)
+-
+-	CMP	r10,#0x8000
+-	BLT	duff
+-
+-	MOV	r7, r7, LSL #1
+-	CMP	r8, r7			@ if bit==0 (chase+bit==chase) sets C
+-	LDRHNE	r14,[r6, r7]		@ r14= t[chase]
+-	MOVEQ	r14,#0x8000
+-	ADC	r12,r8, r14,LSR #15	@ r12= 1+((chase+bit)<<1)+(!bit || t[chase]0x0x8000)
+-	ADC	r12,r12,r14,LSR #15	@ r12= t + (1+chase+bit+(!bit || t[chase]0x0x8000))<<1
+-	LDRH	r14,[r6, r12]		@ r14= t[chase+bit+1
+-	BIC	r10,r10,#0x8000		@ r3 = next &= ~0x8000
+-	@ stall Xscale
+-	ORR	r0, r14,r10,LSL #16	@ r7 = chase = (next<<16) | r14
+-
+-	LDMFD	r13!,{r4-r8,r10,PC}
+-
+-meth4:
+-	RSB	r1, r4, #0		@ r1 = i-read = 0-read
+-	MOV	r7, #0			@ r7 = chase
+-m4_loop:
+-	MOVS	r0, r0, LSR #1		@ r0 = lok>>1   C = bottom bit
+-	ADC	r2, r7, r7		@ r8 = chase*2+C
+-	LDR	r7, [r6, r2, LSL #2]
+-	ADDS	r1, r1, #1		@ r1 = i-read++ (i-read<0 => i<read)
+-	@ stall Xscale
+-	CMPLT	r7, #0x80000000
+-	BLT	m4_loop
+-	BIC	r7, r7, #0x80000000	@ r7 = chase
+-	CMP	r1, #0			@ if (i-read >= 0) === (i >= read)
+-	MVNGT	r7, #0			@ if (i >= read) value to return = -1
+-	ADD	r1, r1, r4		@ r1 = i-read+read+1 = i +1
+-	MOV	r0, r5			@ r0 = b
+-	BL	oggpack_adv		@ oggpack_adv(b, i+1);
+-	MOV	r0, r7			@ return chase
+-	LDMFD	r13!,{r4-r8,r10,PC}
+-
+ decode_map:
+ 	@ r0 = codebook *s
+ 	@ r1 = oggpack_buffer *b
+-- 
+2.56.0
+

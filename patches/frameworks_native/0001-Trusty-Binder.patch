@@ -1,0 +1,73 @@
+From 431ab86d1e39300f386199e45052b01368a6577a Mon Sep 17 00:00:00 2001
+From: Weston Carvalho <westoncarvalho@google.com>
+Date: Mon, 29 Jun 2026 12:16:22 -0700
+Subject: [PATCH 1/4] =?utf-8?q?=E4=BF=AE=E5=A4=8D=20Trusty=20Binder=20?=
+ =?utf-8?q?=E6=9C=8D=E5=8A=A1=E9=94=80=E6=AF=81=E5=90=8E=E7=9A=84=E6=82=AC?=
+ =?utf-8?q?=E7=A9=BA=E7=AB=AF=E5=8F=A3?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+Bug: 514731794
+
+(cherry picked from commit 07bdd5060258912e65dac0ff9e57e38cf6dcc4ce)
+Change-Id: I01e5500cfbb5e88122c85e26ea7f3bb96372a873
+---
+ libs/binder/trusty/RpcServerTrusty.cpp              | 9 ++++++++-
+ libs/binder/trusty/include/binder/RpcServerTrusty.h | 2 ++
+ libs/binder/trusty/include_mock/lib/tipc/tipc_srv.h | 4 ++++
+ 3 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/libs/binder/trusty/RpcServerTrusty.cpp b/libs/binder/trusty/RpcServerTrusty.cpp
+index edfa8b8..4f0ccea 100644
+--- a/libs/binder/trusty/RpcServerTrusty.cpp
++++ b/libs/binder/trusty/RpcServerTrusty.cpp
+@@ -66,12 +66,19 @@ sp<RpcServerTrusty> RpcServerTrusty::make(
+     return srv;
+ }
+ 
++RpcServerTrusty::~RpcServerTrusty() {
++    if (mTipcPortCtx != nullptr) {
++        tipc_remove_service(mTipcPortCtx);
++    }
++}
++
+ RpcServerTrusty::RpcServerTrusty(std::unique_ptr<RpcTransportCtx> ctx, std::string&& portName,
+                                  std::shared_ptr<const PortAcl>&& portAcl, size_t msgMaxSize,
+                                  size_t msgQueueLen)
+       : mRpcServer(makeRpcServer(std::move(ctx))),
+         mPortName(std::move(portName)),
+-        mPortAcl(std::move(portAcl)) {
++        mPortAcl(std::move(portAcl)),
++        mTipcPortCtx(nullptr) {
+     mTipcPort.name = mPortName.c_str();
+     mTipcPort.msg_max_size = msgMaxSize;
+     mTipcPort.msg_queue_len = msgQueueLen;
+diff --git a/libs/binder/trusty/include/binder/RpcServerTrusty.h b/libs/binder/trusty/include/binder/RpcServerTrusty.h
+index b6edf1a..f137344 100644
+--- a/libs/binder/trusty/include/binder/RpcServerTrusty.h
++++ b/libs/binder/trusty/include/binder/RpcServerTrusty.h
+@@ -47,6 +47,8 @@ public:
+         const void* extraData;
+     };
+ 
++    ~RpcServerTrusty();
++
+     /**
+      * Creates an RPC server listening on the given port and adds it to the
+      * Trusty handle set at |handleSet|.
+diff --git a/libs/binder/trusty/include_mock/lib/tipc/tipc_srv.h b/libs/binder/trusty/include_mock/lib/tipc/tipc_srv.h
+index 1bfb600..079d135 100644
+--- a/libs/binder/trusty/include_mock/lib/tipc/tipc_srv.h
++++ b/libs/binder/trusty/include_mock/lib/tipc/tipc_srv.h
+@@ -69,3 +69,7 @@ static inline int tipc_add_connection(struct tipc_port_ctx*, handle_t, const str
+ static inline struct tipc_hset* tipc_get_hset(struct tipc_port_ctx*) {
+     return nullptr;
+ }
++
++static inline int tipc_remove_service(struct tipc_port_ctx*) {
++    return 0;
++}
+-- 
+2.56.0
+

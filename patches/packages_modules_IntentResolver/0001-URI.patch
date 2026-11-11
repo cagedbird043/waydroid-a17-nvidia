@@ -1,0 +1,43 @@
+From c4465bc0ddef04d40dcd9613c3b1319183e9ff78 Mon Sep 17 00:00:00 2001
+From: Andrey Yepin <ayepin@google.com>
+Date: Thu, 27 Aug 2026 12:29:36 -0700
+Subject: [PATCH] =?utf-8?q?=E6=8C=89=E5=8F=91=E8=B5=B7=E5=8C=85=E8=BA=AB?=
+ =?utf-8?q?=E4=BB=BD=E6=A0=A1=E9=AA=8C=E5=88=86=E4=BA=AB=20URI=20=E8=AF=BB?=
+ =?utf-8?q?=E5=8F=96=E6=9D=83=E9=99=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+This is, essentially, asking the Framework whether the calling package
+is able to grant the permission for the URI to itself. It aligns with
+how the method is used by System UI in other places. This is also a more
+stable way to perform the check.
+
+Bug: b/435188844
+Test: `sts-tradefed run sts-dynamic-develop -m CtsSecurityBulletinHostTestCases -t android.security.cts.Bug_435188844`
+Flag: EXEMPT CVE_FIX
+Change-Id: I287cb5a32e24d4d6cbecf65271ae5159695ab477
+
+(cherry picked from commit e3670d5711c7e806cfbdb44c6e9963a95300faba)
+Change-Id: I1960fbac03804662ff462def6e5464234b9f588e
+---
+ .../intentresolver/domain/UriCallerReadAccessValidator.kt      | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/java/src/com/android/intentresolver/domain/UriCallerReadAccessValidator.kt b/java/src/com/android/intentresolver/domain/UriCallerReadAccessValidator.kt
+index 28a50f6..9a4a6bb 100644
+--- a/java/src/com/android/intentresolver/domain/UriCallerReadAccessValidator.kt
++++ b/java/src/com/android/intentresolver/domain/UriCallerReadAccessValidator.kt
+@@ -71,7 +71,8 @@ constructor(
+ object CallerUriReadAccessValidatorModule {
+     @Provides
+     @PackageName
+-    fun packageName(@ApplicationContext context: Context): String = context.packageName
++    fun packageName(activityModelRepository: ActivityModelRepository): String =
++        activityModelRepository.value.launchedFromPackage
+ 
+     @Provides
+     @LaunchedFromUid
+-- 
+2.56.0
+
